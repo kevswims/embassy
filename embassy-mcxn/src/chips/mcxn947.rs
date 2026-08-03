@@ -1,10 +1,10 @@
 //! Module for MCXN947 family
 //!
-//! This is a bring-up stub: it configures the reset-default main clock
-//! (verifying it, see `clocks`), enables the PORT/GPIO clock gates, and
-//! enables interrupts. There is no GPIO/UART driver yet, and the clock tree
-//! doesn't support switching the main clock source away from its reset
-//! default (`fro_hf`) yet - see `crate::clocks` for details.
+//! `init` configures the reset-default main clock (verifying it, see `clocks`),
+//! enables interrupts, brings up both eDMA controllers, and enables the
+//! PORT/GPIO clock gates. The clock tree does not support switching the main
+//! clock source away from its reset default (`fro_hf`) yet - see
+//! `crate::clocks` for details.
 
 use crate::_generated::Peripherals;
 
@@ -18,6 +18,11 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     unsafe {
         cortex_m::interrupt::enable();
     }
+
+    // Bring up both eDMA controllers. Must follow `clocks::init`, which the
+    // clock gates depend on, and leaves every channel ready to be claimed.
+    #[cfg(mcxn_dma)]
+    crate::dma::init();
 
     // Enable PORT/GPIO clocks. GPIO5/PORT5 are always-on (see `clocks::gate`)
     // and need no explicit enable.

@@ -15,6 +15,10 @@ mod mcxn947_exclusive {
 
 pub mod clocks;
 pub mod config;
+// Gated so a PAC regression that drops the eDMA blocks surfaces as one missing
+// module rather than errors inside every generated channel impl.
+#[cfg(mcxn_dma)]
+pub mod dma;
 pub mod gpio;
 
 #[cfg(feature = "mcxn947")]

@@ -1,5 +1,11 @@
 [target.thumbv8m.main-none-eabihf]
-runner = 'probe-rs run --chip MCXN947 --preverify --verify --protocol swd --speed 12000'
+# No `--preverify`/`--verify`: probe-rs 0.32's read-back verification reports a
+# spurious "Flash content verification failed" on MCXN947 whenever an
+# invocation actually programs flash. Re-running immediately then succeeds,
+# because preverify finds the content already matching and skips programming -
+# so the write itself is fine and only the read-back comparison is wrong.
+# With the flags set, every `cargo run` after a rebuild fails on its first try.
+runner = 'probe-rs run --chip MCXN947 --protocol swd --speed 12000'
 
 rustflags = [
   # `flip-link` (https://github.com/knurling-rs/flip-link) gives stack

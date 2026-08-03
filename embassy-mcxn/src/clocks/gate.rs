@@ -201,6 +201,59 @@ macro_rules! impl_syscon_gate {
     };
 }
 
+/// Implements [`Gate`] for a peripheral whose clock-enable and reset bits are
+/// scalar (non-array) fields, and which may sit in different
+/// `AHBCLKCTRLn`/`PRESETCTRLn` registers - unlike [`impl_syscon_gate!`], which
+/// covers array-indexed field families sharing one index.
+///
+/// `$rst_ty` is the reset value enum SYSCON's register definitions use for this
+/// field (e.g. `Dma0Rst`), all of which share the same `Released = 0`/
+/// `Asserted = 1` shape.
+macro_rules! impl_syscon_scalar_gate {
+    ($name:ident, $clk_reg:ident, $clk_field:ident, $rst_reg:ident, $rst_field:ident, $rst_ty:ident) => {
+        impl crate::clocks::Gate for crate::peripherals::$name {
+            paste::paste! {
+                #[inline]
+                unsafe fn enable_clock() {
+                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>](true));
+                }
+
+                #[inline]
+                unsafe fn disable_clock() {
+                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>](false));
+                }
+
+                #[inline]
+                unsafe fn release_reset() {
+                    use crate::pac::syscon::$rst_ty;
+                    crate::pac::SYSCON0
+                        .$rst_reg()
+                        .modify(|w| w.[<set_ $rst_field>]($rst_ty::Released));
+                }
+
+                #[inline]
+                unsafe fn assert_reset() {
+                    use crate::pac::syscon::$rst_ty;
+                    crate::pac::SYSCON0
+                        .$rst_reg()
+                        .modify(|w| w.[<set_ $rst_field>]($rst_ty::Asserted));
+                }
+            }
+
+            #[inline]
+            fn is_clock_enabled() -> bool {
+                crate::pac::SYSCON0.$clk_reg().read().$clk_field()
+            }
+
+            #[inline]
+            fn is_reset_released() -> bool {
+                use crate::pac::syscon::$rst_ty;
+                crate::pac::SYSCON0.$rst_reg().read().$rst_field() == $rst_ty::Released
+            }
+        }
+    };
+}
+
 // PORT0-4 / GPIO0-4: gated via SYSCON0.AHBCLKCTRL0 / PRESETCTRL0 (RM Chapter
 // 17). GPIO5/PORT5 are deliberately not included here - RM "Chapter 33
 // Clocking" (Table 319, `slow_clk`) documents them as always clocked (they
@@ -216,3 +269,11 @@ impl_syscon_gate!(GPIO1, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 1);
 impl_syscon_gate!(GPIO2, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 2);
 impl_syscon_gate!(GPIO3, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 3);
 impl_syscon_gate!(GPIO4, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 4);
+
+// The two eDMA controllers sit in different register pairs: DMA0 in
+// AHBCLKCTRL0/PRESETCTRL0 bit 26, DMA1 in AHBCLKCTRL2/PRESETCTRL2 bit 1 (RM
+// Chapter 17). Both are scalar fields rather than members of an indexed family.
+#[cfg(mcxn_dma)]
+impl_syscon_scalar_gate!(DMA0, ahbclkctrl0, dma0, presetctrl0, dma0_rst, Dma0Rst);
+#[cfg(mcxn_dma)]
+impl_syscon_scalar_gate!(DMA1, ahbclkctrl2, dma1, presetctrl2, dma1_rst, Dma1Rst);

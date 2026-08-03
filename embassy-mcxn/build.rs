@@ -45,7 +45,7 @@ fn main() {
         generate_peripherals_call(),
         generate_interrupt_mod_call(),
         generate_cc_gates(),
-        generate_dma_requests_enum(),
+        generate_dma_channel_impls(),
         generate_instance_calls(),
         generate_gpio_pin_impls(),
         generate_adc_pin_impls(),
@@ -525,7 +525,7 @@ fn generate_flexcan_pin_impls() -> TokenStream {
     generated
 }
 
-fn generate_dma_requests_enum() -> TokenStream {
+fn generate_dma_channel_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
     let dma_regex = Regex::new(r"(?:^DMA)(\d+)").unwrap();
@@ -536,17 +536,26 @@ fn generate_dma_requests_enum() -> TokenStream {
         .iter()
         .filter_map(|p| get_regex_num(p.name, &dma_regex).map(|num| (p, num)))
     {
+        // The channel count is encoded in the block name, e.g. `mcxn/DMA::DMA16`.
         let num_channels = get_regex_num(dma.driver_name, &dma_driver_regex).unwrap();
 
         for channel_num in 0..num_channels {
+            // The HAL singleton is `DMA{n}_CH{c}`, matching the `DMA{n}` parent
+            // peripheral. The NVIC vector for that channel is spelled
+            // `EDMA_{n}_CH{c}` on MCXN947, so the two idents differ - which is
+            // why `impl_dma_channel!` takes the interrupt separately. A wrong
+            // vector name is a compile error, not a dead handler: the
+            // `#[cortex_m_rt::interrupt]` expansion checks the name against
+            // `interrupt::*`.
+            let channel_ident = format_ident!("DMA{dma_num}_CH{channel_num}");
+            let irq_ident = format_ident!("EDMA_{dma_num}_CH{channel_num}");
+
             let dma_num = proc_macro2::Literal::u32_unsuffixed(dma_num);
             let channel_num = proc_macro2::Literal::u32_unsuffixed(channel_num);
 
-            let channel_ident = format_ident!("DMA{dma_num}_CH{channel_num}");
-
             generated.extend(quote! {
-                crate::impl_dma_channel!(#channel_ident, #dma_num, #channel_num, #channel_ident);
-                crate::impl_dma_interrupt_handler!(#channel_ident, #dma_num, #channel_num);
+                crate::impl_dma_channel!(#channel_ident, #dma_num, #channel_num, #irq_ident);
+                crate::impl_dma_interrupt_handler!(#irq_ident, #dma_num, #channel_num);
             });
         }
     }
@@ -560,10 +569,16 @@ fn generate_dma_impls() -> TokenStream {
         dma_requests.insert(dma_mux.signal, dma_mux.request);
     }
     // No `dma_muxing` metadata exists for MCXN947 yet (only relevant once
-    // per-driver transform data assigns it), so this can be empty. A
-    // zero-variant `#[repr(u8)]` enum can't be `transmute`d from a `u8` (it
-    // has zero size, not one byte), so skip the repr/transmute machinery in
-    // that case instead of generating code that fails to compile.
+    // per-driver transform data assigns it), so this can be empty. Two things
+    // must differ from the populated case:
+    //
+    //   * `#[repr(u8)]` is rejected on a zero-variant enum, so it is omitted.
+    //   * `from_number_unchecked` is omitted: `transmute`ing a `u8` into an
+    //     uninhabited (zero-sized) type cannot compile.
+    //
+    // `number()` is still emitted, because `dma::set_request_source` calls it.
+    // With no variants there is no way to obtain a `DmaRequest` to pass, so
+    // that path is unreachable rather than broken.
     let mut sorted_dma_requests = dma_requests.into_iter().collect::<Vec<_>>();
     sorted_dma_requests.sort_unstable_by_key(|(_, request)| *request);
     if sorted_dma_requests.is_empty() {
@@ -572,6 +587,14 @@ fn generate_dma_impls() -> TokenStream {
             #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
             #[allow(dead_code)]
             pub enum DmaRequest {}
+
+            impl DmaRequest {
+                /// Convert enumerated value into a raw integer
+                #[allow(dead_code)]
+                pub const fn number(self) -> u8 {
+                    match self {}
+                }
+            }
         };
     }
     let enum_variants = sorted_dma_requests.into_iter().map(|(name, value)| {
