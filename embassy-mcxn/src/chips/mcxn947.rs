@@ -24,6 +24,11 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     #[cfg(mcxn_dma)]
     crate::dma::init();
 
+    // Start the `embassy-time` driver. Must follow `clocks::init`, which enables
+    // the `clk_1m` this runs from.
+    #[cfg(mcxn_ostimer)]
+    crate::ostimer::init(cfg.time_interrupt_priority);
+
     // Enable PORT/GPIO clocks. GPIO5/PORT5 are always-on (see `clocks::gate`)
     // and need no explicit enable.
     unsafe {
