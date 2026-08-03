@@ -1,29 +1,56 @@
 //! # Clock module
 //!
-//! **Status: minimal bring-up.** [`init()`] does not change the main clock
-//! source away from its reset default - RM "Chapter 33 Clocking" documents
-//! `fro_hf` (SCG's FIRC, `SCG0.RCCR.SCS == Firc`) as the default main clock,
-//! at 48 MHz (`SCG0.FIRCCFG.RANGE == Firc48mhz`), with `AHBCLKDIV` reset to
-//! divide-by-1. [`init()`] verifies those reset-default conditions still
-//! hold and records the resulting frequencies; it returns
-//! [`ClockError::UnsupportedMainClockSource`] if the main clock has already
-//! been switched to anything else (SOSC, PLL0, PLL1, ROSC, ...) - selecting
-//! those, and configuring `AHBCLKDIV` to something other than 1, isn't
-//! implemented yet.
+//! [`init()`] brings up the clock sources and records the resulting tree in
+//! [`Clocks`], which peripheral drivers then read to resolve their own
+//! functional clock. Four things are worth knowing about how it is put
+//! together.
 //!
-//! Peripheral clock gating (SYSCON `AHBCLKCTRLx`/`PRESETCTRLx`) is handled by
-//! the [`gate`] module and does not depend on the above.
+//! **`main_clk` stays on its reset default.** RM "Chapter 33 Clocking"
+//! documents `fro_hf` (SCG's FIRC, `SCG0.RCCR.SCS == Firc`) as the default main
+//! clock at 48 MHz. [`init()`] verifies that rather than configuring it, and
+//! returns [`ClockError::UnsupportedMainClockSource`] if the main clock has
+//! already been switched elsewhere. Raising it is not just a matter of writing
+//! `FIRCCFG.RANGE`: the core LDO level in `SPC0` and the flash read wait states
+//! in `FMU0` have to go up first, in that order, or the next instruction fetch
+//! faults. `AHBCLKDIV` *can* be configured, but division only - `system_clk`
+//! can go below 48 MHz, not above.
+//!
+//! **Sources must be enabled before a peripheral can select them.** Most of the
+//! fan-out gates in `SYSCON0.CLOCK_CTRL` are clear at reset, and `FROHFDIV`
+//! resets halted, so a `*CLKSEL` pointing at `clk_1m` or `fro_hf_div` receives
+//! nothing until [`init()`] has enabled it. [`Clocks`] records only what was
+//! actually brought up, and a driver selecting an unavailable source is
+//! rejected with [`ClockError::BadConfig`] naming the config field to set -
+//! rather than silently running at no clock. Drivers never enable a source
+//! themselves: several are shared across peripherals, and one
+//! (`xtal32k`) can take hundreds of milliseconds to settle.
+//!
+//! **`CLKUNLOCK` is never written.** It resets to `Unlock::Enable`, meaning
+//! clock configuration registers are already writable. Freezing it would break
+//! every later driver, because `*CLKSEL`/`*CLKDIV` are programmed at
+//! driver-construction time, not here.
+//!
+//! **[`Clocks`] is written once, by [`init()`].** That is what makes handing
+//! out a shared `&Clocks` sound, and it is also how the genuinely shared nodes
+//! stay coherent - `pll_div` in particular is a single resource that every
+//! peripheral mux sees as its "PLL divided clock" input.
+//!
+//! Peripheral clock gating (SYSCON `AHBCLKCTRLn`/`PRESETCTRLn`) lives in the
+//! `gate` submodule, and the per-peripheral mux/divider layer in `functional`.
 
 use core::cell::RefCell;
 
 use config::ClocksConfig;
 
-use crate::pac;
-
 pub mod config;
+mod functional;
 mod gate;
+mod source;
 mod types;
 
+pub use functional::{FunctionalClock, enable_and_reset_with_clock};
+#[cfg(mcxn_ostimer)]
+pub use functional::{OstimerClockConfig, OstimerClockSource};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 
@@ -38,7 +65,7 @@ pub(super) static CLOCKS: critical_section::Mutex<RefCell<Option<Clocks>>> =
 /// This function should be called EXACTLY once at start-up, usually via a
 /// call to [`embassy_mcxn::init()`](crate::init()). Subsequent calls will
 /// return an error.
-pub fn init(_settings: ClocksConfig) -> Result<(), ClockError> {
+pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
     critical_section::with(|cs| {
         if CLOCKS.borrow_ref(cs).is_some() {
             Err(ClockError::AlreadyInitialized)
@@ -47,25 +74,34 @@ pub fn init(_settings: ClocksConfig) -> Result<(), ClockError> {
         }
     })?;
 
-    use pac::scg::{FirccfgRange, RccrScs};
+    let main_clk_hz = source::verify_main_clock()?;
 
-    if pac::SCG0.rccr().read().scs() != RccrScs::Firc {
-        return Err(ClockError::UnsupportedMainClockSource);
-    }
-
-    let main_clk_hz = match pac::SCG0.firccfg().read().range() {
-        FirccfgRange::Firc48mhz => 48_000_000,
-        FirccfgRange::Firc144mhz => 144_000_000,
-    };
-
-    // AHBCLKDIV.DIV divides by DIV + 1; reset value is 0 (divide-by-1).
-    let ahb_div = pac::SYSCON0.ahbclkdiv().read().div() as u32 + 1;
-    let system_clk_hz = main_clk_hz / ahb_div;
-
-    let clocks = Clocks {
+    let mut clocks = Clocks {
         main_clk_hz,
-        system_clk_hz,
+        // Filled in below, once AHBCLKDIV is known.
+        system_clk_hz: main_clk_hz,
+        fro_12m: None,
+        fro_hf_48m: None,
+        fro_hf_144m: None,
+        fro_hf_div: None,
+        clk_1m: None,
+        // Not implemented yet; see the field docs.
+        clk_in: None,
+        clk_16k: None,
+        xtal32k: None,
+        pll0_clk: None,
+        pll1_clk0: None,
+        pll1_clk1: None,
+        pll_div: None,
     };
+
+    source::record_sirc(&mut clocks);
+    source::record_firc(&mut clocks);
+    source::configure_clock_ctrl(&settings, &mut clocks);
+    // Needs main_clk_hz already recorded: FROHFDIV divides `fro_hf`.
+    source::configure_fro_hf_div(&settings, &mut clocks);
+
+    clocks.system_clk_hz = main_clk_hz / source::configure_ahb_div(&settings);
 
     critical_section::with(|cs| {
         let mut clks = CLOCKS.borrow_ref_mut(cs);

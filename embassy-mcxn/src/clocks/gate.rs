@@ -2,46 +2,144 @@
 //! clocks through SYSCON.
 //!
 //! Unlike embassy-mcxa (which gates peripheral clocks through MRCC), MCXN947
-//! gates AHB peripheral clocks through `SYSCON0.AHBCLKCTRLx` and resets them
-//! through `SYSCON0.PRESETCTRLx` (RM "Chapter 17 System Controller (SYSCON)").
+//! gates AHB peripheral clocks through `SYSCON0.AHBCLKCTRLn` and resets them
+//! through `SYSCON0.PRESETCTRLn` (RM "Chapter 17 System Controller (SYSCON)").
 //! Clock-enable and reset bits share the same bit position within their
-//! respective register index for a given peripheral.
+//! respective register index for a given peripheral - where a reset bit exists
+//! at all, which for some peripherals (WWDT0, WWDT1, the RAM controllers) it
+//! does not.
+//!
+//! Gates are driven through the write-1-to-act `AHBCLKCTRLSET`/`CLR` and
+//! `PRESETCTRLSET`/`CLR` aliases rather than by read-modify-write on the plain
+//! registers. Two reasons: the operation becomes atomic, so two concurrent
+//! `enable` calls cannot lose one another's bit; and it cannot disturb the
+//! reset-set bits that the PAC fieldsets do not model (`AHBCLKCTRL0` resets to
+//! `0x603`, `PRESETCTRL0` to `0x100`).
+
+/// Derive a bitmask at compile time from a named SYSCON fieldset setter.
+///
+/// Writing the mask as a setter call rather than a literal keeps the bit
+/// position tied to the PAC: if a regeneration moves the field, the mask moves
+/// with it instead of silently pointing somewhere else.
+macro_rules! syscon_mask {
+    ($fieldset:ident, $($setter:tt)*) => {
+        const {
+            let mut r = crate::pac::syscon::$fieldset(0);
+            r.$($setter)*;
+            r.0
+        }
+    };
+}
 
 /// Trait describing an AHB clock gate that can be toggled through SYSCON.
+///
+/// Implementors supply three constants; every method is provided. Prefer the
+/// `impl_syscon_gate!` macro over writing an impl by hand.
 pub trait Gate {
+    /// Index of this peripheral's `AHBCLKCTRLn`/`PRESETCTRLn` register pair.
+    const REG_IDX: usize;
+
+    /// This peripheral's clock-enable bit within `AHBCLKCTRL[REG_IDX]`.
+    const CLK_MASK: u32;
+
+    /// This peripheral's reset bit within `PRESETCTRL[REG_IDX]`, or `0` for a
+    /// peripheral that has no reset bit at all.
+    const RST_MASK: u32;
+
     /// Enable the clock gate.
     ///
     /// # Safety
     ///
     /// The current peripheral must be disabled prior to calling this method.
-    unsafe fn enable_clock();
+    #[inline]
+    unsafe fn enable_clock() {
+        crate::pac::SYSCON0
+            .ahbclkctrlset(Self::REG_IDX)
+            .write_value(crate::pac::syscon::Ahbclkctrlset(Self::CLK_MASK));
+    }
 
     /// Disable the clock gate.
     ///
     /// # Safety
     ///
     /// There must be no active user of this peripheral when calling this method.
-    unsafe fn disable_clock();
+    #[inline]
+    unsafe fn disable_clock() {
+        crate::pac::SYSCON0
+            .ahbclkctrlclr(Self::REG_IDX)
+            .write_value(crate::pac::syscon::Ahbclkctrlclr(Self::CLK_MASK));
+    }
 
-    /// Drive the peripheral into reset.
+    /// Drive the peripheral into reset. A no-op if it has no reset bit.
     ///
     /// # Safety
     ///
     /// There must be no active user of this peripheral when calling this method.
-    unsafe fn assert_reset();
+    #[inline]
+    unsafe fn assert_reset() {
+        if Self::RST_MASK != 0 {
+            crate::pac::SYSCON0
+                .presetctrlset(Self::REG_IDX)
+                .write_value(crate::pac::syscon::Presetctrlset(Self::RST_MASK));
+        }
+    }
 
-    /// Drive the peripheral out of reset.
+    /// Drive the peripheral out of reset. A no-op if it has no reset bit.
     ///
     /// # Safety
     ///
     /// There must be no active user of this peripheral when calling this method.
-    unsafe fn release_reset();
+    #[inline]
+    unsafe fn release_reset() {
+        if Self::RST_MASK != 0 {
+            crate::pac::SYSCON0
+                .presetctrlclr(Self::REG_IDX)
+                .write_value(crate::pac::syscon::Presetctrlclr(Self::RST_MASK));
+        }
+    }
 
     /// Return whether the clock gate for this peripheral is currently enabled.
-    fn is_clock_enabled() -> bool;
+    #[inline]
+    fn is_clock_enabled() -> bool {
+        ahbclkctrl_bits(Self::REG_IDX) & Self::CLK_MASK != 0
+    }
 
-    /// Return whether the peripheral is currently held in reset.
-    fn is_reset_released() -> bool;
+    /// Return whether the peripheral is currently out of reset.
+    ///
+    /// Trivially true for a peripheral with no reset bit - there is nothing
+    /// holding it.
+    #[inline]
+    fn is_reset_released() -> bool {
+        Self::RST_MASK == 0 || presetctrl_bits(Self::REG_IDX) & Self::RST_MASK == 0
+    }
+}
+
+/// `AHBCLKCTRL0..3` are four separately-named registers rather than an array,
+/// so reading one by index needs a match. (Only the SET/CLR aliases are
+/// modelled as arrays.)
+#[inline]
+fn ahbclkctrl_bits(idx: usize) -> u32 {
+    let s = crate::pac::SYSCON0;
+    match idx {
+        0 => s.ahbclkctrl0().read().0,
+        1 => s.ahbclkctrl1().read().0,
+        2 => s.ahbclkctrl2().read().0,
+        3 => s.ahbclkctrl3().read().0,
+        _ => unreachable!(),
+    }
+}
+
+/// As [`ahbclkctrl_bits`], for the reset registers.
+#[inline]
+fn presetctrl_bits(idx: usize) -> u32 {
+    let s = crate::pac::SYSCON0;
+    match idx {
+        0 => s.presetctrl0().read().0,
+        1 => s.presetctrl1().read().0,
+        2 => s.presetctrl2().read().0,
+        3 => s.presetctrl3().read().0,
+        _ => unreachable!(),
+    }
 }
 
 /// Enable the clock gate for the given peripheral, then pulse its reset line.
@@ -108,13 +206,12 @@ pub unsafe fn release_reset<G: Gate>() {
     }
 }
 
-/// Assert a reset line for the given peripheral.
-///
-/// Prefer [`enable_and_reset`].
+/// Assert the reset line for the given peripheral.
 ///
 /// # Safety
 ///
-/// This peripheral must not yet be in use prior to calling `assert_reset`.
+/// This peripheral must no longer be in use prior to calling `assert_reset`.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn assert_reset<G: Gate>() {
     unsafe {
@@ -122,16 +219,17 @@ pub unsafe fn assert_reset<G: Gate>() {
     }
 }
 
-/// Check whether the peripheral is held in reset.
+/// Check whether a peripheral is currently out of reset.
 #[allow(dead_code)]
 #[inline]
 pub fn is_reset_released<G: Gate>() -> bool {
     G::is_reset_released()
 }
 
-/// Pulse a reset line (assert then release).
+/// Pulse the reset line for the given peripheral.
 ///
-/// Prefer [`enable_and_reset`].
+/// For a peripheral with no reset bit this reduces to the two `nop`s and the
+/// spin exits immediately, since there is nothing to hold in reset.
 ///
 /// # Safety
 ///
@@ -147,109 +245,50 @@ pub unsafe fn pulse_reset<G: Gate>() {
     }
 }
 
-/// Implements [`Gate`] for a peripheral gated through a `SYSCON0.AHBCLKCTRLn`
-/// clock-enable bit and a `SYSCON0.PRESETCTRLn` reset bit, at the same
-/// array-indexed field in both (e.g. `port(0)`/`port_rst(0)` at bit 13 of
-/// index 0).
+/// Implements [`Gate`] for a peripheral gated through
+/// `SYSCON0.AHBCLKCTRL{idx}`, and reset through `SYSCON0.PRESETCTRL{idx}` where
+/// such a bit exists.
 ///
-/// `$rst_ty` is the reset value enum SYSCON's register definitions use for
-/// this field family (e.g. `PortRst`, `GpioRst`) - shared across every index
-/// in the family since they all have the same `Released = 0`/`Asserted = 1`
-/// shape.
+/// `clk:` and `rst:` are given as *setter calls* on the corresponding fieldset,
+/// evaluated in a `const` block to derive the bitmask. That spelling works
+/// unchanged for array-indexed field families (`set_port(0, true)`) and for
+/// scalar fields (`set_crc(true)`), which is why one macro covers both.
+///
+/// `rst: none` is for peripherals with a clock-enable bit but no reset bit at
+/// all - WWDT0 and WWDT1 are the ones this crate gates.
 macro_rules! impl_syscon_gate {
-    ($name:ident, $clk_reg:ident, $clk_field:ident, $rst_reg:ident, $rst_field:ident, $rst_ty:ident, $idx:expr) => {
+    (
+        $name:ident, $idx:expr,
+        clk: $clk_fs:ident . $clk_setter:ident ( $($clk_args:expr),* ) ;
+        rst: $rst_fs:ident . $rst_setter:ident ( $($rst_args:expr),* ) , $rst_ty:ident $(,)?
+    ) => {
         impl crate::clocks::Gate for crate::peripherals::$name {
-            paste::paste! {
-                #[inline]
-                unsafe fn enable_clock() {
-                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>]($idx, true));
-                }
-
-                #[inline]
-                unsafe fn disable_clock() {
-                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>]($idx, false));
-                }
-
-                #[inline]
-                unsafe fn release_reset() {
-                    use crate::pac::syscon::$rst_ty;
-                    crate::pac::SYSCON0
-                        .$rst_reg()
-                        .modify(|w| w.[<set_ $rst_field>]($idx, $rst_ty::Released));
-                }
-
-                #[inline]
-                unsafe fn assert_reset() {
-                    use crate::pac::syscon::$rst_ty;
-                    crate::pac::SYSCON0
-                        .$rst_reg()
-                        .modify(|w| w.[<set_ $rst_field>]($idx, $rst_ty::Asserted));
-                }
-            }
-
-            #[inline]
-            fn is_clock_enabled() -> bool {
-                crate::pac::SYSCON0.$clk_reg().read().$clk_field($idx)
-            }
-
-            #[inline]
-            fn is_reset_released() -> bool {
-                use crate::pac::syscon::$rst_ty;
-                crate::pac::SYSCON0.$rst_reg().read().$rst_field($idx) == $rst_ty::Released
-            }
+            const REG_IDX: usize = $idx;
+            const CLK_MASK: u32 = syscon_mask!($clk_fs, $clk_setter($($clk_args),*));
+            const RST_MASK: u32 = syscon_mask!(
+                $rst_fs,
+                $rst_setter($($rst_args,)* crate::pac::syscon::$rst_ty::Asserted)
+            );
         }
+
+        // Driving reset through the SET/CLR aliases assumes a set bit means
+        // "asserted". Every SYSCON reset field enum is shaped that way; check
+        // it rather than trust it.
+        const _: () = {
+            assert!(crate::pac::syscon::$rst_ty::Released.to_bits() == 0);
+            assert!(crate::pac::syscon::$rst_ty::Asserted.to_bits() == 1);
+        };
     };
-}
 
-/// Implements [`Gate`] for a peripheral whose clock-enable and reset bits are
-/// scalar (non-array) fields, and which may sit in different
-/// `AHBCLKCTRLn`/`PRESETCTRLn` registers - unlike [`impl_syscon_gate!`], which
-/// covers array-indexed field families sharing one index.
-///
-/// `$rst_ty` is the reset value enum SYSCON's register definitions use for this
-/// field (e.g. `Dma0Rst`), all of which share the same `Released = 0`/
-/// `Asserted = 1` shape.
-macro_rules! impl_syscon_scalar_gate {
-    ($name:ident, $clk_reg:ident, $clk_field:ident, $rst_reg:ident, $rst_field:ident, $rst_ty:ident) => {
+    (
+        $name:ident, $idx:expr,
+        clk: $clk_fs:ident . $clk_setter:ident ( $($clk_args:expr),* ) ;
+        rst: none $(,)?
+    ) => {
         impl crate::clocks::Gate for crate::peripherals::$name {
-            paste::paste! {
-                #[inline]
-                unsafe fn enable_clock() {
-                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>](true));
-                }
-
-                #[inline]
-                unsafe fn disable_clock() {
-                    crate::pac::SYSCON0.$clk_reg().modify(|w| w.[<set_ $clk_field>](false));
-                }
-
-                #[inline]
-                unsafe fn release_reset() {
-                    use crate::pac::syscon::$rst_ty;
-                    crate::pac::SYSCON0
-                        .$rst_reg()
-                        .modify(|w| w.[<set_ $rst_field>]($rst_ty::Released));
-                }
-
-                #[inline]
-                unsafe fn assert_reset() {
-                    use crate::pac::syscon::$rst_ty;
-                    crate::pac::SYSCON0
-                        .$rst_reg()
-                        .modify(|w| w.[<set_ $rst_field>]($rst_ty::Asserted));
-                }
-            }
-
-            #[inline]
-            fn is_clock_enabled() -> bool {
-                crate::pac::SYSCON0.$clk_reg().read().$clk_field()
-            }
-
-            #[inline]
-            fn is_reset_released() -> bool {
-                use crate::pac::syscon::$rst_ty;
-                crate::pac::SYSCON0.$rst_reg().read().$rst_field() == $rst_ty::Released
-            }
+            const REG_IDX: usize = $idx;
+            const CLK_MASK: u32 = syscon_mask!($clk_fs, $clk_setter($($clk_args),*));
+            const RST_MASK: u32 = 0;
         }
     };
 }
@@ -259,21 +298,24 @@ macro_rules! impl_syscon_scalar_gate {
 // Clocking" (Table 319, `slow_clk`) documents them as always clocked (they
 // live in the always-on VBAT domain, for wake-up support), with no AHB clock
 // gate or reset bit exposed for them at all.
-impl_syscon_gate!(PORT0, ahbclkctrl0, port, presetctrl0, port_rst, PortRst, 0);
-impl_syscon_gate!(PORT1, ahbclkctrl0, port, presetctrl0, port_rst, PortRst, 1);
-impl_syscon_gate!(PORT2, ahbclkctrl0, port, presetctrl0, port_rst, PortRst, 2);
-impl_syscon_gate!(PORT3, ahbclkctrl0, port, presetctrl0, port_rst, PortRst, 3);
-impl_syscon_gate!(PORT4, ahbclkctrl0, port, presetctrl0, port_rst, PortRst, 4);
-impl_syscon_gate!(GPIO0, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 0);
-impl_syscon_gate!(GPIO1, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 1);
-impl_syscon_gate!(GPIO2, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 2);
-impl_syscon_gate!(GPIO3, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 3);
-impl_syscon_gate!(GPIO4, ahbclkctrl0, gpio, presetctrl0, gpio_rst, GpioRst, 4);
+impl_syscon_gate!(PORT0, 0, clk: Ahbclkctrl0.set_port(0, true); rst: Presetctrl0.set_port_rst(0), PortRst);
+impl_syscon_gate!(PORT1, 0, clk: Ahbclkctrl0.set_port(1, true); rst: Presetctrl0.set_port_rst(1), PortRst);
+impl_syscon_gate!(PORT2, 0, clk: Ahbclkctrl0.set_port(2, true); rst: Presetctrl0.set_port_rst(2), PortRst);
+impl_syscon_gate!(PORT3, 0, clk: Ahbclkctrl0.set_port(3, true); rst: Presetctrl0.set_port_rst(3), PortRst);
+impl_syscon_gate!(PORT4, 0, clk: Ahbclkctrl0.set_port(4, true); rst: Presetctrl0.set_port_rst(4), PortRst);
+impl_syscon_gate!(GPIO0, 0, clk: Ahbclkctrl0.set_gpio(0, true); rst: Presetctrl0.set_gpio_rst(0), GpioRst);
+impl_syscon_gate!(GPIO1, 0, clk: Ahbclkctrl0.set_gpio(1, true); rst: Presetctrl0.set_gpio_rst(1), GpioRst);
+impl_syscon_gate!(GPIO2, 0, clk: Ahbclkctrl0.set_gpio(2, true); rst: Presetctrl0.set_gpio_rst(2), GpioRst);
+impl_syscon_gate!(GPIO3, 0, clk: Ahbclkctrl0.set_gpio(3, true); rst: Presetctrl0.set_gpio_rst(3), GpioRst);
+impl_syscon_gate!(GPIO4, 0, clk: Ahbclkctrl0.set_gpio(4, true); rst: Presetctrl0.set_gpio_rst(4), GpioRst);
 
 // The two eDMA controllers sit in different register pairs: DMA0 in
-// AHBCLKCTRL0/PRESETCTRL0 bit 26, DMA1 in AHBCLKCTRL2/PRESETCTRL2 bit 1 (RM
-// Chapter 17). Both are scalar fields rather than members of an indexed family.
+// AHBCLKCTRL0/PRESETCTRL0 bit 26, DMA1 in AHBCLKCTRL2/PRESETCTRL2 bit 1.
 #[cfg(mcxn_dma)]
-impl_syscon_scalar_gate!(DMA0, ahbclkctrl0, dma0, presetctrl0, dma0_rst, Dma0Rst);
+impl_syscon_gate!(DMA0, 0, clk: Ahbclkctrl0.set_dma0(true); rst: Presetctrl0.set_dma0_rst(), Dma0Rst);
 #[cfg(mcxn_dma)]
-impl_syscon_scalar_gate!(DMA1, ahbclkctrl2, dma1, presetctrl2, dma1_rst, Dma1Rst);
+impl_syscon_gate!(DMA1, 2, clk: Ahbclkctrl2.set_dma1(true); rst: Presetctrl2.set_dma1_rst(), Dma1Rst);
+
+// OSTIMER0, the source of the embassy-time driver.
+#[cfg(mcxn_ostimer)]
+impl_syscon_gate!(OSTIMER0, 1, clk: Ahbclkctrl1.set_ostimer(true); rst: Presetctrl1.set_ostimer_rst(), OstimerRst);

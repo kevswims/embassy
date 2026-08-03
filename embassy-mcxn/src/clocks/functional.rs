@@ -1,0 +1,225 @@
+//! The per-peripheral functional-clock layer.
+//!
+//! Between a [`Clocks`] tree node and a peripheral sit a `*CLKSEL` mux and
+//! usually a `*CLKDIV` divider. SYSCON has 54 of the former and 58 of the
+//! latter, and they are not interchangeable: each selector has its own enum
+//! type whose variants are *anonymous* (`Enum0`, or `Enum0x0` - the two
+//! spellings appear at the same field width) and whose ordering differs between
+//! peripherals. `Adc0clkselSel` is `{1=PLL0, 2=fro_hf, 3=fro_12m, 4=clk_in}`
+//! while `FlexioclkselSel` is `{1=PLL0, 2=clk_in, 3=fro_hf, 4=fro_12m}`.
+//!
+//! So there can be no shared mux enum, and every peripheral needs its own
+//! mapping from "source I want" to "raw value for this register". That mapping
+//! is what [`impl_functional_clock!`] declares, and each row carries the raw
+//! value it expects so that a PAC regeneration renumbering the anonymous
+//! variants breaks the build instead of silently selecting a different clock.
+//!
+//! Bus-clocked peripherals - PORT, GPIO, DMA, CRC and friends - have no mux and
+//! no divider. They do not implement [`FunctionalClock`]; they use
+//! [`super::enable_and_reset`] and read [`Clocks::system_clk_hz`] if they need
+//! a rate.
+
+use super::gate::Gate;
+use super::types::{ClockError, Clocks};
+use super::CLOCKS;
+
+/// A peripheral's functional-clock configuration: which source, and how far
+/// divided.
+pub trait FunctionalClock {
+    /// Source selection, plus a divisor for peripherals that have a `*CLKDIV`.
+    type Config;
+
+    /// Program the mux and divider, returning the resulting frequency in Hz.
+    ///
+    /// # Contract
+    ///
+    /// Called with this peripheral's functional clock gated *off*, inside a
+    /// critical section, with a read-only view of [`Clocks`]. Must not touch
+    /// core system clock configuration and must not block for long.
+    fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError>;
+}
+
+/// Enable a peripheral's clock gate, program its functional clock, and pulse
+/// its reset. Returns the functional clock frequency in Hz.
+///
+/// The ordering is load-bearing. The mux and divider are programmed while the
+/// peripheral's clock is gated off, because switching a live mux or reloading a
+/// live divider glitches. And the `?` sits before the gate is enabled, so if
+/// the requested source turns out to be unavailable the peripheral is left
+/// disabled rather than half-configured.
+///
+/// # Safety
+///
+/// This peripheral must not already be in use.
+pub unsafe fn enable_and_reset_with_clock<G>(cfg: &G::Config) -> Result<u32, ClockError>
+where
+    G: Gate + FunctionalClock,
+{
+    unsafe {
+        G::disable_clock();
+
+        let hz = critical_section::with(|cs| {
+            let clocks = CLOCKS.borrow_ref(cs);
+            let clocks = clocks.as_ref().ok_or(ClockError::NeverInitialized)?;
+            G::configure(cfg, clocks)
+        })?;
+
+        G::enable_clock();
+        while !G::is_clock_enabled() {}
+        core::arch::asm!("dsb sy; isb sy", options(nomem, nostack, preserves_flags));
+
+        super::gate::pulse_reset::<G>();
+
+        Ok(hz)
+    }
+}
+
+/// Program a divider whose register has the full `div`/`reset`/`halt`/`unstab`
+/// field set. That is 55 of SYSCON's 58 dividers, including every
+/// per-peripheral one.
+///
+/// The divisor is written while the divider is halted and held in reset, then
+/// both are released, then we wait for the output to report stable.
+///
+/// Note the field polarity here reads the way it is named - `Halt::Run` is 0,
+/// `Reset::Released` is 0, `Unstab::Stable` is 0. embassy-mcxa's equivalent
+/// macro works against inverted `On`/`Off` naming, so do not pattern-match the
+/// two against each other.
+#[allow(unused_macros)] // Used once WWDT lands; it has the only per-peripheral divider here.
+macro_rules! apply_div_full {
+    ($reg:expr, $divty:ident, $div:expr) => {{
+        ::paste::paste! {
+            use crate::pac::syscon::{[<$divty Halt>], [<$divty Reset>], [<$divty Unstab>]};
+
+            let r = $reg;
+            r.modify(|w| {
+                w.set_div($div.into_bits());
+                w.set_halt([<$divty Halt>]::Halt);
+                w.set_reset([<$divty Reset>]::Asserted);
+            });
+            r.modify(|w| {
+                w.set_halt([<$divty Halt>]::Run);
+                w.set_reset([<$divty Reset>]::Released);
+            });
+            while r.read().unstab() == [<$divty Unstab>]::Ongoing {}
+        }
+    }};
+}
+
+/// Implement [`FunctionalClock`] for a peripheral, generating its source enum,
+/// its config struct, and the `configure()` body.
+///
+/// Each row of `sources` reads
+/// `Variant => PacVariant @ raw : tree_accessor`, where `raw` is the register
+/// value that `PacVariant` must encode and `tree_accessor` is a [`Clocks`]
+/// `ensure_*` method. The `raw` value is asserted against the PAC at compile
+/// time - that check is the reason the anonymous, per-peripheral-permuted
+/// selector enums are safe to use.
+///
+/// `sel:` takes the register accessor expression, so array-indexed selectors
+/// work by writing the index at the invocation site
+/// (`pac::SYSCON0.fcclksel(3)`).
+///
+/// `div:` is either `none` for a peripheral with no `*CLKDIV`, or
+/// `full(accessor, EnumPrefix, BITS)`.
+macro_rules! impl_functional_clock {
+    (
+        $periph:ident,
+        name: $src_enum:ident / $cfg_struct:ident,
+        sel: $sel:expr, $sel_ty:ident,
+        div: $div:tt,
+        sources: {
+            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+        }
+    ) => {
+        #[doc = concat!("Functional clock sources selectable for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub enum $src_enum {
+            $(
+                #[doc = concat!("Source ", stringify!($variant), ".")]
+                $variant,
+            )+
+        }
+
+        // The selector enums have anonymous variant names and orderings that
+        // differ between peripherals, so pin each variant to the raw value this
+        // mapping was written against.
+        const _: () = {
+            $( assert!(crate::pac::syscon::$sel_ty::$pac_variant.to_bits() == $raw); )+
+        };
+
+        impl_functional_clock!(@config $periph, $cfg_struct, $src_enum, $div);
+
+        impl crate::clocks::FunctionalClock for crate::peripherals::$periph {
+            type Config = $cfg_struct;
+
+            fn configure(
+                cfg: &Self::Config,
+                clocks: &crate::clocks::Clocks,
+            ) -> Result<u32, crate::clocks::ClockError> {
+                // Resolve the source rate first. On failure we return before
+                // touching a register, leaving the mux as it was.
+                let src_hz = match cfg.source {
+                    $( $src_enum::$variant => clocks.$accessor()?, )+
+                };
+
+                $sel.modify(|w| {
+                    w.set_sel(match cfg.source {
+                        $( $src_enum::$variant => crate::pac::syscon::$sel_ty::$pac_variant, )+
+                    })
+                });
+
+                Ok(impl_functional_clock!(@apply_div cfg, src_hz, $div))
+            }
+        }
+    };
+
+    // No divider: the config carries just a source.
+    (@config $periph:ident, $cfg_struct:ident, $src_enum:ident, none) => {
+        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct $cfg_struct {
+            /// Which source to select.
+            pub source: $src_enum,
+        }
+    };
+
+    // With a divider: the config carries a width-bound divisor too.
+    (@config $periph:ident, $cfg_struct:ident, $src_enum:ident,
+     full($reg:expr, $divty:ident, $bits:expr)) => {
+        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct $cfg_struct {
+            /// Which source to select.
+            pub source: $src_enum,
+            /// Divisor applied to the selected source.
+            pub div: crate::clocks::config::Div<$bits>,
+        }
+    };
+
+    (@apply_div $cfg:ident, $src_hz:ident, none) => { $src_hz };
+
+    (@apply_div $cfg:ident, $src_hz:ident, full($reg:expr, $divty:ident, $bits:expr)) => {{
+        apply_div_full!($reg, $divty, $cfg.div);
+        $src_hz / $cfg.div.into_divisor()
+    }};
+}
+
+// OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
+// it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
+// unlike the other two options it needs nothing from the VBAT power domain.
+#[cfg(mcxn_ostimer)]
+impl_functional_clock! {
+    OSTIMER0,
+    name: OstimerClockSource / OstimerClockConfig,
+    sel: crate::pac::SYSCON0.ostimerclksel(), OstimerclkselSel,
+    div: none,
+    sources: {
+        Clk16k  => Enum0 @ 0 : ensure_clk_16k,
+        Xtal32k => Enum1 @ 1 : ensure_xtal32k,
+        Clk1M   => Enum2 @ 2 : ensure_clk_1m,
+    }
+}
