@@ -18,6 +18,14 @@ async fn main(_spawner: Spawner) {
         defmt::info!("main_clk = {} Hz, system_clk = {} Hz", c.main_clk_hz, c.system_clk_hz);
     });
 
+    // Why the MCU last came up. Reading this latches and clears CMC0.SRS, so
+    // the value is cached for the rest of the boot and repeat calls are cheap.
+    let reason = hal::reset_reason::reset_reason();
+    defmt::info!("reset reason: {}", reason);
+    for r in reason {
+        defmt::info!("  - {}", r);
+    }
+
     loop {
         defmt::info!("tick");
         cortex_m::asm::delay(48_000_000);
