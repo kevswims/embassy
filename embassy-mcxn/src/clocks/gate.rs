@@ -319,3 +319,7 @@ impl_syscon_gate!(DMA1, 2, clk: Ahbclkctrl2.set_dma1(true); rst: Presetctrl2.set
 // OSTIMER0, the source of the embassy-time driver.
 #[cfg(mcxn_ostimer)]
 impl_syscon_gate!(OSTIMER0, 1, clk: Ahbclkctrl1.set_ostimer(true); rst: Presetctrl1.set_ostimer_rst(), OstimerRst);
+
+// CRC0 is bus-clocked: it has no functional-clock mux or divider of its own.
+#[cfg(mcxn_crc)]
+impl_syscon_gate!(CRC0, 0, clk: Ahbclkctrl0.set_crc(true); rst: Presetctrl0.set_crc_rst(), CrcRst);
