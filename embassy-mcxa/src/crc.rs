@@ -602,7 +602,10 @@ impl Algorithm16 {
                 polynomial: 0x8005,
                 reflect_in: Reflect::Yes,
                 reflect_out: Reflect::Yes,
-                complement_out: Complement::No,
+                // CRC-16/USB is MODBUS plus a final XOR with 0xFFFF, which is
+                // what CTRL[FXOR] does. Without it this returns the MODBUS
+                // checksum.
+                complement_out: Complement::Yes,
                 seed: 0xffff,
             },
             Algorithm16::X25 => Config {
