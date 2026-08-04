@@ -323,3 +323,12 @@ impl_syscon_gate!(OSTIMER0, 1, clk: Ahbclkctrl1.set_ostimer(true); rst: Presetct
 // CRC0 is bus-clocked: it has no functional-clock mux or divider of its own.
 #[cfg(mcxn_crc)]
 impl_syscon_gate!(CRC0, 0, clk: Ahbclkctrl0.set_crc(true); rst: Presetctrl0.set_crc_rst(), CrcRst);
+
+// WWDT0/WWDT1 have an AHBCLKCTRL0 clock-enable bit but no PRESETCTRL bit at
+// all, so reset is a no-op for them and `is_reset_released()` is trivially
+// true. Without that, `pulse_reset` would spin forever waiting on a reset line
+// that does not exist.
+#[cfg(mcx_wwdt)]
+impl_syscon_gate!(WWDT0, 0, clk: Ahbclkctrl0.set_wwdt0(true); rst: none);
+#[cfg(mcx_wwdt)]
+impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);

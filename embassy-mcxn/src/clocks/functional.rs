@@ -106,6 +106,32 @@ macro_rules! apply_div_full {
     }};
 }
 
+/// Program a full-shape divider without waiting for `UNSTAB` to clear.
+///
+/// `WDT0CLKDIV` and `WDT1CLKDIV` latch `UNSTAB` high the moment `HALT` is
+/// released and never clear it, even though the divider output is correct -
+/// measured against `embassy-time`, `wdt0_clk` comes out at 249,993 Hz for the
+/// expected 250,000 (`clk_1m` / 1 / 4). `FROHFDIV` and `AHBCLKDIV` do clear it,
+/// so the flag is not usable uniformly and polling it here would hang forever.
+macro_rules! apply_div_no_poll {
+    ($reg:expr, $divty:ident, $div:expr) => {{
+        ::paste::paste! {
+            use crate::pac::syscon::{[<$divty Halt>], [<$divty Reset>]};
+
+            let r = $reg;
+            r.modify(|w| {
+                w.set_div($div.into_bits());
+                w.set_halt([<$divty Halt>]::Halt);
+                w.set_reset([<$divty Reset>]::Asserted);
+            });
+            r.modify(|w| {
+                w.set_halt([<$divty Halt>]::Run);
+                w.set_reset([<$divty Reset>]::Released);
+            });
+        }
+    }};
+}
+
 /// Implement [`FunctionalClock`] for a peripheral, generating its source enum,
 /// its config struct, and the `configure()` body.
 ///
@@ -221,5 +247,55 @@ impl_functional_clock! {
         Clk16k  => Enum0 @ 0 : ensure_clk_16k,
         Xtal32k => Enum1 @ 1 : ensure_xtal32k,
         Clk1M   => Enum2 @ 2 : ensure_clk_1m,
+    }
+}
+
+/// Functional clock configuration shared by `WWDT0` and `WWDT1`.
+///
+/// Both are driven from `clk_1m` (RM "Chapter 33 Clocking", figures 147 and
+/// 148), then through the SYSCON divider below, then through a fixed /4 inside
+/// the watchdog itself. WWDT0 has no `*CLKSEL` at all, its source being
+/// hardwired; WWDT1 has one, and its reset value already selects `clk_1m`.
+///
+/// WWDT1's other options (`clk_16k` from the VBAT domain, `fro_hf_div`) would
+/// need this to grow a source field. Neither is useful yet: the VBAT sources are
+/// not implemented and `fro_hf_div` is halted unless asked for.
+#[cfg(mcx_wwdt)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct WwdtClockConfig {
+    /// Divisor applied to `clk_1m` ahead of the watchdog's own fixed /4.
+    pub div: crate::clocks::config::Div<6>,
+}
+
+#[cfg(mcx_wwdt)]
+impl crate::clocks::FunctionalClock for crate::peripherals::WWDT0 {
+    type Config = WwdtClockConfig;
+
+    fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError> {
+        // No WDT0CLKSEL exists: the source is hardwired to clk_1m, so there is
+        // only a divider to program.
+        let src_hz = clocks.ensure_clk_1m()?;
+        apply_div_no_poll!(crate::pac::SYSCON0.wdt0clkdiv(), Wdt0clkdiv, cfg.div);
+        Ok(src_hz / cfg.div.into_divisor())
+    }
+}
+
+#[cfg(mcx_wwdt)]
+impl crate::clocks::FunctionalClock for crate::peripherals::WWDT1 {
+    type Config = WwdtClockConfig;
+
+    fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError> {
+        use crate::pac::syscon::Wdt1clkselSel;
+
+        // Both Enum2 and Enum3 select clk_1m on this mux; Enum2 is canonical.
+        const _: () = assert!(Wdt1clkselSel::Enum2.to_bits() == 2);
+
+        let src_hz = clocks.ensure_clk_1m()?;
+        crate::pac::SYSCON0
+            .wdt1clksel()
+            .modify(|w| w.set_sel(Wdt1clkselSel::Enum2));
+        apply_div_no_poll!(crate::pac::SYSCON0.wdt1clkdiv(), Wdt1clkdiv, cfg.div);
+        Ok(src_hz / cfg.div.into_divisor())
     }
 }

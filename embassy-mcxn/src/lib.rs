@@ -26,6 +26,8 @@ pub mod gpio;
 pub mod ostimer;
 #[cfg(mcxn_cmc)]
 pub mod reset_reason;
+#[cfg(mcx_wwdt)]
+pub mod wwdt;
 
 #[cfg(feature = "mcxn947")]
 pub use mcxn947_exclusive::*;

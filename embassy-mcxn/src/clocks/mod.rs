@@ -49,6 +49,8 @@ mod source;
 mod types;
 
 pub use functional::{FunctionalClock, enable_and_reset_with_clock};
+#[cfg(mcx_wwdt)]
+pub use functional::WwdtClockConfig;
 #[cfg(mcxn_ostimer)]
 pub use functional::{OstimerClockConfig, OstimerClockSource};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
