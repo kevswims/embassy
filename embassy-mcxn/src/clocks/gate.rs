@@ -338,3 +338,9 @@ impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
 // same way when they are needed.
 #[cfg(mcx_ctimer)]
 impl_syscon_gate!(CTIMER0, 1, clk: Ahbclkctrl1.set_timer0(true); rst: Presetctrl1.set_timer0_rst(), Timer0Rst);
+
+// INPUTMUX0 is bus-clocked like CRC0: no functional-clock mux or divider.
+// CTIMER capture routes a pad's INP signal through it, so it is only ungated
+// for the duration of that register write - see `ctimer::capture`.
+#[cfg(mcxn_inputmux0)]
+impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0.set_mux_rst(), MuxRst);
