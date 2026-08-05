@@ -441,6 +441,7 @@ fn generate_ctimer_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
     let ctimer_regex = Regex::new(r"^CTIMER\d+").unwrap();
+    let input_regex = Regex::new(r"(?:^INP)(\d+)").unwrap();
     let match_channel_regex = Regex::new(r"(?:^MAT)(\d+)").unwrap();
 
     for ctimer in METADATA.peripherals.iter().filter(|p| ctimer_regex.is_match(p.name)) {
@@ -452,11 +453,15 @@ fn generate_ctimer_pin_impls() -> TokenStream {
         // There are multiple INPn and MATn signals
         // And they share pins. We don't use that, so we need to filter out duplicates to prevent duplicate trait impls
         for signal in ctimer.signals {
-            if signal.name.starts_with("INP") {
+            if let Some(inp_index) = get_regex_num(signal.name, &input_regex) {
                 for pin in signal.pins {
                     let pin_name = format_ident!("{}", pin.pin);
                     let mux = format_ident!("Mux{}", pin.alt);
-                    inp_pins.insert(pin_name, mux);
+                    // Every INPn signal on this timer lists the same pins (RM:
+                    // the 20 capture inputs are shared across all five CTIMERs
+                    // through INPUTMUX), so a pin's INP index is a property of
+                    // the pin, not of which timer we happen to be iterating.
+                    inp_pins.insert(pin_name, (mux, inp_index as u8));
                 }
             } else if let Some(match_index) = get_regex_num(signal.name, &match_channel_regex) {
                 for pin in signal.pins {
@@ -477,11 +482,11 @@ fn generate_ctimer_pin_impls() -> TokenStream {
             }
         }
 
-        for (pin_name, mux) in inp_pins {
+        for (pin_name, (mux, inp_index)) in inp_pins {
             let feature_gate = pin_feature_gate(&pin_name.to_string());
             generated.extend(quote! {
                 #feature_gate
-                crate::impl_ctimer_input_pin!(#pin_name, #ctimer_name, #mux);
+                crate::impl_ctimer_input_pin!(#pin_name, #ctimer_name, #mux, #inp_index);
             });
         }
         for (pin_name, mux) in mat_pins {

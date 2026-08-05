@@ -11,8 +11,8 @@
 //! [`ValidMatchConfig`].
 //!
 //! **Status:** match outputs only. Capture inputs have their pin traits
-//! generated ([`InputPin`]) but no driver, and there is no interrupt-driven or
-//! PWM support yet.
+//! generated ([`InputPin`]) and now carry an [`InputPin::INP`] index, but
+//! there is no capture driver in this module yet, and no PWM support either.
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
@@ -42,12 +42,19 @@ impl Channel {
 }
 
 pub(crate) trait SealedInstance {
+    /// Index into INPUTMUX0's per-timer `ctimerXcap` registers and this
+    /// module's per-timer waker/flag arrays.
+    const TIMER_INDEX: u8;
+
     fn regs() -> crate::pac::ctimer::Ctimer;
 }
 
 /// A CTIMER peripheral.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + PeripheralType + 'static {}
+pub trait Instance: SealedInstance + PeripheralType + 'static {
+    /// Interrupt for this CTIMER instance.
+    type Interrupt: crate::interrupt::typelevel::Interrupt;
+}
 
 #[doc(hidden)]
 #[macro_export]
@@ -55,13 +62,17 @@ macro_rules! impl_ctimer_instance {
     ($n:literal) => {
         ::paste::paste! {
             impl crate::ctimer::SealedInstance for crate::peripherals::[<CTIMER $n>] {
+                const TIMER_INDEX: u8 = $n;
+
                 #[inline(always)]
                 fn regs() -> crate::pac::ctimer::Ctimer {
                     crate::pac::[<CTIMER $n>]
                 }
             }
 
-            impl crate::ctimer::Instance for crate::peripherals::[<CTIMER $n>] {}
+            impl crate::ctimer::Instance for crate::peripherals::[<CTIMER $n>] {
+                type Interrupt = crate::interrupt::typelevel::[<CTIMER $n>];
+            }
 
             crate::impl_ctimer_channel!([<CTIMER $n _CH0>], [<CTIMER $n>], Zero);
             crate::impl_ctimer_channel!([<CTIMER $n _CH1>], [<CTIMER $n>], One);
@@ -100,9 +111,17 @@ pub(crate) trait SealedOutputPin<T: Instance> {}
 /// A pad that can be routed to a CTIMER capture input.
 ///
 /// The 20 capture inputs are shared: any of them can be routed to any timer
-/// through INPUTMUX, so every CTIMER implements this for the same set of pads.
+/// through INPUTMUX, so every CTIMER implements this for the same set of pads,
+/// each with the same [`InputPin::INP`] - a pin's INP index is fixed by the pad,
+/// not by which timer happens to be observing it.
 #[allow(private_bounds)]
 pub trait InputPin<T: Instance>: GpioPin + SealedInputPin<T> + PeripheralType {
+    /// Which of the 20 shared `CT_INPn` signals this pad carries.
+    ///
+    /// A future capture driver would write this into the target channel's
+    /// INPUTMUX capture-select register; nothing here uses it yet.
+    const INP: u8;
+
     /// Configure this pad to act as the capture input.
     fn mux(&self);
 }
@@ -117,10 +136,12 @@ pub trait OutputPin<T: Instance>: GpioPin + SealedOutputPin<T> + PeripheralType 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! impl_ctimer_input_pin {
-    ($pin:ident, $peri:ident, $fn:ident) => {
+    ($pin:ident, $peri:ident, $fn:ident, $inp:literal) => {
         impl crate::ctimer::SealedInputPin<crate::peripherals::$peri> for crate::peripherals::$pin {}
 
         impl crate::ctimer::InputPin<crate::peripherals::$peri> for crate::peripherals::$pin {
+            const INP: u8 = $inp;
+
             #[inline(always)]
             fn mux(&self) {
                 use crate::gpio::SealedPin;
