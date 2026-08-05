@@ -193,15 +193,19 @@ macro_rules! impl_ctimer_match {
 ///
 /// The pin toggles on every match and the counter resets, so the output is a
 /// square wave at half the match rate, generated entirely in hardware.
-pub struct MatchOutput<'d, T: Instance> {
-    /// Held to keep exclusive use of the timer for this driver's lifetime.
+pub struct MatchOutput<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> {
+    /// Held to keep exclusive use of the timer, channel and pin for this
+    /// driver's lifetime - dropping any of them early would let something else
+    /// reconfigure hardware this driver is still actively using.
     _timer: Peri<'d, T>,
+    _channel: Peri<'d, Ch>,
+    _pin: Peri<'d, P>,
     channel: Channel,
     /// Functional clock feeding the counter, before the prescaler.
     hz: u32,
 }
 
-impl<'d, T: Instance + Gate + FunctionalClock> MatchOutput<'d, T> {
+impl<'d, T: Instance + Gate + FunctionalClock, Ch: PeripheralType, P: PeripheralType> MatchOutput<'d, T, Ch, P> {
     /// Configure `pin` to be toggled by `channel` every `period` counter ticks.
     ///
     /// This enables and resets the timer's functional clock, so it must not be
@@ -209,9 +213,9 @@ impl<'d, T: Instance + Gate + FunctionalClock> MatchOutput<'d, T> {
     /// stopped; call [`MatchOutput::start`].
     ///
     /// A `period` of 0 toggles on every tick.
-    pub fn new<Ch, P>(
+    pub fn new(
         timer: Peri<'d, T>,
-        _channel: Peri<'d, Ch>,
+        channel_peri: Peri<'d, Ch>,
         pin: Peri<'d, P>,
         clock: &T::Config,
         period: u32,
@@ -224,9 +228,11 @@ impl<'d, T: Instance + Gate + FunctionalClock> MatchOutput<'d, T> {
         // SAFETY: `timer` is owned, so nothing else is driving this peripheral.
         let hz = unsafe { enable_and_reset_with_clock::<T>(clock) }?;
 
-        let channel = _channel.number();
+        let channel = channel_peri.number();
         let mut this = Self {
             _timer: timer,
+            _channel: channel_peri,
+            _pin: pin,
             channel,
             hz,
         };
@@ -243,13 +249,13 @@ impl<'d, T: Instance + Gate + FunctionalClock> MatchOutput<'d, T> {
         this.set_reset_on_match(true);
         this.set_external_match(crate::pac::ctimer::Emc::Toggle);
 
-        pin.mux();
+        this._pin.mux();
 
         Ok(this)
     }
 }
 
-impl<T: Instance> MatchOutput<'_, T> {
+impl<T: Instance, Ch: PeripheralType, P: PeripheralType> MatchOutput<'_, T, Ch, P> {
     /// The functional clock feeding the counter, in Hz.
     ///
     /// The output toggles every `period + 1` of these ticks.
@@ -305,7 +311,7 @@ impl<T: Instance> MatchOutput<'_, T> {
     }
 }
 
-impl<T: Instance> Drop for MatchOutput<'_, T> {
+impl<T: Instance, Ch: PeripheralType, P: PeripheralType> Drop for MatchOutput<'_, T, Ch, P> {
     fn drop(&mut self) {
         let regs = T::regs();
         regs.tcr().modify(|w| w.set_cen(false));
