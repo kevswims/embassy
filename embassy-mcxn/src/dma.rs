@@ -23,9 +23,13 @@
 //! [`DmaChannel::mem_to_mem`] and [`DmaChannel::memset`] are started from
 //! software (`TCD_CSR[START]`) and move their whole buffer in a single major
 //! loop iteration. Peripheral-driven transfers instead take their pace from a
-//! hardware service request, selected with `set_request_source`; that needs DMA
-//! request-source metadata, which MCXN947 does not have yet, so only
-//! software-started transfers are usable today.
+//! hardware service request, selected with `set_request_source` from the
+//! `DmaRequest` sources the PAC metadata provides. Both eDMA controllers share
+//! one request map, so any source is valid on any channel.
+//!
+//! Note that the serial requests are per LP_FLEXCOMM rather than per function:
+//! one `LpFlexcommNRx`/`Tx` pair serves whichever of UART, SPI or I2C that
+//! flexcomm is configured as.
 //!
 //! # Memory attributes
 //!
@@ -62,7 +66,7 @@ use core::task::{Context, Poll};
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 
-pub(crate) use crate::_generated::DmaRequest;
+pub use crate::_generated::DmaRequest;
 use crate::clocks::enable_and_reset;
 use crate::pac::dma::Halt;
 use crate::pac::edma_tcd::{
@@ -669,35 +673,53 @@ impl DmaChannel<'_> {
         Ok(Transfer::new(self.reborrow()))
     }
 
-    /// Write `buf` to a peripheral register.
+    /// Write `buf` to a peripheral register, paced by `request`.
+    ///
+    /// The transfer advances one word per service request from `request`, so
+    /// nothing moves until that peripheral starts asserting it.
     ///
     /// # Safety
     ///
-    /// `buf` must stay valid for the duration of the transfer, and `peri_addr`
-    /// must be valid for writes.
+    /// `buf` must stay valid for the duration of the transfer, `peri_addr` must
+    /// be valid for writes, and `request` must belong to the peripheral that
+    /// will drive it.
     pub unsafe fn write_to_peripheral<W: Word>(
         &mut self,
         buf: &[W],
         peri_addr: *mut W,
+        request: DmaRequest,
         options: TransferOptions,
     ) -> Result<Transfer<'_>, InvalidParameters> {
-        unsafe { self.setup_write_to_peripheral(buf, peri_addr, false, options)? };
+        unsafe {
+            self.setup_write_to_peripheral(buf, peri_addr, false, options)?;
+            self.set_request_source(request);
+            self.enable_request();
+        }
         Ok(Transfer::new(self.reborrow()))
     }
 
-    /// Read from a peripheral register into `buf`.
+    /// Read from a peripheral register into `buf`, paced by `request`.
+    ///
+    /// The transfer advances one word per service request from `request`, so
+    /// nothing moves until that peripheral starts asserting it.
     ///
     /// # Safety
     ///
-    /// `buf` must stay valid for the duration of the transfer, and `peri_addr`
-    /// must be valid for reads.
+    /// `buf` must stay valid for the duration of the transfer, `peri_addr` must
+    /// be valid for reads, and `request` must belong to the peripheral that will
+    /// drive it.
     pub unsafe fn read_from_peripheral<W: Word>(
         &mut self,
         peri_addr: *const W,
         buf: &mut [W],
+        request: DmaRequest,
         options: TransferOptions,
     ) -> Result<Transfer<'_>, InvalidParameters> {
-        unsafe { self.setup_read_from_peripheral(peri_addr, buf, false, options)? };
+        unsafe {
+            self.setup_read_from_peripheral(peri_addr, buf, false, options)?;
+            self.set_request_source(request);
+            self.enable_request();
+        }
         Ok(Transfer::new(self.reborrow()))
     }
 

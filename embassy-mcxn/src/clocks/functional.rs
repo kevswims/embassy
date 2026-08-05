@@ -85,7 +85,10 @@ where
 /// `Reset::Released` is 0, `Unstab::Stable` is 0. embassy-mcxa's equivalent
 /// macro works against inverted `On`/`Off` naming, so do not pattern-match the
 /// two against each other.
-#[allow(unused_macros)] // Used once WWDT lands; it has the only per-peripheral divider here.
+// Currently unused: of the per-peripheral dividers wired up so far, WWDT's need
+// `apply_div_no_poll!` and CTIMER's has a different field shape entirely. Kept
+// as the correct sequence for a divider whose `UNSTAB` does clear.
+#[allow(unused_macros)]
 macro_rules! apply_div_full {
     ($reg:expr, $divty:ident, $div:expr) => {{
         ::paste::paste! {
@@ -296,6 +299,55 @@ impl crate::clocks::FunctionalClock for crate::peripherals::WWDT1 {
             .wdt1clksel()
             .modify(|w| w.set_sel(Wdt1clkselSel::Enum2));
         apply_div_no_poll!(crate::pac::SYSCON0.wdt1clkdiv(), Wdt1clkdiv, cfg.div);
+        Ok(src_hz / cfg.div.into_divisor())
+    }
+}
+
+/// Functional clock configuration for `CTIMER0`.
+///
+/// Sourced from `clk_1m`. `CTIMERCLKSEL` offers PLL and `fro_hf` options too,
+/// but those are not brought up yet, so this only needs a divisor.
+#[cfg(mcx_ctimer)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Ctimer0ClockConfig {
+    /// Divisor applied to `clk_1m`.
+    pub div: crate::clocks::config::Div<8>,
+}
+
+#[cfg(mcx_ctimer)]
+impl crate::clocks::FunctionalClock for crate::peripherals::CTIMER0 {
+    type Config = Ctimer0ClockConfig;
+
+    fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError> {
+        use crate::pac::syscon::{CtimerclkdivHalt, CtimerclkselSel};
+
+        // CTIMERCLKSEL resets to 0xF ("no clock"), so the mux must be written
+        // even to get the nominal default. Enum0x0 is FRO_1M, i.e. clk_1m.
+        const _: () = assert!(CtimerclkselSel::Enum0x0.to_bits() == 0);
+
+        let src_hz = clocks.ensure_clk_1m()?;
+
+        crate::pac::SYSCON0
+            .ctimerclksel(0)
+            .modify(|w| w.set_sel(CtimerclkselSel::Enum0x0));
+
+        // This divider has its own shape: `reset` is a bare bool rather than an
+        // enum, and `halt`/`unstab` are spelled Enable/Disable rather than
+        // Run/Halt and Stable/Ongoing - `Enable` meaning running and stable
+        // respectively. So none of the shared divider macros fit. Like every
+        // other SYSCON divider it also resets halted.
+        let d = crate::pac::SYSCON0.ctimerclkdiv(0);
+        d.modify(|w| {
+            w.set_div(cfg.div.into_bits());
+            w.set_halt(CtimerclkdivHalt::Disable);
+            w.set_reset(true);
+        });
+        d.modify(|w| {
+            w.set_halt(CtimerclkdivHalt::Enable);
+            w.set_reset(false);
+        });
+
         Ok(src_hz / cfg.div.into_divisor())
     }
 }

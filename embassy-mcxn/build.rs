@@ -568,9 +568,9 @@ fn generate_dma_impls() -> TokenStream {
     for dma_mux in METADATA.peripherals.iter().flat_map(|p| p.dma_muxing) {
         dma_requests.insert(dma_mux.signal, dma_mux.request);
     }
-    // No `dma_muxing` metadata exists for MCXN947 yet (only relevant once
-    // per-driver transform data assigns it), so this can be empty. Two things
-    // must differ from the populated case:
+    // The empty case is unreachable for mcxn947, which carries all 117 DMAMUX
+    // request sources, but is kept for a chip whose metadata has none. Two
+    // things must differ from the populated case there:
     //
     //   * `#[repr(u8)]` is rejected on a zero-variant enum, so it is omitted.
     //   * `from_number_unchecked` is omitted: `transmute`ing a `u8` into an
@@ -579,6 +579,11 @@ fn generate_dma_impls() -> TokenStream {
     // `number()` is still emitted, because `dma::set_request_source` calls it.
     // With no variants there is no way to obtain a `DmaRequest` to pass, so
     // that path is unreachable rather than broken.
+    //
+    // Note this map is keyed on the signal name alone: two entries sharing a
+    // signal collapse silently, keeping whichever peripheral appears later in
+    // the metadata. Duplicate *request* numbers are caught, but only as an
+    // E0081 in the generated code rather than here.
     let mut sorted_dma_requests = dma_requests.into_iter().collect::<Vec<_>>();
     sorted_dma_requests.sort_unstable_by_key(|(_, request)| *request);
     if sorted_dma_requests.is_empty() {

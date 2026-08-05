@@ -332,3 +332,9 @@ impl_syscon_gate!(CRC0, 0, clk: Ahbclkctrl0.set_crc(true); rst: Presetctrl0.set_
 impl_syscon_gate!(WWDT0, 0, clk: Ahbclkctrl0.set_wwdt0(true); rst: none);
 #[cfg(mcx_wwdt)]
 impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
+
+// CTIMER0. The other four instances live in different AHBCLKCTRL registers
+// (CTIMER1/2 in AHBCLKCTRL1, CTIMER3/4 in AHBCLKCTRL2) and can be added the
+// same way when they are needed.
+#[cfg(mcx_ctimer)]
+impl_syscon_gate!(CTIMER0, 1, clk: Ahbclkctrl1.set_timer0(true); rst: Presetctrl1.set_timer0_rst(), Timer0Rst);

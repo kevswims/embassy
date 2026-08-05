@@ -12,6 +12,7 @@ critical-section = "1.2.0"
 defmt = "1.0"
 defmt-rtt = "1.0"
 embassy-executor = { version = "0.10.0", path = "../../embassy-executor", default-features = false, features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-futures = { version = "0.1.2", path = "../../embassy-futures" }
 embassy-mcxn = { version = "0.1.0", path = "../../embassy-mcxn", features = ["defmt", "unstable-pac", "mcxn947"] }
 embassy-time = { version = "0.5.1", path = "../../embassy-time", features = ["defmt"] }
 panic-probe = { version = "1.0", features = ["print-defmt"] }
