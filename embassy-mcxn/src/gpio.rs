@@ -9,6 +9,11 @@
 //! operations on those just shift a runtime pin index directly rather than
 //! going through the (also now available) typed per-pin field accessors.
 //!
+//! Pad configuration lives on the sealed pin trait as provided methods over the
+//! pin's `PCR` register, so peripherals other than GPIO configure pads through
+//! the same path - notably `set_function`, which the generated per-peripheral pin
+//! traits use to route a pad to their own ALT setting.
+//!
 //! **Status:** blocking only. There's no type-erased `AnyPin`, and no
 //! interrupt-driven async `wait_for_*` yet - that needs a GPIO
 //! `Instance`/interrupt story like embassy-mcxa's.
@@ -77,18 +82,104 @@ pub enum Inverter {
     Enabled,
 }
 
+/// Pad configuration, shared by every pin.
+///
+/// Only the four accessors are per-pin; everything else is written in terms of
+/// [`SealedPin::pcr_reg`], so [`impl_gpio_pin!`] generates no register code and
+/// other drivers reach pad settings the same way GPIO does.
 pub(crate) trait SealedPin {
+    /// The PORT/GPIO index (0-5) this pin belongs to.
     fn port(&self) -> u8;
+
+    /// The bit position (0-31) of this pin within its PORT/GPIO.
     fn pin(&self) -> u8;
+
+    /// The GPIO data-register block for this pin's bank.
     fn gpio(&self) -> crate::pac::gpio::Gpio;
 
-    fn set_function_gpio(&self);
-    fn set_pull(&self, pull: Pull);
-    fn set_drive_strength(&self, strength: DriveStrength);
-    fn set_slew_rate(&self, slew_rate: SlewRate);
-    fn set_enable_input_buffer(&self, enabled: bool);
-    fn set_open_drain(&self, open_drain: OpenDrain);
-    fn set_input_inversion(&self, invert: Inverter);
+    /// The PORT pad-control block for this pin's bank.
+    fn port_reg(&self) -> crate::pac::port::Port;
+
+    /// This pin's pad control register.
+    #[inline(always)]
+    fn pcr_reg(&self) -> crate::pac::common::Reg<crate::pac::port::Pcr, crate::pac::common::RW> {
+        self.port_reg().pcr(self.pin() as usize)
+    }
+
+    /// Select which peripheral function drives this pin.
+    ///
+    /// The mux value for a given pin and peripheral comes from the PAC pin-mux
+    /// metadata (RM Table 119), which is what the per-peripheral pin traits are
+    /// generated from.
+    #[inline(always)]
+    fn set_function(&self, mux: crate::pac::port::Mux) {
+        self.pcr_reg().modify(|w| w.set_mux(mux));
+    }
+
+    /// Select GPIO, which is ALT0 on every pin of this chip.
+    #[inline(always)]
+    fn set_function_gpio(&self) {
+        self.set_function(crate::pac::port::Mux::Mux0);
+    }
+
+    #[inline(always)]
+    fn set_pull(&self, pull: Pull) {
+        let (pe, ps) = match pull {
+            Pull::Disabled => (crate::pac::port::Pe::Pe0, crate::pac::port::Ps::Ps0),
+            Pull::Up => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps1),
+            Pull::Down => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps0),
+        };
+        self.pcr_reg().modify(|w| {
+            w.set_pe(pe);
+            w.set_ps(ps);
+        });
+    }
+
+    #[inline(always)]
+    fn set_drive_strength(&self, strength: DriveStrength) {
+        let val = match strength {
+            DriveStrength::Normal => crate::pac::port::Dse::Dse0,
+            DriveStrength::Double => crate::pac::port::Dse::Dse1,
+        };
+        self.pcr_reg().modify(|w| w.set_dse(val));
+    }
+
+    #[inline(always)]
+    fn set_slew_rate(&self, slew_rate: SlewRate) {
+        let val = match slew_rate {
+            SlewRate::Fast => crate::pac::port::Sre::Sre0,
+            SlewRate::Slow => crate::pac::port::Sre::Sre1,
+        };
+        self.pcr_reg().modify(|w| w.set_sre(val));
+    }
+
+    #[inline(always)]
+    fn set_enable_input_buffer(&self, enabled: bool) {
+        let val = if enabled {
+            crate::pac::port::Ibe::Ibe1
+        } else {
+            crate::pac::port::Ibe::Ibe0
+        };
+        self.pcr_reg().modify(|w| w.set_ibe(val));
+    }
+
+    #[inline(always)]
+    fn set_open_drain(&self, open_drain: OpenDrain) {
+        let val = match open_drain {
+            OpenDrain::No => crate::pac::port::Ode::Ode0,
+            OpenDrain::Yes => crate::pac::port::Ode::Ode1,
+        };
+        self.pcr_reg().modify(|w| w.set_ode(val));
+    }
+
+    #[inline(always)]
+    fn set_input_inversion(&self, invert: Inverter) {
+        let val = match invert {
+            Inverter::Disabled => crate::pac::port::Inv::Inv0,
+            Inverter::Enabled => crate::pac::port::Inv::Inv1,
+        };
+        self.pcr_reg().modify(|w| w.set_inv(val));
+    }
 }
 
 /// GPIO pin trait, implemented for each concrete pin singleton by [`impl_gpio_pin!`].
@@ -140,69 +231,8 @@ macro_rules! impl_gpio_pin {
                 }
 
                 #[inline(always)]
-                fn set_function_gpio(&self) {
+                fn port_reg(&self) -> crate::pac::port::Port {
                     crate::pac::[<PORT $port>]
-                        .pcr($pin)
-                        .modify(|w| w.set_mux(crate::pac::port::Mux::Mux0));
-                }
-
-                #[inline(always)]
-                fn set_pull(&self, pull: crate::gpio::Pull) {
-                    let (pe, ps) = match pull {
-                        crate::gpio::Pull::Disabled => (crate::pac::port::Pe::Pe0, crate::pac::port::Ps::Ps0),
-                        crate::gpio::Pull::Up => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps1),
-                        crate::gpio::Pull::Down => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps0),
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| {
-                        w.set_pe(pe);
-                        w.set_ps(ps);
-                    });
-                }
-
-                #[inline(always)]
-                fn set_drive_strength(&self, strength: crate::gpio::DriveStrength) {
-                    let val = match strength {
-                        crate::gpio::DriveStrength::Normal => crate::pac::port::Dse::Dse0,
-                        crate::gpio::DriveStrength::Double => crate::pac::port::Dse::Dse1,
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| w.set_dse(val));
-                }
-
-                #[inline(always)]
-                fn set_slew_rate(&self, slew_rate: crate::gpio::SlewRate) {
-                    let val = match slew_rate {
-                        crate::gpio::SlewRate::Fast => crate::pac::port::Sre::Sre0,
-                        crate::gpio::SlewRate::Slow => crate::pac::port::Sre::Sre1,
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| w.set_sre(val));
-                }
-
-                #[inline(always)]
-                fn set_enable_input_buffer(&self, enabled: bool) {
-                    let val = if enabled {
-                        crate::pac::port::Ibe::Ibe1
-                    } else {
-                        crate::pac::port::Ibe::Ibe0
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| w.set_ibe(val));
-                }
-
-                #[inline(always)]
-                fn set_open_drain(&self, open_drain: crate::gpio::OpenDrain) {
-                    let val = match open_drain {
-                        crate::gpio::OpenDrain::No => crate::pac::port::Ode::Ode0,
-                        crate::gpio::OpenDrain::Yes => crate::pac::port::Ode::Ode1,
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| w.set_ode(val));
-                }
-
-                #[inline(always)]
-                fn set_input_inversion(&self, invert: crate::gpio::Inverter) {
-                    let val = match invert {
-                        crate::gpio::Inverter::Disabled => crate::pac::port::Inv::Inv0,
-                        crate::gpio::Inverter::Enabled => crate::pac::port::Inv::Inv1,
-                    };
-                    crate::pac::[<PORT $port>].pcr($pin).modify(|w| w.set_inv(val));
                 }
             }
 
