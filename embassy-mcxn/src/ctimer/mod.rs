@@ -1,23 +1,24 @@
 //! Standard counter/timer (CTIMER) driver.
 //!
 //! Each CTIMER has a 32-bit counter, a prescaler, and four match registers.
-//! This module currently implements only match outputs: a match can drive its
-//! external match pin, which produces a waveform in hardware with no CPU
-//! involvement.
+//! This module implements match outputs (a match can drive its external match
+//! pin, producing a waveform in hardware with no CPU involvement) and, in
+//! [`capture`], interrupt-driven capture inputs.
 //!
 //! Which pad a match can reach is fixed by the chip's pin-mux table and comes
 //! from the PAC metadata, so [`MatchOutput::new`] will only accept a
 //! timer/channel/pin combination the hardware can actually route - see
 //! [`ValidMatchConfig`].
 //!
-//! **Status:** match outputs only. Capture inputs have their pin traits
-//! generated ([`InputPin`]) and now carry an [`InputPin::INP`] index, but
-//! there is no capture driver in this module yet, and no PWM support either.
+//! **Status:** no PWM support yet.
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
 use crate::clocks::{ClockError, FunctionalClock, Gate, enable_and_reset_with_clock};
 use crate::gpio::GpioPin;
+
+#[cfg(mcxn_inputmux0)]
+pub mod capture;
 
 /// One of a CTIMER's four match channels.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -118,8 +119,8 @@ pub(crate) trait SealedOutputPin<T: Instance> {}
 pub trait InputPin<T: Instance>: GpioPin + SealedInputPin<T> + PeripheralType {
     /// Which of the 20 shared `CT_INPn` signals this pad carries.
     ///
-    /// A future capture driver would write this into the target channel's
-    /// INPUTMUX capture-select register; nothing here uses it yet.
+    /// [`crate::ctimer::capture::Capture::new`] writes this into the target
+    /// channel's INPUTMUX capture-select register; nothing else needs it.
     const INP: u8;
 
     /// Configure this pad to act as the capture input.
