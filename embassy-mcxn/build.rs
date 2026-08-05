@@ -41,30 +41,50 @@ fn main() {
         cfgs.enable(&driver_to_cfg_name(peripheral.driver_name));
     }
 
-    let generated = [
+    let mut generated = vec![
         generate_peripherals_call(),
         generate_interrupt_mod_call(),
         generate_cc_gates(),
         generate_dma_channel_impls(),
         generate_instance_calls(),
         generate_gpio_pin_impls(),
-        generate_adc_pin_impls(),
-        generate_clkout_impls(),
-        generate_lpi2c_pin_impls(),
-        generate_i3c_pin_impls(),
-        generate_spi_pin_impls(),
-        generate_ctimer_pin_impls(),
-        generate_lpuart_pin_impls(),
-        generate_flexspi_pin_impls(),
-        generate_flexcan_pin_impls(),
         generate_dma_impls(),
     ];
+
+    for (family, generate) in PIN_IMPLS {
+        if PIN_FAMILIES.contains(family) {
+            generated.push(generate());
+        }
+    }
 
     let out_dir = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let out_file = out_dir.join("_generated.rs");
     fs::write(&out_file, generated.into_iter().collect::<TokenStream>().to_string()).unwrap();
     rustfmt(&out_file);
 }
+
+/// Pin-trait families whose `impl_*_pin!` macros exist in the HAL.
+///
+/// The PAC metadata carries pin-mux signals for every peripheral in RM Table
+/// 119, but a generator emits macro calls that only compile once the driver
+/// defining them lands. Adding a family here is the last step of implementing
+/// its pin traits, not the first.
+const PIN_FAMILIES: &[&str] = &[];
+
+/// Pin-impl generators, keyed by the family name checked against
+/// [`PIN_FAMILIES`]. GPIO is absent because it is unconditional.
+#[allow(clippy::type_complexity)]
+const PIN_IMPLS: &[(&str, fn() -> TokenStream)] = &[
+    ("adc", generate_adc_pin_impls),
+    ("clkout", generate_clkout_impls),
+    ("ctimer", generate_ctimer_pin_impls),
+    ("flexcan", generate_flexcan_pin_impls),
+    ("flexspi", generate_flexspi_pin_impls),
+    ("i3c", generate_i3c_pin_impls),
+    ("lpi2c", generate_lpi2c_pin_impls),
+    ("lpuart", generate_lpuart_pin_impls),
+    ("spi", generate_spi_pin_impls),
+];
 
 fn generate_peripherals_call() -> TokenStream {
     struct Singleton {
