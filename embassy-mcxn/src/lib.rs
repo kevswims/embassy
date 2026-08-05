@@ -17,6 +17,8 @@ pub mod clocks;
 pub mod config;
 #[cfg(mcxn_crc)]
 pub mod crc;
+#[cfg(mcx_ctimer)]
+pub mod ctimer;
 // Gated so a PAC regression that drops the eDMA blocks surfaces as one missing
 // module rather than errors inside every generated channel impl.
 #[cfg(mcxn_dma)]

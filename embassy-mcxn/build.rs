@@ -69,7 +69,7 @@ fn main() {
 /// 119, but a generator emits macro calls that only compile once the driver
 /// defining them lands. Adding a family here is the last step of implementing
 /// its pin traits, not the first.
-const PIN_FAMILIES: &[&str] = &[];
+const PIN_FAMILIES: &[&str] = &["ctimer"];
 
 /// Pin-impl generators, keyed by the family name checked against
 /// [`PIN_FAMILIES`]. GPIO is absent because it is unconditional.
@@ -223,7 +223,7 @@ fn generate_instance_calls() -> TokenStream {
     // Peripherals whose driver defines an `impl_<name>_instance!` macro. Adding
     // a name here without the matching macro breaks the build, so this list
     // grows as drivers land.
-    const REQUIRES_INSTANCE: &[&str] = &["crc", "gpio", "wwdt"];
+    const REQUIRES_INSTANCE: &[&str] = &["crc", "ctimer", "gpio", "wwdt"];
 
     let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
 
