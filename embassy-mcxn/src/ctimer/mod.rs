@@ -2,15 +2,14 @@
 //!
 //! Each CTIMER has a 32-bit counter, a prescaler, and four match registers.
 //! This module implements match outputs (a match can drive its external match
-//! pin, producing a waveform in hardware with no CPU involvement) and, in
-//! [`capture`], interrupt-driven capture inputs.
+//! pin, producing a waveform in hardware with no CPU involvement), [`pwm`]
+//! (up to three of those four channels repurposed as single-edge PWM
+//! outputs), and, in [`capture`], interrupt-driven capture inputs.
 //!
-//! Which pad a match can reach is fixed by the chip's pin-mux table and comes
-//! from the PAC metadata, so [`MatchOutput::new`] will only accept a
-//! timer/channel/pin combination the hardware can actually route - see
-//! [`ValidMatchConfig`].
-//!
-//! **Status:** no PWM support yet.
+//! Which pad a match or duty channel can reach is fixed by the chip's pin-mux
+//! table and comes from the PAC metadata, so [`MatchOutput::new`] and the
+//! `pwm` constructors will only accept a timer/channel/pin combination the
+//! hardware can actually route - see [`ValidMatchConfig`].
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
@@ -19,6 +18,7 @@ use crate::gpio::GpioPin;
 
 #[cfg(mcxn_inputmux0)]
 pub mod capture;
+pub mod pwm;
 
 /// One of a CTIMER's four match channels.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
