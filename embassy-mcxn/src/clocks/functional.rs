@@ -152,15 +152,83 @@ macro_rules! apply_div_no_poll {
 /// `div:` is either `none` for a peripheral with no `*CLKDIV`, or
 /// `full(accessor, EnumPrefix, BITS)`.
 macro_rules! impl_functional_clock {
+    // No divider: the config carries just a source.
     (
         $periph:ident,
         name: $src_enum:ident / $cfg_struct:ident,
         sel: $sel:expr, $sel_ty:ident,
-        div: $div:tt,
+        div: none,
         sources: {
             $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
         }
     ) => {
+        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+
+        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct $cfg_struct {
+            /// Which source to select.
+            pub source: $src_enum,
+        }
+
+        impl crate::clocks::FunctionalClock for crate::peripherals::$periph {
+            type Config = $cfg_struct;
+
+            fn configure(
+                cfg: &Self::Config,
+                clocks: &crate::clocks::Clocks,
+            ) -> Result<u32, crate::clocks::ClockError> {
+                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
+                Ok(src_hz)
+            }
+        }
+    };
+
+    // With a divider: the config carries a width-bound divisor too, applied
+    // with `apply_div_no_poll!` - not `apply_div_full!`, since WDT0CLKDIV and
+    // WDT1CLKDIV proved a SYSCON divider's UNSTAB does not reliably clear (see
+    // that macro's doc), and nothing has verified any of the other 55 do
+    // either, so no caller here should be left spinning on a bit that may
+    // never move.
+    (
+        $periph:ident,
+        name: $src_enum:ident / $cfg_struct:ident,
+        sel: $sel:expr, $sel_ty:ident,
+        div: full($div_reg:expr, $divty:ident, $bits:expr),
+        sources: {
+            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+        }
+    ) => {
+        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+
+        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct $cfg_struct {
+            /// Which source to select.
+            pub source: $src_enum,
+            /// Divisor applied to the selected source.
+            pub div: crate::clocks::config::Div<$bits>,
+        }
+
+        impl crate::clocks::FunctionalClock for crate::peripherals::$periph {
+            type Config = $cfg_struct;
+
+            fn configure(
+                cfg: &Self::Config,
+                clocks: &crate::clocks::Clocks,
+            ) -> Result<u32, crate::clocks::ClockError> {
+                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
+                apply_div_no_poll!($div_reg, $divty, cfg.div);
+                Ok(src_hz / cfg.div.into_divisor())
+            }
+        }
+    };
+
+    // Shared: the source enum plus its compile-time pin against the PAC's raw
+    // values (see the doc comment above).
+    (@sources $periph:ident, $src_enum:ident, $sel_ty:ident, { $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ }) => {
         #[doc = concat!("Functional clock sources selectable for `", stringify!($periph), "`.")]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
         #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -171,69 +239,23 @@ macro_rules! impl_functional_clock {
             )+
         }
 
-        // The selector enums have anonymous variant names and orderings that
-        // differ between peripherals, so pin each variant to the raw value this
-        // mapping was written against.
         const _: () = {
             $( assert!(crate::pac::syscon::$sel_ty::$pac_variant.to_bits() == $raw); )+
         };
-
-        impl_functional_clock!(@config $periph, $cfg_struct, $src_enum, $div);
-
-        impl crate::clocks::FunctionalClock for crate::peripherals::$periph {
-            type Config = $cfg_struct;
-
-            fn configure(
-                cfg: &Self::Config,
-                clocks: &crate::clocks::Clocks,
-            ) -> Result<u32, crate::clocks::ClockError> {
-                // Resolve the source rate first. On failure we return before
-                // touching a register, leaving the mux as it was.
-                let src_hz = match cfg.source {
-                    $( $src_enum::$variant => clocks.$accessor()?, )+
-                };
-
-                $sel.modify(|w| {
-                    w.set_sel(match cfg.source {
-                        $( $src_enum::$variant => crate::pac::syscon::$sel_ty::$pac_variant, )+
-                    })
-                });
-
-                Ok(impl_functional_clock!(@apply_div cfg, src_hz, $div))
-            }
-        }
     };
 
-    // No divider: the config carries just a source.
-    (@config $periph:ident, $cfg_struct:ident, $src_enum:ident, none) => {
-        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
-        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-        pub struct $cfg_struct {
-            /// Which source to select.
-            pub source: $src_enum,
-        }
-    };
-
-    // With a divider: the config carries a width-bound divisor too.
-    (@config $periph:ident, $cfg_struct:ident, $src_enum:ident,
-     full($reg:expr, $divty:ident, $bits:expr)) => {
-        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
-        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-        pub struct $cfg_struct {
-            /// Which source to select.
-            pub source: $src_enum,
-            /// Divisor applied to the selected source.
-            pub div: crate::clocks::config::Div<$bits>,
-        }
-    };
-
-    (@apply_div $cfg:ident, $src_hz:ident, none) => { $src_hz };
-
-    (@apply_div $cfg:ident, $src_hz:ident, full($reg:expr, $divty:ident, $bits:expr)) => {{
-        apply_div_full!($reg, $divty, $cfg.div);
-        $src_hz / $cfg.div.into_divisor()
+    // Shared: resolve the selected source's rate, then write the mux. Rate
+    // resolution happens first so a failure leaves the mux untouched.
+    (@select $sel:expr, $sel_ty:ident, $cfg:ident, $clocks:ident, $src_enum:ident, { $( $variant:ident => $pac_variant:ident : $accessor:ident ),+ }) => {{
+        let src_hz = match $cfg.source {
+            $( $src_enum::$variant => $clocks.$accessor()?, )+
+        };
+        $sel.modify(|w| {
+            w.set_sel(match $cfg.source {
+                $( $src_enum::$variant => crate::pac::syscon::$sel_ty::$pac_variant, )+
+            })
+        });
+        Result::<u32, crate::clocks::ClockError>::Ok(src_hz)
     }};
 }
 
