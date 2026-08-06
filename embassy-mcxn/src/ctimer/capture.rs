@@ -16,7 +16,7 @@ use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 
 use super::{Channel, CtimerChannel, InputPin, Instance};
-use crate::clocks::{ClockError, FunctionalClock, Gate, disable, enable_and_reset, enable_and_reset_with_clock};
+use crate::clocks::{ClockError, FunctionalClock, Gate, disable, enable, enable_and_reset_with_clock};
 use crate::interrupt::typelevel::{Binding, Handler, Interrupt};
 use crate::pac;
 use crate::peripherals::INPUTMUX0;
@@ -35,12 +35,17 @@ pub enum Edge {
 ///
 /// Await [`Capture::capture`] to get the counter value at the next edge.
 pub struct Capture<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> {
-    _timer: Peri<'d, T>,
+    /// `Some` only when this instance brought the timer up (via [`Capture::new`])
+    /// and so is the one responsible for stopping it again on drop. A second
+    /// channel attached with [`Capture::new_channel`] must not stop a counter
+    /// some other driver still needs.
+    _timer: Option<Peri<'d, T>>,
     _channel: Peri<'d, Ch>,
     _pin: Peri<'d, P>,
     channel: Channel,
-    /// Functional clock feeding the counter, before the prescaler.
-    hz: u32,
+    /// Functional clock feeding the counter, before the prescaler. `None`
+    /// when attached to a timer already running under another driver's clock.
+    hz: Option<u32>,
 }
 
 impl<'d, T: Instance + Gate + FunctionalClock, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, P> {
@@ -53,14 +58,17 @@ impl<'d, T: Instance + Gate + FunctionalClock, Ch: PeripheralType, P: Peripheral
     ///
     /// This enables and resets the timer's functional clock and starts its
     /// counter, so - like [`super::MatchOutput::new`] - it must not be called
-    /// while another driver already owns `timer`.
+    /// while another driver already owns `timer`. To add a second capture
+    /// channel to a timer already running (whether started by this method or
+    /// by [`super::MatchOutput`]/[`super::pwm`]), use [`Capture::new_channel`]
+    /// instead.
     pub fn new(
         timer: Peri<'d, T>,
         channel_peri: Peri<'d, Ch>,
         pin: Peri<'d, P>,
         edge: Edge,
         clock: &T::Config,
-        _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
     ) -> Result<Self, ClockError>
     where
         Ch: CtimerChannel<T>,
@@ -69,21 +77,60 @@ impl<'d, T: Instance + Gate + FunctionalClock, Ch: PeripheralType, P: Peripheral
         // SAFETY: `timer` is owned, so nothing else is driving this peripheral.
         let hz = unsafe { enable_and_reset_with_clock::<T>(clock) }?;
 
+        let mut this = Self::new_channel(channel_peri, pin, edge, irq);
+        this._timer = Some(timer);
+        this.hz = Some(hz);
+
+        T::regs().tcr().modify(|w| w.set_cen(true));
+
+        Ok(this)
+    }
+
+    /// The functional clock feeding the counter, in Hz.
+    ///
+    /// `None` for a [`Capture::new_channel`] instance: attaching to a timer
+    /// already running does not itself determine that timer's rate.
+    pub fn frequency(&self) -> Option<u32> {
+        self.hz
+    }
+}
+
+impl<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, P> {
+    /// Add a capture channel to a timer some other driver already started.
+    ///
+    /// Unlike [`Capture::new`], this does not touch the timer's clock or
+    /// counter - the timer must already be running, or edges will never
+    /// advance a timestamp for this channel to capture. Dropping this
+    /// instance releases only this channel, leaving the timer running for
+    /// whatever else is using it.
+    pub fn new_channel(
+        channel_peri: Peri<'d, Ch>,
+        pin: Peri<'d, P>,
+        edge: Edge,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+    ) -> Self
+    where
+        Ch: CtimerChannel<T>,
+        P: InputPin<T>,
+    {
         let channel = channel_peri.number();
         let this = Self {
-            _timer: timer,
+            _timer: None,
             _channel: channel_peri,
             _pin: pin,
             channel,
-            hz,
+            hz: None,
         };
 
         this._pin.mux();
 
         // INPUTMUX0 only needs its clock ungated for this one write; the
-        // register itself holds its value with the clock off.
+        // register itself holds its value with the clock off. Plain `enable`,
+        // not `enable_and_reset`: INPUTMUX0 is shared across every capture
+        // channel on every timer, so pulsing its reset here would wipe out
+        // whatever routing another channel already configured.
         unsafe {
-            enable_and_reset::<INPUTMUX0>();
+            enable::<INPUTMUX0>();
             write_inp_select(T::TIMER_INDEX, channel, P::INP);
             disable::<INPUTMUX0>();
         }
@@ -95,14 +142,7 @@ impl<'d, T: Instance + Gate + FunctionalClock, Ch: PeripheralType, P: Peripheral
         // Safety: `_irq` ensures an Interrupt Handler exists.
         unsafe { T::Interrupt::enable() };
 
-        T::regs().tcr().modify(|w| w.set_cen(true));
-
-        Ok(this)
-    }
-
-    /// The functional clock feeding the counter, in Hz.
-    pub fn frequency(&self) -> u32 {
-        self.hz
+        this
     }
 }
 
@@ -150,7 +190,9 @@ impl<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, 
 
 impl<T: Instance, Ch: PeripheralType, P: PeripheralType> Drop for Capture<'_, T, Ch, P> {
     fn drop(&mut self) {
-        T::regs().tcr().modify(|w| w.set_cen(false));
+        if self._timer.is_some() {
+            T::regs().tcr().modify(|w| w.set_cen(false));
+        }
         T::regs().ccr().modify(|w| match self.channel {
             Channel::Zero => {
                 w.set_cap0re(false);

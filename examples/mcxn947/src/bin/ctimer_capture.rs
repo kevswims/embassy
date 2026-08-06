@@ -46,7 +46,7 @@ async fn main(_spawner: Spawner) {
     .unwrap();
 
     defmt::info!("CTIMER0 functional clock {} Hz", capture.frequency());
-    defmt::assert_eq!(capture.frequency(), 1_000_000);
+    defmt::assert_eq!(capture.frequency(), Some(1_000_000));
 
     const TOGGLE_PERIOD: Duration = Duration::from_millis(20);
 
