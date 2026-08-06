@@ -333,11 +333,12 @@ impl_syscon_gate!(WWDT0, 0, clk: Ahbclkctrl0.set_wwdt0(true); rst: none);
 #[cfg(mcx_wwdt)]
 impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
 
-// CTIMER0. The other four instances live in different AHBCLKCTRL registers
-// (CTIMER1/2 in AHBCLKCTRL1, CTIMER3/4 in AHBCLKCTRL2) and can be added the
-// same way when they are needed.
+// CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
+// CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
 #[cfg(mcx_ctimer)]
 impl_syscon_gate!(CTIMER0, 1, clk: Ahbclkctrl1.set_timer0(true); rst: Presetctrl1.set_timer0_rst(), Timer0Rst);
+#[cfg(mcx_ctimer)]
+impl_syscon_gate!(CTIMER1, 1, clk: Ahbclkctrl1.set_timer1(true); rst: Presetctrl1.set_timer1_rst(), Timer1Rst);
 
 // INPUTMUX0 is bus-clocked like CRC0: no functional-clock mux or divider.
 // CTIMER capture routes a pad's INP signal through it, so it is only ungated

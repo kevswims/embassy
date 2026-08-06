@@ -50,7 +50,7 @@ mod types;
 
 pub use functional::{FunctionalClock, enable_and_reset_with_clock};
 #[cfg(mcx_ctimer)]
-pub use functional::Ctimer0ClockConfig;
+pub use functional::{Ctimer0ClockConfig, Ctimer1ClockConfig};
 #[cfg(mcx_wwdt)]
 pub use functional::WwdtClockConfig;
 #[cfg(mcxn_ostimer)]
