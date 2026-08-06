@@ -345,3 +345,9 @@ impl_syscon_gate!(CTIMER1, 1, clk: Ahbclkctrl1.set_timer1(true); rst: Presetctrl
 // for the duration of that register write - see `ctimer::capture`.
 #[cfg(mcxn_inputmux0)]
 impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0.set_mux_rst(), MuxRst);
+
+// LP_FLEXCOMM0-9's bus interface clock and reset, gated through LPUART5's own
+// type - see the comment on `Lpuart5ClockConfig` for why the flexcomm and its
+// UART sub-block share one clock owner rather than two.
+#[cfg(mcxn_lpuart)]
+impl_syscon_gate!(LPUART5, 1, clk: Ahbclkctrl1.set_fc(5, true); rst: Presetctrl1.set_fc_rst(5), FcRst);

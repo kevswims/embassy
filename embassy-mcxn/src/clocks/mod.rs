@@ -55,6 +55,8 @@ pub use functional::{Ctimer0ClockConfig, Ctimer1ClockConfig};
 pub use functional::WwdtClockConfig;
 #[cfg(mcxn_ostimer)]
 pub use functional::{OstimerClockConfig, OstimerClockSource};
+#[cfg(mcxn_lpuart)]
+pub use functional::{Lpuart5ClockConfig, Lpuart5ClockSource};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 
