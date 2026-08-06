@@ -346,8 +346,32 @@ impl_syscon_gate!(CTIMER1, 1, clk: Ahbclkctrl1.set_timer1(true); rst: Presetctrl
 #[cfg(mcxn_inputmux0)]
 impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0.set_mux_rst(), MuxRst);
 
-// LP_FLEXCOMM0-9's bus interface clock and reset, gated through LPUART5's own
-// type - see the comment on `Lpuart5ClockConfig` for why the flexcomm and its
-// UART sub-block share one clock owner rather than two.
-#[cfg(mcxn_lpuart)]
-impl_syscon_gate!(LPUART5, 1, clk: Ahbclkctrl1.set_fc(5, true); rst: Presetctrl1.set_fc_rst(5), FcRst);
+// LP_FLEXCOMM0-9's bus interface clock and reset, gated through each
+// LPUARTn's own type - see the comment on `impl_lpuart_functional_clock!` for
+// why the flexcomm and its UART sub-block share one clock owner rather than
+// two. All 10 instances' `FC[n]`/`FC_RST[n]` bits sit in the same register
+// pair, `AHBCLKCTRL1`/`PRESETCTRL1` (bits 11-20) - unlike CTIMER, which is
+// genuinely split across two AHBCLKCTRL registers by instance.
+macro_rules! impl_lpuart_gate {
+    ($n:literal) => {
+        ::paste::paste! {
+            #[cfg(mcxn_lpuart)]
+            impl_syscon_gate!(
+                [<LPUART $n>], 1,
+                clk: Ahbclkctrl1.set_fc($n, true);
+                rst: Presetctrl1.set_fc_rst($n), FcRst
+            );
+        }
+    };
+}
+
+impl_lpuart_gate!(0);
+impl_lpuart_gate!(1);
+impl_lpuart_gate!(2);
+impl_lpuart_gate!(3);
+impl_lpuart_gate!(4);
+impl_lpuart_gate!(5);
+impl_lpuart_gate!(6);
+impl_lpuart_gate!(7);
+impl_lpuart_gate!(8);
+impl_lpuart_gate!(9);

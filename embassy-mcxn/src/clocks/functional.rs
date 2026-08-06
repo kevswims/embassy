@@ -259,25 +259,42 @@ macro_rules! impl_functional_clock {
     }};
 }
 
-// LPUART5's mux and divider actually belong to LP_FLEXCOMM5 (RM 66.2.4: a
+// LPUARTn's mux and divider actually belong to LP_FLEXCOMMn (RM 66.2.4: a
 // flexcomm's bus clock, functional clock and PSELID must be brought up before
 // its LPUART sub-block is touched at all), but FCCLKSEL/FLEXCOMMCLKDIV are
 // array-indexed by instance number, which is the same number either name
-// carries - so this is written directly against `LPUART5` rather than adding
-// a separate `LP_FLEXCOMM5` clock owner. `clk_1m` is deliberately absent: at
+// carries - so this is written directly against `LPUARTn` rather than adding
+// a separate `LP_FLEXCOMMn` clock owner. `clk_1m` is deliberately absent: at
 // 1 MHz the baud-rate generator can't reach any usable baud rate above a
 // handful of bit/s (SBR would need to be well under 1).
-#[cfg(mcxn_lpuart)]
-impl_functional_clock! {
-    LPUART5,
-    name: Lpuart5ClockSource / Lpuart5ClockConfig,
-    sel: crate::pac::SYSCON0.fcclksel(5), FcclkselSel,
-    div: full(crate::pac::SYSCON0.flexcommclkdiv(5), Flexcommclkdiv, 8),
-    sources: {
-        Fro12m   => Enum0x2 @ 2 : ensure_fro_12m,
-        FroHfDiv => Enum0x3 @ 3 : ensure_fro_hf_div,
-    }
+macro_rules! impl_lpuart_functional_clock {
+    ($n:literal) => {
+        ::paste::paste! {
+            #[cfg(mcxn_lpuart)]
+            impl_functional_clock! {
+                [<LPUART $n>],
+                name: [<Lpuart $n ClockSource>] / [<Lpuart $n ClockConfig>],
+                sel: crate::pac::SYSCON0.fcclksel($n), FcclkselSel,
+                div: full(crate::pac::SYSCON0.flexcommclkdiv($n), Flexcommclkdiv, 8),
+                sources: {
+                    Fro12m   => Enum0x2 @ 2 : ensure_fro_12m,
+                    FroHfDiv => Enum0x3 @ 3 : ensure_fro_hf_div,
+                }
+            }
+        }
+    };
 }
+
+impl_lpuart_functional_clock!(0);
+impl_lpuart_functional_clock!(1);
+impl_lpuart_functional_clock!(2);
+impl_lpuart_functional_clock!(3);
+impl_lpuart_functional_clock!(4);
+impl_lpuart_functional_clock!(5);
+impl_lpuart_functional_clock!(6);
+impl_lpuart_functional_clock!(7);
+impl_lpuart_functional_clock!(8);
+impl_lpuart_functional_clock!(9);
 
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
