@@ -85,6 +85,15 @@ pub enum Error {
     Framing,
     /// `STAT[PF]`: parity mismatch.
     Parity,
+    /// The DMA channel rejected the transfer parameters (e.g. `buf` longer
+    /// than `dma::DMA_MAX_TRANSFER_SIZE`).
+    InvalidDmaParameters,
+    /// The DMA transfer itself faulted - see [`crate::dma::TransferErrors`].
+    Dma(crate::dma::TransferErrors),
+    /// A [`RingBufferedUartRx`] wasn't read fast enough and eDMA overwrote
+    /// data before it was consumed. Distinct from [`Error::Overrun`]
+    /// (`STAT[OR]`), which is the LPUART's own hardware FIFO overrunning.
+    RingOverrun,
 }
 
 impl From<ClockError> for Error {
@@ -93,10 +102,35 @@ impl From<ClockError> for Error {
     }
 }
 
+impl From<crate::dma::InvalidParameters> for Error {
+    fn from(_: crate::dma::InvalidParameters) -> Self {
+        Error::InvalidDmaParameters
+    }
+}
+
+impl From<crate::dma::TransferErrors> for Error {
+    fn from(e: crate::dma::TransferErrors) -> Self {
+        Error::Dma(e)
+    }
+}
+
+impl From<crate::dma::Error> for Error {
+    fn from(_: crate::dma::Error) -> Self {
+        // `RingBuffer::read`, this crate's only source of `dma::Error`, only
+        // ever produces `Overrun`.
+        Error::RingOverrun
+    }
+}
+
 pub(crate) trait SealedInstance {
     /// Index into this module's per-instance waker arrays. Not the same thing
     /// as an AHB/SYSCON register index - it is just this LPUART's own number.
     const INDEX: u8;
+
+    /// This instance's flexcomm's DMA request number for transmit.
+    const TX_DMA_REQUEST: crate::dma::DmaRequest;
+    /// This instance's flexcomm's DMA request number for receive.
+    const RX_DMA_REQUEST: crate::dma::DmaRequest;
 
     fn regs() -> pac::lpuart::Lpuart;
 
@@ -120,6 +154,8 @@ macro_rules! impl_lpuart_instance {
         ::paste::paste! {
             impl crate::lpuart::SealedInstance for crate::peripherals::[<LPUART $n>] {
                 const INDEX: u8 = $n;
+                const TX_DMA_REQUEST: crate::dma::DmaRequest = crate::dma::DmaRequest::[<LpFlexcomm $n Tx>];
+                const RX_DMA_REQUEST: crate::dma::DmaRequest = crate::dma::DmaRequest::[<LpFlexcomm $n Rx>];
 
                 #[inline(always)]
                 fn regs() -> crate::pac::lpuart::Lpuart {
@@ -330,6 +366,137 @@ impl<T: Instance + Gate, TxP: PeripheralType, RxP: PeripheralType> Uart<'_, T, T
         }
         Ok(())
     }
+
+    /// Write `buf` in one DMA transfer, rather than interrupt-driven
+    /// byte-at-a-time like [`Uart::write`].
+    ///
+    /// `dma` is a channel the caller already owns and constructed
+    /// (`DmaChannel::new`) - not one held by this `Uart` - so a `write_dma`
+    /// and a concurrent [`Uart::read`]/[`Uart::read_dma`] (with a *different*
+    /// channel) compose the same way the plain interrupt-driven methods do.
+    pub async fn write_dma(&self, dma: &mut crate::dma::DmaChannel<'_>, buf: &[u8]) -> Result<(), Error> {
+        let peri_addr = T::regs().data().as_ptr() as *mut u8;
+
+        // SAFETY: `peri_addr` is this instance's own DATA register, valid for
+        // as long as `T::regs()` is (the whole program); `buf` outlives the
+        // transfer since it is borrowed for this whole async fn.
+        let transfer = unsafe {
+            dma.write_to_peripheral(buf, peri_addr, T::TX_DMA_REQUEST, crate::dma::TransferOptions::COMPLETE_INTERRUPT)
+        }?;
+
+        // Only after the TCD is armed: the DMA channel is ready to service a
+        // request before the LPUART is told to start making them.
+        T::regs().baud().modify(|w| w.set_tdmae(true));
+        let _guard = clear_tdmae_on_drop::<T>();
+
+        transfer.await?;
+        Ok(())
+    }
+
+    /// Fill `buf` in one DMA transfer, rather than interrupt-driven
+    /// byte-at-a-time like [`Uart::read`].
+    ///
+    /// Fixed-length: this resolves only once `buf` is completely full. See
+    /// [`Uart::write_dma`] for the `dma` parameter.
+    pub async fn read_dma(&self, dma: &mut crate::dma::DmaChannel<'_>, buf: &mut [u8]) -> Result<(), Error> {
+        let peri_addr = T::regs().data().as_ptr() as *const u8;
+
+        // SAFETY: as `write_dma`, mirrored for the read direction.
+        let transfer = unsafe {
+            dma.read_from_peripheral(peri_addr, buf, T::RX_DMA_REQUEST, crate::dma::TransferOptions::COMPLETE_INTERRUPT)
+        }?;
+
+        T::regs().baud().modify(|w| w.set_rdmae(true));
+        let _guard = clear_rdmae_on_drop::<T>();
+
+        transfer.await?;
+        Ok(())
+    }
+
+    /// Receive continuously into `buf` via DMA, wrapping back to the start
+    /// every time it fills, rather than one fixed-length transfer like
+    /// [`Uart::read_dma`].
+    ///
+    /// Unlike [`Uart::write_dma`]/[`Uart::read_dma`], `BAUD[RDMAE]` stays set
+    /// for as long as the returned [`RingBufferedUartRx`] lives - this is a
+    /// long-running receive, not a single bounded transfer, so there is no
+    /// single call to scope a guard to. The returned value's `Drop` clears it.
+    pub fn into_ring_rx<'ch, 'buf>(
+        &self,
+        dma: &'ch mut crate::dma::DmaChannel<'_>,
+        buf: &'buf mut [u8],
+    ) -> Result<RingBufferedUartRx<'ch, 'buf, T>, Error> {
+        let peri_addr = T::regs().data().as_ptr() as *const u8;
+
+        // SAFETY: as `read_dma`; `buf` is exclusively borrowed by the
+        // returned `RingBufferedUartRx` for as long as it exists.
+        let ring = unsafe { dma.setup_circular_read(peri_addr, buf, T::RX_DMA_REQUEST) }?;
+
+        T::regs().baud().modify(|w| w.set_rdmae(true));
+
+        Ok(RingBufferedUartRx {
+            ring,
+            _instance: core::marker::PhantomData,
+        })
+    }
+}
+
+/// A continuous DMA receive into a wrapping buffer, from [`Uart::into_ring_rx`].
+pub struct RingBufferedUartRx<'a, 'buf, T: Instance> {
+    ring: crate::dma::RingBuffer<'a, 'buf, u8>,
+    _instance: core::marker::PhantomData<T>,
+}
+
+impl<T: Instance> RingBufferedUartRx<'_, '_, T> {
+    /// Wait for at least one byte, then copy out as much as is available.
+    ///
+    /// Also checks/clears the LPUART error flags the way [`Uart::read`] does,
+    /// since DMA moving the bytes doesn't stop the LPUART from raising them.
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        check_and_clear_rx_errors::<T>()?;
+        Ok(self.ring.read(buf).await?)
+    }
+
+    /// Copy out whatever is already available, without waiting.
+    pub fn read_immediate(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        check_and_clear_rx_errors::<T>()?;
+        Ok(self.ring.read_immediate(buf))
+    }
+
+    /// Discard whatever is currently unread.
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+}
+
+impl<T: Instance> Drop for RingBufferedUartRx<'_, '_, T> {
+    fn drop(&mut self) {
+        // The `RingBuffer`'s own `Drop` stops the DMA side (ERQ/EARQ); this
+        // stops the LPUART side, which nothing else would otherwise do.
+        T::regs().baud().modify(|w| w.set_rdmae(false));
+    }
+}
+
+/// Clears `BAUD[TDMAE]`/`[RDMAE]` on every exit path from `write_dma`/
+/// `read_dma` - success, an `Error`, or the `await` being dropped early by
+/// cancellation. Neither `Transfer::drop` (which only knows about the DMA
+/// side) nor `Uart::drop` clears these, so without this guard an aborted
+/// transfer would leave a live, un-serviced DMA request enabled on the
+/// LPUART side.
+struct ClearOnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for ClearOnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+fn clear_tdmae_on_drop<T: Instance>() -> ClearOnDrop<impl FnMut()> {
+    ClearOnDrop(move || T::regs().baud().modify(|w| w.set_tdmae(false)))
+}
+
+fn clear_rdmae_on_drop<T: Instance>() -> ClearOnDrop<impl FnMut()> {
+    ClearOnDrop(move || T::regs().baud().modify(|w| w.set_rdmae(false)))
 }
 
 impl<T: Instance + Gate, TxP: PeripheralType, RxP: PeripheralType> Drop for Uart<'_, T, TxP, RxP> {
@@ -361,6 +528,42 @@ fn wait_tx_ready<T: Instance>() -> impl Future<Output = ()> {
     })
 }
 
+/// Check `STAT[OR]/[NF]/[FE]/[PF]`, clearing whichever fired.
+///
+/// Shared by the interrupt-driven and DMA-backed RX paths - DMA moving the
+/// bytes themselves doesn't stop the LPUART from raising these on its own.
+fn check_and_clear_rx_errors<T: Instance>() -> Result<(), Error> {
+    let regs = T::regs();
+    let stat = regs.stat().read();
+
+    if !(stat.or() || stat.nf() || stat.fe() || stat.pf()) {
+        return Ok(());
+    }
+
+    // `.write()`, not `.modify()`: STAT is W1C, and writing only the bits
+    // actually seen here - rather than the whole just-read value back -
+    // leaves any other pending flag (e.g. IDLE) alone.
+    regs.stat().write(|w| {
+        w.set_or(stat.or());
+        w.set_nf(stat.nf());
+        w.set_fe(stat.fe());
+        w.set_pf(stat.pf());
+    });
+
+    // Priority order matches embassy-imxrt's flexcomm UART: a byte that is
+    // both framing-broken and overrun is reported as the condition most
+    // likely to explain the others.
+    Err(if stat.or() {
+        Error::Overrun
+    } else if stat.fe() {
+        Error::Framing
+    } else if stat.pf() {
+        Error::Parity
+    } else {
+        Error::Noise
+    })
+}
+
 fn wait_rx_byte<T: Instance>() -> impl Future<Output = Result<u8, Error>> {
     core::future::poll_fn(move |cx| {
         let regs = T::regs();
@@ -375,34 +578,11 @@ fn wait_rx_byte<T: Instance>() -> impl Future<Output = Result<u8, Error>> {
             w.set_peie(true);
         });
 
-        let stat = regs.stat().read();
-        if stat.or() || stat.nf() || stat.fe() || stat.pf() {
-            // `.write()`, not `.modify()`: STAT is W1C, and writing only the
-            // bits actually seen here - rather than the whole just-read value
-            // back - leaves any other pending flag (e.g. IDLE) alone.
-            regs.stat().write(|w| {
-                w.set_or(stat.or());
-                w.set_nf(stat.nf());
-                w.set_fe(stat.fe());
-                w.set_pf(stat.pf());
-            });
-
-            // Priority order matches embassy-imxrt's flexcomm UART: a byte
-            // that is both framing-broken and overrun is reported as the
-            // condition most likely to explain the others.
-            let err = if stat.or() {
-                Error::Overrun
-            } else if stat.fe() {
-                Error::Framing
-            } else if stat.pf() {
-                Error::Parity
-            } else {
-                Error::Noise
-            };
-            return Poll::Ready(Err(err));
+        if let Err(e) = check_and_clear_rx_errors::<T>() {
+            return Poll::Ready(Err(e));
         }
 
-        if stat.rdrf() {
+        if regs.stat().read().rdrf() {
             let byte = (regs.data().read().0 & 0xFF) as u8;
             Poll::Ready(Ok(byte))
         } else {

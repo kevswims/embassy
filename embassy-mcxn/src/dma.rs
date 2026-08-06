@@ -55,12 +55,15 @@
 //! ```
 
 // Most of the `pub(crate)` surface below exists for peripheral drivers that
-// consume DMA channels; none have landed yet.
+// consume DMA channels - `lpuart` is the first, but plenty (e.g. `Error`'s
+// non-`Overrun` variants) is still unused by anything.
 #![allow(dead_code)]
 
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
-use core::sync::atomic::{Ordering, fence};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use core::task::{Context, Poll};
 
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -1303,6 +1306,215 @@ impl Drop for Transfer<'_> {
     }
 }
 
+/// A circular buffer fed continuously by a peripheral's DMA requests.
+///
+/// Unlike [`Transfer`], this never completes on its own: `circular: true`
+/// rewinds the destination pointer every time the major loop wraps, so the
+/// only way to know how much new data has arrived is to compare the address
+/// eDMA is currently writing to against how far the reader has already
+/// consumed. `DmaChannel::setup_circular_read` creates one.
+pub struct RingBuffer<'channel, 'buf, W: Word> {
+    channel: DmaChannel<'channel>,
+    /// `NonNull` rather than `&mut`: eDMA writes into this buffer for as long
+    /// as the transfer runs, concurrently with reads through `read_pos` - an
+    /// exclusive reference would claim more than that.
+    buf: NonNull<[W]>,
+    buf_len: usize,
+    /// How far the reader has consumed, as an index into `buf`.
+    read_pos: AtomicUsize,
+    _buf: PhantomData<&'buf mut [W]>,
+}
+
+impl<'channel, 'buf, W: Word> RingBuffer<'channel, 'buf, W> {
+    /// # Safety
+    ///
+    /// `channel` must already be configured for a circular transfer into
+    /// `buf`, with its request source and interrupts enabled.
+    unsafe fn new(channel: DmaChannel<'channel>, buf: &'buf mut [W]) -> Self {
+        Self {
+            buf_len: buf.len(),
+            buf: NonNull::from(buf),
+            channel,
+            read_pos: AtomicUsize::new(0),
+            _buf: PhantomData,
+        }
+    }
+
+    /// Index into `buf` that eDMA is currently writing to.
+    fn write_pos(&self) -> usize {
+        let daddr = self.channel.tcd().tcd_daddr().read().daddr() as usize;
+        let buf_start = self.buf.as_ptr() as *const W as usize;
+        (daddr.wrapping_sub(buf_start) / core::mem::size_of::<W>()) % self.buf_len
+    }
+
+    /// Words available to read without blocking.
+    pub fn available(&self) -> usize {
+        let write_pos = self.write_pos();
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            self.buf_len - read_pos + write_pos
+        }
+    }
+
+    /// `true` once eDMA has written a full lap without being read, meaning
+    /// data was silently overwritten before [`RingBuffer::read`] saw it.
+    pub fn is_overrun(&self) -> bool {
+        self.available() >= self.buf_len - 1
+    }
+
+    /// Copy out whatever is already available, without waiting.
+    ///
+    /// Returns the number of words copied, which may be less than `dst.len()`.
+    pub fn read_immediate(&self, dst: &mut [W]) -> usize {
+        let write_pos = self.write_pos();
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let available = if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            self.buf_len - read_pos + write_pos
+        };
+
+        let to_read = dst.len().min(available);
+        if to_read == 0 {
+            return 0;
+        }
+
+        // SAFETY: only `[read_pos, write_pos)` is read here, which eDMA has
+        // already finished writing - `write_pos` was sampled above, and eDMA
+        // can only have advanced further since, never into this range.
+        let buf = unsafe { self.buf.as_ref() };
+
+        let first = (self.buf_len - read_pos).min(to_read);
+        dst[..first].copy_from_slice(&buf[read_pos..read_pos + first]);
+        if to_read > first {
+            dst[first..to_read].copy_from_slice(&buf[..to_read - first]);
+        }
+
+        self.read_pos.store((read_pos + to_read) % self.buf_len, Ordering::Release);
+        to_read
+    }
+
+    /// Wait for at least one word, then copy out as much as is available.
+    pub async fn read(&self, dst: &mut [W]) -> Result<usize, Error> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+
+        core::future::poll_fn(|cx| {
+            if self.is_overrun() {
+                return Poll::Ready(Err(Error::Overrun));
+            }
+
+            let n = self.read_immediate(dst);
+            if n > 0 {
+                return Poll::Ready(Ok(n));
+            }
+
+            // Register before the second check, for the same reason as every
+            // other future in this crate: a wake with nothing registered is
+            // discarded, so registering after would leave a window in which
+            // eDMA's write lands between the check and the registration.
+            self.channel.waker().register(cx.waker());
+
+            let n = self.read_immediate(dst);
+            if n > 0 {
+                Poll::Ready(Ok(n))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Discard whatever is currently unread.
+    pub fn clear(&self) {
+        self.read_pos.store(self.write_pos(), Ordering::Release);
+    }
+
+    fn teardown(&mut self) {
+        let t = self.channel.tcd();
+        t.ch_csr().modify(|w| {
+            w.set_erq(false);
+            w.set_earq(false);
+        });
+        t.ch_int().write(|w| w.set_int(true));
+        t.ch_csr().modify(|w| w.set_done(true));
+        fence(Ordering::Release);
+    }
+
+    /// Stop the transfer and release the channel, returning the count of
+    /// words that were never read.
+    pub fn stop(mut self) -> usize {
+        let remaining = self.available();
+        self.teardown();
+        remaining
+    }
+}
+
+impl<W: Word> Drop for RingBuffer<'_, '_, W> {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+impl<'a> DmaChannel<'a> {
+    /// Set up a continuous peripheral-to-memory transfer into `buf`, wrapping
+    /// back to the start every time it fills.
+    ///
+    /// Self-contained like [`DmaChannel::read_from_peripheral`] - programs the
+    /// TCD, sets the request source, enables both the request and this
+    /// channel's NVIC vector, and hands back a [`RingBuffer`] already
+    /// running. Doing all of that here, rather than leaving the request
+    /// source/enable to the caller, is what let this share the "TCD before
+    /// mux before enable" ordering `write_to_peripheral`/`read_from_peripheral`
+    /// already get right, and avoids handing back a `RingBuffer` that
+    /// mutably (re)borrows `self` while the caller still needs to call
+    /// further `&mut self` methods on it to finish setup.
+    ///
+    /// # Safety
+    ///
+    /// `peri_addr` must be valid for reads for as long as the returned
+    /// `RingBuffer` exists, and `buf` must not be accessed by anything else
+    /// meanwhile.
+    pub(crate) unsafe fn setup_circular_read<'buf, W: Word>(
+        &mut self,
+        peri_addr: *const W,
+        buf: &'buf mut [W],
+        request: DmaRequest,
+    ) -> Result<RingBuffer<'_, 'buf, W>, InvalidParameters> {
+        if buf.is_empty() || buf.len() > DMA_MAX_TRANSFER_SIZE {
+            return Err(InvalidParameters);
+        }
+
+        unsafe {
+            self.setup_transfers(DmaTransferParameters {
+                src_ptr: peri_addr,
+                dst_ptr: buf.as_mut_ptr(),
+                dst_count: buf.len(),
+                src_incr: false,
+                dst_incr: true,
+                circular: true,
+                // Request-driven, like `read_from_peripheral`: one word per
+                // major loop iteration, paced by the peripheral, not started
+                // all at once from software.
+                software: false,
+                options: TransferOptions {
+                    half_transfer_interrupt: true,
+                    complete_transfer_interrupt: true,
+                    priority: Priority::default(),
+                },
+            });
+            self.set_request_source(request);
+            self.enable_interrupt();
+            self.enable_request();
+        }
+
+        Ok(unsafe { RingBuffer::new(self.reborrow(), buf) })
+    }
+}
+
 /// Acknowledge a channel's interrupt and wake its [`Transfer`], if any.
 ///
 /// # Safety
@@ -1319,16 +1531,13 @@ pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
     // acknowledging here is what stops this handler re-entering.
     t.ch_int().write(|w| w.set_int(true));
 
-    // Only a completed major loop resolves a `Transfer`. A half-transfer
-    // interrupt shares this vector and is acknowledged above without waking,
-    // since CH_CSR[DONE] is still clear.
-    //
-    // Reading DONE after the acknowledge cannot lose a completion, because DONE
-    // is sticky until explicitly cleared; the reverse order could drop a second
-    // request that arrived in between.
-    if t.ch_csr().read().done() {
-        waker(dma, channel).wake();
-    }
+    // Wake unconditionally rather than gating on CH_CSR[DONE]: a circular
+    // transfer's half-transfer interrupt (RingBuffer) shares this vector and
+    // never sets DONE at all, since the major loop never completes on its
+    // own. A spurious wake for a plain one-shot Transfer is harmless - its
+    // own poll re-checks DONE regardless of why it was woken - so one waker
+    // serving both shapes is simpler than tracking which interrupt fired.
+    waker(dma, channel).wake();
 }
 
 #[doc(hidden)]
