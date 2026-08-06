@@ -24,6 +24,8 @@ pub mod ctimer;
 #[cfg(mcxn_dma)]
 pub mod dma;
 pub mod gpio;
+#[cfg(mcxn_lpuart)]
+pub mod lpuart;
 #[cfg(mcxn_ostimer)]
 pub mod ostimer;
 #[cfg(mcxn_cmc)]

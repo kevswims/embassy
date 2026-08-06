@@ -69,7 +69,7 @@ fn main() {
 /// 119, but a generator emits macro calls that only compile once the driver
 /// defining them lands. Adding a family here is the last step of implementing
 /// its pin traits, not the first.
-const PIN_FAMILIES: &[&str] = &["ctimer"];
+const PIN_FAMILIES: &[&str] = &["ctimer", "lpuart"];
 
 /// Pin-impl generators, keyed by the family name checked against
 /// [`PIN_FAMILIES`]. GPIO is absent because it is unconditional.
@@ -223,7 +223,7 @@ fn generate_instance_calls() -> TokenStream {
     // Peripherals whose driver defines an `impl_<name>_instance!` macro. Adding
     // a name here without the matching macro breaks the build, so this list
     // grows as drivers land.
-    const REQUIRES_INSTANCE: &[&str] = &["crc", "ctimer", "gpio", "wwdt"];
+    const REQUIRES_INSTANCE: &[&str] = &["crc", "ctimer", "gpio", "lpuart", "wwdt"];
 
     let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
 
@@ -504,11 +504,26 @@ fn generate_ctimer_pin_impls() -> TokenStream {
 fn generate_lpuart_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
-    let lpuart_regex = Regex::new(r"^LPUART\d+").unwrap();
-    for lpuart in METADATA.peripherals.iter().filter(|p| lpuart_regex.is_match(p.name)) {
-        let lpuart_name = format_ident!("{}", lpuart.name);
-        for signal in lpuart.signals {
-            let signal_name = format_ident!("{}", signal.name);
+    // Pin-mux signals live on LP_FLEXCOMMn, not LPUARTn - LPUART's own
+    // `signals` are empty, since a flexcomm's pads are shared raw material for
+    // whichever of UART/SPI/I2C/I2S its PSELID selects. RM 66.2.3's pure-UART
+    // column (not the combined UART+I2C one) says P0 is RXD and P1 is TXD -
+    // backwards from the intuitive reading, since the low-numbered pad is the
+    // input. RTS_b/CTS_b (P2/P3) and the modem-control pads (P4-P6) are left
+    // unmapped until a driver actually uses them.
+    let flexcomm_regex = Regex::new(r"^LP_FLEXCOMM\d+").unwrap();
+    let signal_names: &[(&str, &str)] = &[("P0", "RXD"), ("P1", "TXD")];
+
+    for flexcomm in METADATA.peripherals.iter().filter(|p| flexcomm_regex.is_match(p.name)) {
+        let n = &flexcomm.name["LP_FLEXCOMM".len()..];
+        let lpuart_name = format_ident!("LPUART{n}");
+
+        for signal in flexcomm.signals {
+            let Some((_, uart_signal)) = signal_names.iter().find(|(pad, _)| *pad == signal.name) else {
+                continue;
+            };
+            let signal_name = format_ident!("{uart_signal}");
+
             for pin in signal.pins {
                 let pin_name = format_ident!("{}", pin.pin);
                 let mux = format_ident!("Mux{}", pin.alt);
