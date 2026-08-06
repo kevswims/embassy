@@ -6,11 +6,15 @@
 //! [`Capture::new`] just writes the pin's [`InputPin::INP`] index into the
 //! target channel's `ctimerXcap` register - there is no restricted
 //! `ValidMatchConfig`-style marker here because every combination is valid.
+//!
+//! [`PwmInput`] builds on the same primitives to measure an external PWM
+//! signal: since INPUTMUX routing is per-channel, one pad's `CT_INPn` can feed
+//! two capture channels at once, one watching only rising edges and the other
+//! only falling, without ever needing to poll the pin's level directly.
 
 use core::future::Future;
-use core::pin::Pin as CorePin;
 use core::sync::atomic::{AtomicU8, Ordering};
-use core::task::{Context, Poll};
+use core::task::Poll;
 
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -135,8 +139,8 @@ impl<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, 
             disable::<INPUTMUX0>();
         }
 
-        this.set_edges(edge);
-        this.enable_interrupt();
+        configure_edges::<T>(channel, edge);
+        enable_channel_interrupt::<T>(channel);
 
         T::Interrupt::unpend();
         // Safety: `_irq` ensures an Interrupt Handler exists.
@@ -147,44 +151,9 @@ impl<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, 
 }
 
 impl<'d, T: Instance, Ch: PeripheralType, P: PeripheralType> Capture<'d, T, Ch, P> {
-    fn set_edges(&self, edge: Edge) {
-        let (rising, falling) = match edge {
-            Edge::Rising => (true, false),
-            Edge::Falling => (false, true),
-            Edge::Both => (true, true),
-        };
-        T::regs().ccr().modify(|w| match self.channel {
-            Channel::Zero => {
-                w.set_cap0re(rising);
-                w.set_cap0fe(falling);
-            }
-            Channel::One => {
-                w.set_cap1re(rising);
-                w.set_cap1fe(falling);
-            }
-            Channel::Two => {
-                w.set_cap2re(rising);
-                w.set_cap2fe(falling);
-            }
-            Channel::Three => {
-                w.set_cap3re(rising);
-                w.set_cap3fe(falling);
-            }
-        });
-    }
-
-    fn enable_interrupt(&self) {
-        T::regs().ccr().modify(|w| match self.channel {
-            Channel::Zero => w.set_cap0i(true),
-            Channel::One => w.set_cap1i(true),
-            Channel::Two => w.set_cap2i(true),
-            Channel::Three => w.set_cap3i(true),
-        });
-    }
-
     /// The counter value at the next captured edge.
-    pub fn capture(&mut self) -> CaptureFuture<'_, 'd, T, Ch, P> {
-        CaptureFuture { capture: self }
+    pub fn capture(&mut self) -> impl Future<Output = u32> + '_ {
+        wait_edge::<T>(self.channel)
     }
 }
 
@@ -193,52 +162,229 @@ impl<T: Instance, Ch: PeripheralType, P: PeripheralType> Drop for Capture<'_, T,
         if self._timer.is_some() {
             T::regs().tcr().modify(|w| w.set_cen(false));
         }
-        T::regs().ccr().modify(|w| match self.channel {
-            Channel::Zero => {
-                w.set_cap0re(false);
-                w.set_cap0fe(false);
-                w.set_cap0i(false);
-            }
-            Channel::One => {
-                w.set_cap1re(false);
-                w.set_cap1fe(false);
-                w.set_cap1i(false);
-            }
-            Channel::Two => {
-                w.set_cap2re(false);
-                w.set_cap2fe(false);
-                w.set_cap2i(false);
-            }
-            Channel::Three => {
-                w.set_cap3re(false);
-                w.set_cap3fe(false);
-                w.set_cap3i(false);
-            }
-        });
+        disable_channel::<T>(self.channel);
     }
 }
 
-/// Future returned by [`Capture::capture`].
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct CaptureFuture<'a, 'd, T: Instance, Ch: PeripheralType, P: PeripheralType> {
-    capture: &'a mut Capture<'d, T, Ch, P>,
+/// A period/duty measurement from [`PwmInput::measure`].
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Measurement {
+    /// Ticks between consecutive rising edges.
+    pub period: u32,
+    /// Ticks the input was high within that period.
+    pub high_ticks: u32,
 }
 
-impl<T: Instance, Ch: PeripheralType, P: PeripheralType> Future for CaptureFuture<'_, '_, T, Ch, P> {
-    type Output = u32;
+/// Measures an external PWM signal's period and duty cycle.
+///
+/// Uses two capture channels on the same pad: one watching only rising edges,
+/// the other only falling, both fed the same [`InputPin::INP`] index through
+/// INPUTMUX0. This is what lets [`PwmInput::measure`] compute a duty cycle
+/// without ever sampling the pin's level directly, unlike a single
+/// [`Capture`] channel watching [`Edge::Both`].
+pub struct PwmInput<'d, T: Instance, ChR: PeripheralType, ChF: PeripheralType, P: PeripheralType> {
+    _timer: Peri<'d, T>,
+    _rising_channel: Peri<'d, ChR>,
+    _falling_channel: Peri<'d, ChF>,
+    _pin: Peri<'d, P>,
+    rising: Channel,
+    falling: Channel,
+    /// The rising edge that starts the *next* measurement's period. `None`
+    /// only before the first [`PwmInput::measure`] call.
+    last_rising: Option<u32>,
+    hz: u32,
+}
 
-    fn poll(self: CorePin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+impl<
+    'd,
+    T: Instance + Gate + FunctionalClock,
+    ChR: PeripheralType,
+    ChF: PeripheralType,
+    P: PeripheralType,
+> PwmInput<'d, T, ChR, ChF, P>
+{
+    /// Measure the signal on `pin` using `rising_channel` and `falling_channel`.
+    ///
+    /// Like [`Capture::new`], this brings up the timer's functional clock and
+    /// starts its counter, so it must not be called while another driver
+    /// already owns `timer`.
+    pub fn new(
+        timer: Peri<'d, T>,
+        rising_channel: Peri<'d, ChR>,
+        falling_channel: Peri<'d, ChF>,
+        pin: Peri<'d, P>,
+        clock: &T::Config,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+    ) -> Result<Self, ClockError>
+    where
+        ChR: CtimerChannel<T>,
+        ChF: CtimerChannel<T>,
+        P: InputPin<T>,
+    {
+        // SAFETY: `timer` is owned, so nothing else is driving this peripheral.
+        let hz = unsafe { enable_and_reset_with_clock::<T>(clock) }?;
+
+        let rising = rising_channel.number();
+        let falling = falling_channel.number();
+        let this = Self {
+            _timer: timer,
+            _rising_channel: rising_channel,
+            _falling_channel: falling_channel,
+            _pin: pin,
+            rising,
+            falling,
+            last_rising: None,
+            hz,
+        };
+
+        this._pin.mux();
+
+        // Both channels observe the same pad - routed to two independent
+        // capture registers, one per channel, is what lets one watch just the
+        // rising edge and the other just the falling edge of the same signal.
+        unsafe {
+            enable::<INPUTMUX0>();
+            write_inp_select(T::TIMER_INDEX, rising, P::INP);
+            write_inp_select(T::TIMER_INDEX, falling, P::INP);
+            disable::<INPUTMUX0>();
+        }
+
+        configure_edges::<T>(rising, Edge::Rising);
+        configure_edges::<T>(falling, Edge::Falling);
+        enable_channel_interrupt::<T>(rising);
+        enable_channel_interrupt::<T>(falling);
+
+        T::Interrupt::unpend();
+        // Safety: `_irq` ensures an Interrupt Handler exists.
+        unsafe { T::Interrupt::enable() };
+
+        T::regs().tcr().modify(|w| w.set_cen(true));
+
+        Ok(this)
+    }
+}
+
+impl<T: Instance, ChR: PeripheralType, ChF: PeripheralType, P: PeripheralType> PwmInput<'_, T, ChR, ChF, P> {
+    /// The functional clock feeding the counter, in Hz.
+    pub fn frequency(&self) -> u32 {
+        self.hz
+    }
+
+    /// The next period/duty measurement.
+    ///
+    /// The first call waits out a full rising-to-rising period plus whatever
+    /// is left of the current cycle; every call after that needs only the
+    /// remaining falling and rising edge, reusing the previous measurement's
+    /// closing rising edge as this one's opening edge.
+    pub async fn measure(&mut self) -> Measurement {
+        if self.last_rising.is_none() {
+            self.last_rising = Some(wait_edge::<T>(self.rising).await);
+        }
+
+        let high_edge = wait_edge::<T>(self.falling).await;
+        let next_rising = wait_edge::<T>(self.rising).await;
+
+        // SAFETY of the unwrap: set above, and every path below re-sets it.
+        let r0 = self.last_rising.unwrap();
+        let measurement = Measurement {
+            period: next_rising.wrapping_sub(r0),
+            high_ticks: high_edge.wrapping_sub(r0),
+        };
+        self.last_rising = Some(next_rising);
+
+        measurement
+    }
+}
+
+impl<T: Instance, ChR: PeripheralType, ChF: PeripheralType, P: PeripheralType> Drop for PwmInput<'_, T, ChR, ChF, P> {
+    fn drop(&mut self) {
+        T::regs().tcr().modify(|w| w.set_cen(false));
+        disable_channel::<T>(self.rising);
+        disable_channel::<T>(self.falling);
+    }
+}
+
+/// Set a channel's `CAPnRE`/`CAPnFE` edge-enable bits.
+fn configure_edges<T: Instance>(channel: Channel, edge: Edge) {
+    let (rising, falling) = match edge {
+        Edge::Rising => (true, false),
+        Edge::Falling => (false, true),
+        Edge::Both => (true, true),
+    };
+    T::regs().ccr().modify(|w| match channel {
+        Channel::Zero => {
+            w.set_cap0re(rising);
+            w.set_cap0fe(falling);
+        }
+        Channel::One => {
+            w.set_cap1re(rising);
+            w.set_cap1fe(falling);
+        }
+        Channel::Two => {
+            w.set_cap2re(rising);
+            w.set_cap2fe(falling);
+        }
+        Channel::Three => {
+            w.set_cap3re(rising);
+            w.set_cap3fe(falling);
+        }
+    });
+}
+
+/// Set a channel's `CAPnI` interrupt-enable bit.
+fn enable_channel_interrupt<T: Instance>(channel: Channel) {
+    T::regs().ccr().modify(|w| match channel {
+        Channel::Zero => w.set_cap0i(true),
+        Channel::One => w.set_cap1i(true),
+        Channel::Two => w.set_cap2i(true),
+        Channel::Three => w.set_cap3i(true),
+    });
+}
+
+/// Clear a channel's edge-enable and interrupt-enable bits.
+fn disable_channel<T: Instance>(channel: Channel) {
+    T::regs().ccr().modify(|w| match channel {
+        Channel::Zero => {
+            w.set_cap0re(false);
+            w.set_cap0fe(false);
+            w.set_cap0i(false);
+        }
+        Channel::One => {
+            w.set_cap1re(false);
+            w.set_cap1fe(false);
+            w.set_cap1i(false);
+        }
+        Channel::Two => {
+            w.set_cap2re(false);
+            w.set_cap2fe(false);
+            w.set_cap2i(false);
+        }
+        Channel::Three => {
+            w.set_cap3re(false);
+            w.set_cap3fe(false);
+            w.set_cap3i(false);
+        }
+    });
+}
+
+/// The counter value at `channel`'s next captured edge.
+///
+/// The interrupt must already be enabled for `channel` for this to ever
+/// resolve - see [`Capture::new`]/[`Capture::new_channel`]/[`PwmInput::new`].
+fn wait_edge<T: Instance>(channel: Channel) -> impl Future<Output = u32> {
+    core::future::poll_fn(move |cx| {
         let index = T::TIMER_INDEX as usize;
-        let n = self.capture.channel.index();
+        let n = channel.index();
         let bit = 1 << n;
 
-        // Register before sampling the flag. The interrupt is enabled for this
-        // channel's whole lifetime (see `Capture::new`), so `FLAGS` is sticky:
-        // an edge that lands between two `capture()` calls, or before the first
-        // one, is still recorded and this returns Ready for it immediately
-        // rather than waiting for a fresh edge that may never come. Registering
-        // first only matters for the case where the edge lands after this poll
-        // - the same reasoning as the DMA transfer future.
+        // Register before sampling the flag. The interrupt is enabled for
+        // this channel's whole lifetime, so `FLAGS` is sticky: an edge that
+        // lands between two polls, or before the first one, is still
+        // recorded and this returns Ready for it immediately rather than
+        // waiting for a fresh edge that may never come. Registering first
+        // only matters for the case where the edge lands after this poll -
+        // the same reasoning as the DMA transfer future.
         waker(index).register(cx.waker());
 
         let prev = FLAGS[index].fetch_and(!bit, Ordering::AcqRel);
@@ -247,7 +393,7 @@ impl<T: Instance, Ch: PeripheralType, P: PeripheralType> Future for CaptureFutur
         } else {
             Poll::Pending
         }
-    }
+    })
 }
 
 struct State {
