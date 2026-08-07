@@ -94,8 +94,7 @@ pub struct Clocks {
 
     /// `clk_16k`, FRO16K from the VBAT domain.
     ///
-    /// Always `None`: the oscillator is already running at reset, but routing
-    /// it out through `VBAT0.FROCLKE` is not implemented.
+    /// `None` unless [`super::config::ClocksConfig::enable_clk_16k`] was set.
     pub clk_16k: Option<u32>,
 
     /// `xtal32k`, OSC32K from the VBAT domain.
@@ -180,7 +179,7 @@ impl Clocks {
 
     /// `clk_16k`, FRO16K from the VBAT domain.
     pub fn ensure_clk_16k(&self) -> Result<u32, ClockError> {
-        Self::ensure(self.clk_16k, "clk_16k", "VBAT0 FRO16K fan-out is not implemented")
+        Self::ensure(self.clk_16k, "clk_16k", "set ClocksConfig::enable_clk_16k")
     }
 
     /// `xtal32k`, OSC32K from the VBAT domain.

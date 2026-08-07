@@ -111,6 +111,7 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
     source::configure_clock_ctrl(&settings, &mut clocks);
     // Needs main_clk_hz already recorded: FROHFDIV divides `fro_hf`.
     source::configure_fro_hf_div(&settings, &mut clocks);
+    source::configure_vbat(&settings, &mut clocks);
 
     clocks.system_clk_hz = main_clk_hz / source::configure_ahb_div(&settings);
 

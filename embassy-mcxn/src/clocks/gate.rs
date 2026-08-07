@@ -333,6 +333,11 @@ impl_syscon_gate!(WWDT0, 0, clk: Ahbclkctrl0.set_wwdt0(true); rst: none);
 #[cfg(mcx_wwdt)]
 impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
 
+// RTC0's bus interface only - the tick clock feeding its counters comes from
+// the VBAT domain (`Ctrl.clk_sel`), not this gate. See `crate::rtc`.
+#[cfg(mcx_rtc5xx)]
+impl_syscon_gate!(RTC0, 1, clk: Ahbclkctrl1.set_rtc(true); rst: Presetctrl1.set_rtc_rst(), RtcRst);
+
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
 #[cfg(mcx_ctimer)]

@@ -157,6 +157,39 @@ pub(super) fn configure_ahb_div(cfg: &ClocksConfig) -> u32 {
     }
 }
 
+/// FRO16K's fixed rate.
+const FRO_16K_HZ: u32 = 16_384;
+
+/// Bring `clk_16k` up, if asked for.
+///
+/// `VBAT0.FROCTLA.FRO_EN` starts the oscillator; `VBAT0.FROCLKE.CLKE` then
+/// fans it out to consumers. Unlike `xtal32k`, FRO16K is a free-running RC
+/// oscillator with no crystal settling time, so there is no ready flag to
+/// poll.
+///
+/// This crate does not model the VBAT domain's per-power-domain gating (the
+/// `CLKE` nibble has one bit per domain on chips with more than one), so all
+/// four bits are set: RTC's tick clock has to survive every low-power mode it
+/// runs through, and there is no correctness downside to leaving unused
+/// domains enabled here.
+///
+/// UNVERIFIED ON HARDWARE: the one attempt to run an `RTC0` example that
+/// exercises this path left the target unresponsive to the debug probe (not
+/// a normal crash - `probe-rs` could not reconnect at all, needing a full
+/// power cycle). Root cause not confirmed; this VBAT0 write is one of several
+/// candidates (the others being RTC0's own write-unlock sequence). Do not
+/// trust this path until it has been re-run and diagnosed.
+pub(super) fn configure_vbat(cfg: &ClocksConfig, clocks: &mut Clocks) {
+    if !cfg.enable_clk_16k {
+        return;
+    }
+
+    pac::VBAT0.froctla().modify(|w| w.set_fro_en(true));
+    pac::VBAT0.froclke().modify(|w| w.set_clke(0b1111));
+
+    clocks.clk_16k = Some(FRO_16K_HZ);
+}
+
 /// Compile-time guard: `Div<8>` must cover the full `AHBCLKDIV`/`FROHFDIV`
 /// range, and the encoding must be divide-by-`n+1`.
 const _: () = {

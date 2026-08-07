@@ -115,6 +115,15 @@ pub struct ClocksConfig {
     /// needs `SPC0` voltage and `FMU0` wait-state changes that are not
     /// implemented.
     pub ahb_div: Option<Div<8>>,
+
+    /// Enable `clk_16k`, the VBAT domain's FRO16K (`VBAT0.FROCTLA.FRO_EN` +
+    /// `VBAT0.FROCLKE.CLKE`).
+    ///
+    /// Defaults to `false` - nothing needs it until a driver (RTC) selects
+    /// it. Unlike `xtal32k`, this is a free-running RC oscillator with no
+    /// ready flag to poll, so enabling it costs one register write and takes
+    /// effect immediately.
+    pub enable_clk_16k: bool,
 }
 
 impl Default for ClocksConfig {
@@ -127,6 +136,7 @@ impl Default for ClocksConfig {
             enable_clk_in_fm_usbh_lpt: false,
             fro_hf_div: None,
             ahb_div: None,
+            enable_clk_16k: false,
         }
     }
 }

@@ -30,6 +30,8 @@ pub mod lpuart;
 pub mod ostimer;
 #[cfg(mcxn_cmc)]
 pub mod reset_reason;
+#[cfg(mcx_rtc5xx)]
+pub mod rtc;
 #[cfg(mcx_wwdt)]
 pub mod wwdt;
 
