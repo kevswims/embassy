@@ -46,28 +46,32 @@ pub trait Gate {
     /// peripheral that has no reset bit at all.
     const RST_MASK: u32;
 
-    /// Enable the clock gate.
+    /// Enable the clock gate. A no-op if it has no clock-enable bit at all.
     ///
     /// # Safety
     ///
     /// The current peripheral must be disabled prior to calling this method.
     #[inline]
     unsafe fn enable_clock() {
-        crate::pac::SYSCON0
-            .ahbclkctrlset(Self::REG_IDX)
-            .write_value(crate::pac::syscon::Ahbclkctrlset(Self::CLK_MASK));
+        if Self::CLK_MASK != 0 {
+            crate::pac::SYSCON0
+                .ahbclkctrlset(Self::REG_IDX)
+                .write_value(crate::pac::syscon::Ahbclkctrlset(Self::CLK_MASK));
+        }
     }
 
-    /// Disable the clock gate.
+    /// Disable the clock gate. A no-op if it has no clock-enable bit at all.
     ///
     /// # Safety
     ///
     /// There must be no active user of this peripheral when calling this method.
     #[inline]
     unsafe fn disable_clock() {
-        crate::pac::SYSCON0
-            .ahbclkctrlclr(Self::REG_IDX)
-            .write_value(crate::pac::syscon::Ahbclkctrlclr(Self::CLK_MASK));
+        if Self::CLK_MASK != 0 {
+            crate::pac::SYSCON0
+                .ahbclkctrlclr(Self::REG_IDX)
+                .write_value(crate::pac::syscon::Ahbclkctrlclr(Self::CLK_MASK));
+        }
     }
 
     /// Drive the peripheral into reset. A no-op if it has no reset bit.
@@ -99,9 +103,12 @@ pub trait Gate {
     }
 
     /// Return whether the clock gate for this peripheral is currently enabled.
+    ///
+    /// Trivially true for a peripheral with no clock-enable bit at all - it
+    /// is always clocked, there is nothing gating it.
     #[inline]
     fn is_clock_enabled() -> bool {
-        ahbclkctrl_bits(Self::REG_IDX) & Self::CLK_MASK != 0
+        Self::CLK_MASK == 0 || ahbclkctrl_bits(Self::REG_IDX) & Self::CLK_MASK != 0
     }
 
     /// Return whether the peripheral is currently out of reset.
@@ -291,6 +298,22 @@ macro_rules! impl_syscon_gate {
             const RST_MASK: u32 = 0;
         }
     };
+
+    // No SYSCON bus-clock gate and no reset bit at all - the peripheral is
+    // always clocked. `REG_IDX` is unused (both masks are 0, so `Gate`'s
+    // default methods never index into `AHBCLKCTRL`/`PRESETCTRL`) but still
+    // has to be a valid index for the type to be well-formed.
+    (
+        $name:ident,
+        clk: none;
+        rst: none $(,)?
+    ) => {
+        impl crate::clocks::Gate for crate::peripherals::$name {
+            const REG_IDX: usize = 0;
+            const CLK_MASK: u32 = 0;
+            const RST_MASK: u32 = 0;
+        }
+    };
 }
 
 // PORT0-4 / GPIO0-4: gated via SYSCON0.AHBCLKCTRL0 / PRESETCTRL0 (RM Chapter
@@ -337,6 +360,18 @@ impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
 // the VBAT domain (`Ctrl.clk_sel`), not this gate. See `crate::rtc`.
 #[cfg(mcx_rtc5xx)]
 impl_syscon_gate!(RTC0, 1, clk: Ahbclkctrl1.set_rtc(true); rst: Presetctrl1.set_rtc_rst(), RtcRst);
+
+// LPTMR0/1: no AHBCLKCTRL/PRESETCTRL bit exists for either instance anywhere
+// in SYSCON - confirmed by exhaustive grep across all four AHBCLKCTRL/
+// PRESETCTRL register definitions, unlike OSTIMER0/RTC0 which sit at
+// adjacent addresses and do have one each. Only `CLOCK_CTRL.FRO12MHZ_ENA`/
+// `CLKIN_ENA_FM_USBH_LPT` gate whether a *source* reaches LPTMR at all - see
+// `ClocksConfig::enable_fro_12m_periph`, already implemented for other
+// consumers of that same fan-out.
+#[cfg(mcxn_lptmr)]
+impl_syscon_gate!(LPTMR0, clk: none; rst: none);
+#[cfg(mcxn_lptmr)]
+impl_syscon_gate!(LPTMR1, clk: none; rst: none);
 
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
