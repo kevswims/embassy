@@ -62,6 +62,8 @@ pub use functional::{
     Lpuart5ClockConfig, Lpuart5ClockSource, Lpuart6ClockConfig, Lpuart6ClockSource, Lpuart7ClockConfig,
     Lpuart7ClockSource, Lpuart8ClockConfig, Lpuart8ClockSource, Lpuart9ClockConfig, Lpuart9ClockSource,
 };
+#[cfg(mcxn_adc)]
+pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 

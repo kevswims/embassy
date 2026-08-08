@@ -1,0 +1,357 @@
+//! Analog-to-digital converter (ADC) driver.
+//!
+//! First pass only: a single command buffer (CMD1) and a single software
+//! trigger (trigger 0) drive one-shot, single-ended, 16-bit conversions via
+//! [`Adc::read_channel`]. RM chapter 41 documents far more (15 independent
+//! command buffers, 4 prioritized trigger sources with resync, hardware
+//! averaging/looping/compare, DMA into the result FIFO) - none of that is
+//! exposed yet.
+//!
+//! # [`crate::vref`] is required
+//!
+//! **The ADC cannot convert without a live [`crate::vref::Vref`]**, whatever
+//! [`Config`] selects for its reference. VREF supplies the ADC's *bias
+//! current*, so without it the analog front-end is unbiased: every channel
+//! converts to the SAR's mid-scale default (`0x8000`) - including internal
+//! ones like the bandgap and hard-tied `VSS` - and both hardware
+//! calibrations complete but measure exactly zero. Every digital register
+//! reads correctly the whole time, which makes this failure look nothing
+//! like a missing analog supply.
+//!
+//! This is easy to miss because it is independent of `Cfg.refsel`: the
+//! FRDM-MCXN947 example references `VDD_ANA` and still brings VREF up first,
+//! commenting that "the VREF module is only used to supply the bias current
+//! for LPADC".
+//!
+//! # Calibration
+//!
+//! [`Adc::new`] runs both hardware calibrations, mirroring
+//! `LPADC_DoOffsetCalibration` and `LPADC_DoAutoCalibration`:
+//!
+//! - **Offset** (`Ctrl.calofs`): self-clears, completion via `Stat.cal_rdy`,
+//!   result written by hardware into `Ofstrim`.
+//! - **Gain** (`Ctrl.cal_req`): completion is signalled by `Gcc[0]`/
+//!   `Gcc[1].rdy`, *not* `Stat.cal_rdy`. Software must then compute a gain
+//!   correction from `Gcc` and write it to `Gcr[0]`/`Gcr[1]` with `rdy` set;
+//!   only then does `Stat.cal_rdy` follow. Polling `Stat.cal_rdy` for this
+//!   step instead hangs forever. The `Gcr` encoding is a bit-serial
+//!   expansion, not a plain fixed-point cast (ported from NXP's
+//!   `LPADC_GetGainConvResult`).
+//!
+//! Both are one-time, at construction. On healthy hardware they land near
+//! `Ofstrim = 0x0003_0003` and `Gcc = ~6300-6500`; exact zeroes mean the
+//! front-end measured nothing, which in practice means VREF is missing.
+//!
+//! # Clocking
+//!
+//! Unlike [`crate::rtc`]'s `Ctrl.clk_sel` or [`crate::lptmr`]'s `PSR.PCS`,
+//! ADC's functional clock mux (`SYSCON0.ADCnCLKSEL`/`ADCnCLKDIV`) is
+//! SYSCON-owned, not inside ADC's own register block - so
+//! [`crate::clocks::FunctionalClock`] configuration for ADC has none of
+//! those drivers' "don't write your own registers from inside configure()"
+//! restriction.
+//!
+//! Per RM 41.6.1 `ADCK` must be 6-24 MHz in low-power mode, 6-48 MHz for
+//! high-speed 16-bit, and 6-60 MHz for high-speed 12-bit. This driver
+//! selects high power (`Cfg.pwrsel`), so 48 MHz `fro_hf` and 12 MHz
+//! `fro_12m` are both in range for the 16-bit conversions it issues.
+use core::future::Future;
+use core::marker::PhantomData;
+use core::task::Poll;
+
+use embassy_hal_internal::{Peri, PeripheralType};
+use embassy_sync::waitqueue::AtomicWaker;
+
+use crate::clocks::{ClockError, Gate, enable_and_reset_with_clock};
+use crate::interrupt::typelevel;
+use crate::interrupt::typelevel::{Handler, Interrupt};
+use crate::pac;
+use crate::pac::adc::{CalAvgs, CalReq, CalRdy, Calofs, CmdlCtype, CmdlMode, GccRdy, Pwrsel, Refsel, Rst, Rstfifo0, Rstfifo1, Tcmd};
+
+/// Bit-serial gain correction encoding used by `Gcr[n].gcalr`, matching
+/// NXP's `LPADC_GetGainConvResult` - a Q1.16 fixed-point expansion, not a
+/// plain fixed-point cast.
+fn gain_conv_result(mut gain_adjustment: f32) -> u32 {
+    let mut terms = [0u32; 17];
+    for i in (1..=17u32).rev() {
+        let shift = 0x10u32 - (i - 1);
+        let scale = (1u32 << shift) as f32;
+        let inv_scale = 1.0 / scale;
+        let term = (gain_adjustment * scale) as u32;
+        terms[(i - 1) as usize] = term;
+        gain_adjustment -= term as f32 * inv_scale;
+    }
+    let mut result = 0u32;
+    for i in (1..=17u32).rev() {
+        result += terms[(i - 1) as usize] * (1u32 << (i - 1));
+    }
+    result
+}
+
+/// ADC error types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    /// Clock configuration error.
+    ClockSetup(ClockError),
+}
+
+/// ADC configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Power-up delay (`Cfg.pudly`), as a count of `(pudly * 4)` ADCK
+    /// cycles. Must be non-zero - the RM requires this to enable the ADC at
+    /// all.
+    pub power_up_delay: u8,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // Matches `LPADC_GetDefaultConfig()`'s default exactly (0x80, not
+        // the max 0xFF).
+        Self { power_up_delay: 0x80 }
+    }
+}
+
+/// Analog-to-digital converter peripheral.
+pub struct Adc<'d, T: Instance> {
+    _peri: Peri<'d, T>,
+}
+
+impl<'d, T: Instance> Adc<'d, T> {
+    /// Create a new ADC driver.
+    pub fn new<C>(peri: Peri<'d, T>, _irq: impl typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd, config: Config, clock: &C) -> Result<Self, Error>
+    where
+        T: crate::clocks::FunctionalClock<Config = C>,
+    {
+        unsafe { enable_and_reset_with_clock::<T>(clock).map_err(Error::ClockSetup)? };
+
+        let regs = T::info().regs();
+
+        // Pulse the internal reset and clear both result FIFOs before
+        // touching any configuration, mirroring NXP's LPADC_Init()
+        // (LPADC_DoResetConfig + LPADC_DoResetFIFO0/1). The bus-level
+        // PRESETCTRL reset pulsed by `enable_and_reset_with_clock` above
+        // does not reach this internal logic.
+        regs.ctrl().modify(|w| w.set_rst(Rst::HeldInReset));
+        regs.ctrl().modify(|w| w.set_rst(Rst::ReleasedFromReset));
+        regs.ctrl().modify(|w| w.set_rstfifo0(Rstfifo0::TriggerReset));
+        regs.ctrl().modify(|w| w.set_rstfifo1(Rstfifo1::TriggerReset));
+
+        regs.ctrl().modify(|w| w.set_adcen(false));
+        // Averages 1024 samples per calibration step, matching
+        // `LPADC_GetDefaultConfig()`'s `kLPADC_ConversionAverageMax - 1`.
+        // Calibration is one-time at construction, so the extra settling
+        // time buys accuracy at no steady-state cost.
+        regs.ctrl().modify(|w| w.set_cal_avgs(CalAvgs::Average1024));
+        // NXP's LPADC_Init() builds this register from scratch
+        // (`base->CFG = tmp32`), not a read-modify-write - reset defaults
+        // for fields it doesn't explicitly set (observed: `tprictrl =
+        // AbortCurrentOnPriority`, `hpt_exdi = Enabled`) are meant to be
+        // forced to 0, not preserved.
+        let mut cfg = pac::adc::Cfg::default();
+        {
+            let w = &mut cfg;
+            w.set_pudly(config.power_up_delay);
+            w.set_pwren(true);
+            // Matches the FRDM-MCXN947 board's own reference configuration
+            // (examples/_boards/frdmmcxn947 in the MCUXpresso SDK) for its
+            // ADC1 instance - VDD_ANA supply, confirmed powered at ~3.3V on
+            // this board via multimeter, same as VREFH.
+            w.set_refsel(Refsel::Option3);
+            // The PAC only names bits 0b00/0b10 ("Lowest"/"Highest") - the
+            // RM's true highest level (`kLPADC_PowerLevelAlt4`, used by the
+            // SDK's own `lpadc_polling` example) is raw value 0b11, mislabeled
+            // `_RESERVED_3` in the generated enum.
+            w.set_pwrsel(Pwrsel::from_bits(0b11));
+        }
+        regs.cfg().write_value(cfg);
+        regs.ctrl().modify(|w| w.set_adcen(true));
+
+        // Request offset calibration - every NXP lpadc example (including
+        // the FRDM-MCXN947 board's own reference code) runs this before any
+        // conversion; it auto-writes OFSTRIM on completion.
+        regs.ctrl().modify(|w| w.set_calofs(Calofs::OffsetCalibrationRequestPending));
+        let mut spins = 0u32;
+        while regs.stat().read().cal_rdy() != CalRdy::HardwareCalStepCompleted {
+            spins += 1;
+            if spins > 5_000_000 {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("ADC offset calibration never completed, STAT = {:?}", regs.stat().read());
+                break;
+            }
+        }
+
+        // Gain calibration (`LPADC_DoAutoCalibration` in NXP's driver) -
+        // without this, conversions never leave the SAR's mid-code default
+        // regardless of channel or input voltage. `Ctrl.cal_req` triggers
+        // it; completion is signalled by `Gcc[0]`/`Gcc[1].rdy`, not
+        // `Stat.cal_rdy` (that only turns true once software writes the
+        // computed gain back into `Gcr[0]`/`Gcr[1]` with `rdy` set below).
+        regs.ctrl().modify(|w| w.set_cal_req(CalReq::CalibrationRequestPending));
+        spins = 0;
+        while regs.gcc(0).read().rdy() != GccRdy::HardwareCalRoutineCompleted
+            || regs.gcc(1).read().rdy() != GccRdy::HardwareCalRoutineCompleted
+        {
+            spins += 1;
+            if spins > 5_000_000 {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("ADC gain calibration (GCC) never completed");
+                break;
+            }
+        }
+        let gcc_a = regs.gcc(0).read().gain_cal() as f64;
+        let gcc_b = regs.gcc(1).read().gain_cal() as f64;
+        let gcr_a = (131072.0 / (131072.0 - gcc_a)) as f32;
+        let gcr_b = (131072.0 / (131072.0 - gcc_b)) as f32;
+        regs.gcr(0).modify(|w| {
+            w.set_gcalr(gain_conv_result(gcr_a) as u16);
+            w.set_rdy(true);
+        });
+        regs.gcr(1).modify(|w| {
+            w.set_gcalr(gain_conv_result(gcr_b) as u16);
+            w.set_rdy(true);
+        });
+        spins = 0;
+        while regs.stat().read().cal_rdy() != CalRdy::HardwareCalStepCompleted {
+            spins += 1;
+            if spins > 5_000_000 {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("ADC gain calibration never reflected in STAT.cal_rdy");
+                break;
+            }
+        }
+
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
+        Ok(Self { _peri: peri })
+    }
+
+    /// Run a single-ended, 16-bit conversion on `channel` and return the raw
+    /// result.
+    pub async fn read_channel(&self, channel: u8) -> u16 {
+        let regs = T::info().regs();
+
+        regs.cmdl(0).modify(|w| {
+            w.set_adch(channel.into());
+            w.set_ctype(CmdlCtype::SingleEndedASideChannel);
+            w.set_mode(CmdlMode::Data16Bits);
+        });
+        regs.cmdh(0).modify(|w| {
+            w.set_next(0.into());
+            w.set_loop_(0.into());
+            w.set_avgs(0.into());
+            w.set_sts(0.into());
+            w.set_lwi(false);
+            w.set_wait_trig(false);
+            w.set_cmpen(0.into());
+        });
+        regs.tctrl(0).modify(|w| {
+            w.set_tcmd(Tcmd::ExecuteCmd1);
+            w.set_hten(false);
+            w.set_fifo_sel_a(0.into());
+            w.set_tpri(0.into());
+        });
+
+        regs.ie().modify(|w| w.set_fwmie0(true));
+        regs.swtrig().modify(|w| w.set_swt0(1.into()));
+
+        wait_for_ready::<T>().await;
+
+        regs.resfifo(0).read().d()
+    }
+}
+
+fn wait_for_ready<T: Instance>() -> impl Future<Output = ()> {
+    core::future::poll_fn(move |cx| {
+        let regs = T::info().regs();
+        let index = T::INDEX as usize;
+
+        waker(index).register(cx.waker());
+        regs.ie().modify(|w| w.set_fwmie0(true));
+
+        if regs.stat().read().rdy0().to_bits() != 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+}
+
+const INSTANCES: usize = 2;
+
+static WAKERS: [AtomicWaker; INSTANCES] = [const { AtomicWaker::new() }; INSTANCES];
+
+fn waker(index: usize) -> &'static AtomicWaker {
+    &WAKERS[index]
+}
+
+/// ADC interrupt handler.
+pub struct InterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        let regs = T::info().regs();
+        let index = T::INDEX as usize;
+
+        // Disable-on-fire, re-enable-on-poll: STAT[RDY0] is a level that
+        // stays asserted (FCOUNT above FWMARK) until a RESFIFO0 read drains
+        // it below the watermark, not a one-shot pulse - leaving FWMIE0 set
+        // would re-fire this interrupt forever until something polls again.
+        if regs.ie().read().fwmie0() && regs.stat().read().rdy0().to_bits() != 0 {
+            regs.ie().modify(|w| w.set_fwmie0(false));
+            waker(index).wake();
+        }
+    }
+}
+
+pub(crate) trait SealedInstance: Gate {
+    const INDEX: u8;
+    fn info() -> &'static Info;
+}
+
+/// ADC instance.
+#[allow(private_bounds)]
+pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
+    /// Interrupt for this ADC instance.
+    type Interrupt: typelevel::Interrupt;
+}
+
+pub(crate) struct Info {
+    pub(crate) regs: pac::adc::Adc,
+}
+
+impl Info {
+    #[inline(always)]
+    fn regs(&self) -> pac::adc::Adc {
+        self.regs
+    }
+}
+
+unsafe impl Sync for Info {}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! impl_adc_instance {
+    ($n:literal) => {
+        paste::paste! {
+            impl crate::adc::SealedInstance for crate::peripherals::[<ADC $n>] {
+                const INDEX: u8 = $n;
+
+                fn info() -> &'static crate::adc::Info {
+                    static INFO: crate::adc::Info = crate::adc::Info {
+                        regs: crate::pac::[<ADC $n>],
+                    };
+                    &INFO
+                }
+            }
+
+            impl crate::adc::Instance for crate::peripherals::[<ADC $n>] {
+                type Interrupt = crate::interrupt::typelevel::[<ADC $n>];
+            }
+        }
+    };
+}

@@ -373,6 +373,16 @@ impl_syscon_gate!(LPTMR0, clk: none; rst: none);
 #[cfg(mcxn_lptmr)]
 impl_syscon_gate!(LPTMR1, clk: none; rst: none);
 
+#[cfg(mcxn_adc)]
+impl_syscon_gate!(ADC0, 1, clk: Ahbclkctrl1.set_adc0(true); rst: Presetctrl1.set_adc0_rst(), Adc0Rst);
+#[cfg(mcxn_adc)]
+impl_syscon_gate!(ADC1, 1, clk: Ahbclkctrl1.set_adc1(true); rst: Presetctrl1.set_adc1_rst(), Adc1Rst);
+
+// VREF0 supplies the bias current the ADC needs, so it is a prerequisite for
+// `crate::adc` even when `Cfg.refsel` selects a supply other than VREFO.
+#[cfg(mcxn_vref)]
+impl_syscon_gate!(VREF0, 3, clk: Ahbclkctrl3.set_vref(true); rst: Presetctrl3.set_vref_rst(), VrefRst);
+
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
 #[cfg(mcx_ctimer)]

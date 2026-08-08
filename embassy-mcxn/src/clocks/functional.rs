@@ -296,6 +296,33 @@ impl_lpuart_functional_clock!(7);
 impl_lpuart_functional_clock!(8);
 impl_lpuart_functional_clock!(9);
 
+// ADC0/ADC1's mux and divider are SYSCON-owned (`ADCnCLKSEL`/`ADCnCLKDIV`),
+// unlike RTC0's `Ctrl.clk_sel` or LPTMR's `PSR.PCS` - both of those live in
+// the peripheral's own register block and can't be touched from inside
+// `FunctionalClock::configure()` (see `crate::rtc`, `crate::lptmr`). ADC has
+// no such restriction. `clk_1m` is deliberately absent: at 1 MHz the ADC's
+// conversion clock would be far below its usable range.
+macro_rules! impl_adc_functional_clock {
+    ($n:literal) => {
+        ::paste::paste! {
+            #[cfg(mcxn_adc)]
+            impl_functional_clock! {
+                [<ADC $n>],
+                name: [<Adc $n ClockSource>] / [<Adc $n ClockConfig>],
+                sel: crate::pac::SYSCON0.[<adc $n clksel>](), [<Adc $n clkselSel>],
+                div: full(crate::pac::SYSCON0.[<adc $n clkdiv>](), [<Adc $n clkdiv>], 3),
+                sources: {
+                    Fro12m => Enum0x3 @ 3 : ensure_fro_12m,
+                    FroHf48m => Enum0x2 @ 2 : ensure_fro_hf_48m,
+                }
+            }
+        }
+    };
+}
+
+impl_adc_functional_clock!(0);
+impl_adc_functional_clock!(1);
+
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
 // unlike the other two options it needs nothing from the VBAT power domain.

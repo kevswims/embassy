@@ -13,6 +13,8 @@ mod mcxn947_exclusive {
     pub use crate::chips::mcxn947::init;
 }
 
+#[cfg(mcxn_adc)]
+pub mod adc;
 pub mod clocks;
 pub mod config;
 #[cfg(mcxn_crc)]
@@ -34,6 +36,8 @@ pub mod ostimer;
 pub mod reset_reason;
 #[cfg(mcx_rtc5xx)]
 pub mod rtc;
+#[cfg(mcxn_vref)]
+pub mod vref;
 #[cfg(mcx_wwdt)]
 pub mod wwdt;
 
