@@ -13,6 +13,23 @@ pub enum ClockError {
     /// Selecting/configuring other main clock sources (SOSC, PLL0, PLL1,
     /// ROSC, ...) isn't implemented yet.
     UnsupportedMainClockSource,
+
+    /// The requested SOSC frequency cannot be encoded in `SOSCCFG.RANGE`,
+    /// which only spans 16-66 MHz.
+    SoscUnsupportedFrequency(u32),
+
+    /// `SCG0.SOSCCSR.LK` is set, so SOSC cannot be configured.
+    ///
+    /// Nothing in this crate sets it; a bootloader running before `init()`
+    /// must have.
+    SoscLocked,
+
+    /// SOSC was enabled but never reported `SOSCVLD`.
+    ///
+    /// Usually a crystal that is absent, damaged, or mismatched against the
+    /// configured frequency - or [`super::config::SoscMode::Crystal`] selected
+    /// on a board that actually drives `EXTAL` with an external clock.
+    SoscNotValid,
     /// A peripheral asked for a clock that [`super::init()`] did not bring up.
     ///
     /// `clock` names the tree node and `reason` says what to do about it -
@@ -89,7 +106,11 @@ pub struct Clocks {
 
     /// `clk_in`, the SOSC output (external crystal or clock input).
     ///
-    /// Always `None`: SOSC bring-up is not implemented.
+    /// `None` unless [`super::config::ClocksConfig::sosc`] was set. Note this
+    /// records the source itself; reaching a peripheral mux additionally needs
+    /// the matching `CLOCK_CTRL` fan-out gate
+    /// ([`super::config::ClocksConfig::enable_clk_in_periph`] or
+    /// [`super::config::ClocksConfig::enable_clk_in_fm_usbh_lpt`]).
     pub clk_in: Option<u32>,
 
     /// `clk_16k`, FRO16K from the VBAT domain.
@@ -174,7 +195,7 @@ impl Clocks {
 
     /// `clk_in`, the SOSC output.
     pub fn ensure_clk_in(&self) -> Result<u32, ClockError> {
-        Self::ensure(self.clk_in, "clk_in", "SOSC bring-up is not implemented")
+        Self::ensure(self.clk_in, "clk_in", "set ClocksConfig::sosc")
     }
 
     /// `clk_16k`, FRO16K from the VBAT domain.

@@ -3,16 +3,18 @@
 A Hardware Abstraction Layer (HAL) for the NXP MCX-N family of
 microcontrollers using the Embassy async framework.
 
-**Status: early bring-up.** MCXN947 only. The `nxp-pac`-driven codegen
-(peripherals, interrupts, singletons) is wired up, along with:
+**Status: early bring-up.** MCXN947 (core 0) only. The `nxp-pac`-driven codegen
+— peripherals, interrupts, pin and channel singletons — is wired up, along with
+drivers for GPIO, eDMA, LPUART, FlexCAN, USB HS (device), LPADC, VREF, CTIMER
+(match/PWM/capture), LPTMR, OSTIMER (the `embassy-time` driver), RTC, WWDT, CRC,
+and reset-reason reporting. Clocks come from the FRO tree plus SOSC (needed by
+the USB PHY): the main clock is verified rather than configured, and there is no
+PLL support.
 
-- **GPIO** — blocking `Input`/`Output`/`OutputOpenDrain`/`Flex`.
-- **eDMA** — both controllers, 16 channels each; async memory-to-memory
-  and memset transfers, plus the internal surface peripheral drivers use.
-  Peripheral-driven transfers need DMA request-source data that MCXN947's
-  metadata does not carry yet.
-- **Clocks** — verifies the reset-default main clock and reports its rate;
-  switching the main clock source is not supported yet.
+There are no SPI, I2C, I3C, or flash drivers yet. See `embassy-mcxa`
+for the pattern this crate is following as support for MCXN947 (and siblings)
+is filled in.
 
-No UART, SPI or I2C yet. See `embassy-mcxa` for the pattern this crate is
-following as support for MCXN947 (and siblings) is filled in.
+**See [`DRIVERS.md`](DRIVERS.md)** for the full per-driver inventory: which
+instances are supported, what each driver does and does not implement, the
+peripherals with no driver at all, and the known unverified hardware paths.

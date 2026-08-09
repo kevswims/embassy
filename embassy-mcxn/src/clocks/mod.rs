@@ -66,6 +66,7 @@ pub use functional::{
 pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
 #[cfg(mcxn_can)]
 pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
+pub use config::{SoscConfig, SoscMode};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 
@@ -100,7 +101,6 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         fro_hf_144m: None,
         fro_hf_div: None,
         clk_1m: None,
-        // Not implemented yet; see the field docs.
         clk_in: None,
         clk_16k: None,
         xtal32k: None,
@@ -112,6 +112,9 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
 
     source::record_sirc(&mut clocks);
     source::record_firc(&mut clocks);
+    // Before `configure_clock_ctrl`: that enables the `clk_in` fan-out gates,
+    // which want a source already running behind them.
+    source::configure_sosc(&settings, &mut clocks)?;
     source::configure_clock_ctrl(&settings, &mut clocks);
     // Needs main_clk_hz already recorded: FROHFDIV divides `fro_hf`.
     source::configure_fro_hf_div(&settings, &mut clocks);

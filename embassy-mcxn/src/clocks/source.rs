@@ -5,7 +5,7 @@
 //! for the hardware to report the result stable, then record what happened into
 //! [`Clocks`]. Nothing else in the crate writes these registers.
 
-use super::config::{ClocksConfig, Div};
+use super::config::{ClocksConfig, Div, SoscMode};
 use super::types::{ClockError, Clocks};
 use crate::pac;
 
@@ -98,6 +98,87 @@ pub(super) fn record_firc(clocks: &mut Clocks) {
     if csr.firc_fclk_periph_en() {
         clocks.fro_hf_144m = Some(FIRC_FCLK_HZ);
     }
+}
+
+/// Pick `SOSCCFG.RANGE` for an input frequency.
+///
+/// The ranges the field can encode are contiguous and cover 16-66 MHz only, so
+/// anything outside that - including the 12 MHz crystals some NXP parts use -
+/// has no representation. Range boundaries overlap by one endpoint in the RM's
+/// wording; 20/30/50 MHz are assigned to the lower of the two candidates.
+fn sosc_range(hz: u32) -> Result<pac::scg::SosccfgRange, ClockError> {
+    use pac::scg::SosccfgRange;
+
+    Ok(match hz {
+        16_000_000..=20_000_000 => SosccfgRange::Freq16to20mhz,
+        20_000_001..=30_000_000 => SosccfgRange::LowFreq,
+        30_000_001..=50_000_000 => SosccfgRange::MediumFreq,
+        50_000_001..=66_000_000 => SosccfgRange::HighFreq,
+        _ => return Err(ClockError::SoscUnsupportedFrequency(hz)),
+    })
+}
+
+/// Bring SOSC up, if asked for, and record `clk_in`.
+///
+/// SOSC is off at reset and is the only source of `clk_in`. It is left to
+/// explicit configuration because the frequency is a property of the board,
+/// not the chip: nothing on-chip measures the crystal, and every consumer
+/// derives its divider from the number recorded here.
+///
+/// `SOSCCFG` is only writable while `SOSCEN` is clear, hence the
+/// disable/configure/enable order rather than a single write.
+pub(super) fn configure_sosc(cfg: &ClocksConfig, clocks: &mut Clocks) -> Result<(), ClockError> {
+    use pac::scg::{Erefs, SosccsrLk};
+
+    let Some(sosc) = cfg.sosc else {
+        return Ok(());
+    };
+
+    let range = sosc_range(sosc.hz)?;
+    let csr = pac::SCG0.sosccsr();
+
+    // `LK` freezes all of SOSCCSR, including SOSCEN. Nothing here sets it, but
+    // a bootloader can have, and the writes below would otherwise be dropped
+    // silently and leave SOSCVLD never setting - which looks identical to a
+    // dead crystal.
+    if csr.read().lk() == SosccsrLk::WriteDisabled {
+        return Err(ClockError::SoscLocked);
+    }
+
+    // Clear SOSCEN before touching SOSCCFG. It is clear at reset, but `init()`
+    // is not guaranteed to be running from reset.
+    csr.modify(|w| w.set_soscen(false));
+
+    pac::SCG0.sosccfg().modify(|w| {
+        w.set_range(range);
+        w.set_erefs(match sosc.mode {
+            SoscMode::Crystal => Erefs::Internal,
+            SoscMode::ExternalClock => Erefs::External,
+        });
+    });
+
+    csr.modify(|w| w.set_soscen(true));
+
+    // Enable the SOSC clock monitor. Nominally only loss-of-clock detection,
+    // but NXP's working USB firmware sets it and the USB HS PHY PLL does not
+    // lock without it.
+    csr.modify(|w| w.set_sosccm(true));
+
+    // A crystal takes on the order of a millisecond to start; an externally
+    // driven clock is valid almost at once. The cap is deliberately generous -
+    // this runs once, before the executor exists, and the failure it guards
+    // against (absent or mismatched crystal) would otherwise hang the boot.
+    let mut spins = 0u32;
+    while !csr.read().soscvld() {
+        spins += 1;
+        if spins > 5_000_000 {
+            return Err(ClockError::SoscNotValid);
+        }
+    }
+
+    clocks.clk_in = Some(sosc.hz);
+
+    Ok(())
 }
 
 /// Enable the source fan-outs owned by `SYSCON0.CLOCK_CTRL`.
