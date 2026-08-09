@@ -69,7 +69,7 @@ fn main() {
 /// 119, but a generator emits macro calls that only compile once the driver
 /// defining them lands. Adding a family here is the last step of implementing
 /// its pin traits, not the first.
-const PIN_FAMILIES: &[&str] = &["ctimer", "lpuart"];
+const PIN_FAMILIES: &[&str] = &["ctimer", "enet", "lpuart"];
 
 /// Pin-impl generators, keyed by the family name checked against
 /// [`PIN_FAMILIES`]. GPIO is absent because it is unconditional.
@@ -78,6 +78,7 @@ const PIN_IMPLS: &[(&str, fn() -> TokenStream)] = &[
     ("adc", generate_adc_pin_impls),
     ("clkout", generate_clkout_impls),
     ("ctimer", generate_ctimer_pin_impls),
+    ("enet", generate_enet_pin_impls),
     ("flexcan", generate_flexcan_pin_impls),
     ("flexspi", generate_flexspi_pin_impls),
     ("i3c", generate_i3c_pin_impls),
@@ -223,7 +224,9 @@ fn generate_instance_calls() -> TokenStream {
     // Peripherals whose driver defines an `impl_<name>_instance!` macro. Adding
     // a name here without the matching macro breaks the build, so this list
     // grows as drivers land.
-    const REQUIRES_INSTANCE: &[&str] = &["adc", "can", "crc", "ctimer", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt"];
+    const REQUIRES_INSTANCE: &[&str] = &[
+        "adc", "can", "crc", "ctimer", "enet", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt",
+    ];
 
     let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
 
@@ -330,6 +333,64 @@ fn generate_clkout_impls() -> TokenStream {
                 generated.extend(quote! {
                     #feature_gate
                     crate::impl_clkout_pin!(#pin_name, #mux);
+                });
+            }
+        }
+    }
+
+    generated
+}
+
+/// ENET0 pin-mux signals, mapped to the pin-trait each one implements.
+///
+/// Spelled out rather than derived from the signal name, because the RM's names
+/// do not case-convert to anything readable (`RXDV` -> `Rxdv`, `TX_CLK` ->
+/// `TxClk`) and the trait names are public API.
+///
+/// RMII drives a subset of these: `TX_CLK` carries the 50 MHz reference clock
+/// *into* the MCU, and `RXDV` doubles as RMII's CRS_DV. The MII-only signals are
+/// listed anyway so an MII constructor needs no build.rs change - a pin trait
+/// nothing consumes costs nothing.
+const ENET_SIGNALS: &[(&str, &str)] = &[
+    ("MDC", "MdcPin"),
+    ("MDIO", "MdioPin"),
+    ("TX_CLK", "TxClkPin"),
+    ("TXEN", "TxEnPin"),
+    ("TXD0", "Txd0Pin"),
+    ("TXD1", "Txd1Pin"),
+    ("TXD2", "Txd2Pin"),
+    ("TXD3", "Txd3Pin"),
+    ("TXER", "TxErPin"),
+    ("RX_CLK", "RxClkPin"),
+    ("RXDV", "RxDvPin"),
+    ("RXD0", "Rxd0Pin"),
+    ("RXD1", "Rxd1Pin"),
+    ("RXD2", "Rxd2Pin"),
+    ("RXD3", "Rxd3Pin"),
+    ("RXER", "RxErPin"),
+    ("CRS", "CrsPin"),
+    ("COL", "ColPin"),
+];
+
+fn generate_enet_pin_impls() -> TokenStream {
+    let mut generated = TokenStream::new();
+
+    let enet_regex = Regex::new(r"^ENET\d+").unwrap();
+    for enet in METADATA.peripherals.iter().filter(|p| enet_regex.is_match(p.name)) {
+        let enet_name = format_ident!("{}", enet.name);
+        for signal in enet.signals {
+            let Some((_, trait_name)) = ENET_SIGNALS.iter().find(|(sig, _)| *sig == signal.name) else {
+                continue;
+            };
+            let signal_pin = format_ident!("{}", trait_name);
+            for pin in signal.pins {
+                let pin_name = format_ident!("{}", pin.pin);
+                let mux = format_ident!("Mux{}", pin.alt);
+                let feature_gate = pin_feature_gate(pin.pin);
+
+                generated.extend(quote! {
+                    #feature_gate
+                    crate::impl_enet_pin!(#pin_name, #enet_name, #mux, #signal_pin);
                 });
             }
         }

@@ -389,6 +389,11 @@ impl_syscon_gate!(CAN0, 2, clk: Ahbclkctrl2.set_flexcan0(true); rst: Presetctrl2
 #[cfg(mcxn_can)]
 impl_syscon_gate!(CAN1, 2, clk: Ahbclkctrl2.set_flexcan1(true); rst: Presetctrl2.set_flexcan1_rst(), Flexcan1Rst);
 
+// ENET0's AHB bus interface only. The RMII reference clock reaches the block
+// from outside SYSCON's gating - see `crate::enet` for how it is sourced.
+#[cfg(mcxn_enet)]
+impl_syscon_gate!(ENET0, 2, clk: Ahbclkctrl2.set_enet(true); rst: Presetctrl2.set_enet_rst(), EnetRst);
+
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
 #[cfg(mcx_ctimer)]
@@ -400,6 +405,13 @@ impl_syscon_gate!(CTIMER1, 1, clk: Ahbclkctrl1.set_timer1(true); rst: Presetctrl
 // CTIMER capture routes a pad's INP signal through it, so it is only ungated
 // for the duration of that register write - see `ctimer::capture`.
 #[cfg(mcxn_inputmux0)]
+// USB HS. `USBHS1__USBNC` has no gate or reset bit of its own - it sits behind
+// the `usb_hs` gate - so it deliberately gets no `Gate` impl.
+#[cfg(mcxn_usbhs1__usbc)]
+impl_syscon_gate!(USBHS1__USBC, 2, clk: Ahbclkctrl2.set_usb_hs(true); rst: Presetctrl2.set_usb_hs_rst(), UsbHsRst);
+#[cfg(mcxn_usbphy)]
+impl_syscon_gate!(USBPHY, 2, clk: Ahbclkctrl2.set_usb_hs_phy(true); rst: Presetctrl2.set_usb_hs_phy_rst(), UsbHsPhyRst);
+
 impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0.set_mux_rst(), MuxRst);
 
 // LP_FLEXCOMM0-9's bus interface clock and reset, gated through each

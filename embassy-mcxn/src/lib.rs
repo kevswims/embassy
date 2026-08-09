@@ -27,6 +27,8 @@ pub mod ctimer;
 // module rather than errors inside every generated channel impl.
 #[cfg(mcxn_dma)]
 pub mod dma;
+#[cfg(mcxn_enet)]
+pub mod enet;
 pub mod gpio;
 #[cfg(mcxn_lptmr)]
 pub mod lptmr;
@@ -38,6 +40,8 @@ pub mod ostimer;
 pub mod reset_reason;
 #[cfg(mcx_rtc5xx)]
 pub mod rtc;
+#[cfg(mcxn_usbhs1__usbc)]
+pub mod usb;
 #[cfg(mcxn_vref)]
 pub mod vref;
 #[cfg(mcx_wwdt)]
