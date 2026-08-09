@@ -223,7 +223,7 @@ fn generate_instance_calls() -> TokenStream {
     // Peripherals whose driver defines an `impl_<name>_instance!` macro. Adding
     // a name here without the matching macro breaks the build, so this list
     // grows as drivers land.
-    const REQUIRES_INSTANCE: &[&str] = &["adc", "crc", "ctimer", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt"];
+    const REQUIRES_INSTANCE: &[&str] = &["adc", "can", "crc", "ctimer", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt"];
 
     let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
 

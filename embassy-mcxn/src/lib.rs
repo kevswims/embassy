@@ -15,6 +15,8 @@ mod mcxn947_exclusive {
 
 #[cfg(mcxn_adc)]
 pub mod adc;
+#[cfg(mcxn_can)]
+pub mod can;
 pub mod clocks;
 pub mod config;
 #[cfg(mcxn_crc)]

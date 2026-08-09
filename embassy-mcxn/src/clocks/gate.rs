@@ -383,6 +383,12 @@ impl_syscon_gate!(ADC1, 1, clk: Ahbclkctrl1.set_adc1(true); rst: Presetctrl1.set
 #[cfg(mcxn_vref)]
 impl_syscon_gate!(VREF0, 3, clk: Ahbclkctrl3.set_vref(true); rst: Presetctrl3.set_vref_rst(), VrefRst);
 
+// FlexCAN. The SYSCON bit names are `flexcan{n}`, not `can{n}`.
+#[cfg(mcxn_can)]
+impl_syscon_gate!(CAN0, 2, clk: Ahbclkctrl2.set_flexcan0(true); rst: Presetctrl2.set_flexcan0_rst(), Flexcan0Rst);
+#[cfg(mcxn_can)]
+impl_syscon_gate!(CAN1, 2, clk: Ahbclkctrl2.set_flexcan1(true); rst: Presetctrl2.set_flexcan1_rst(), Flexcan1Rst);
+
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
 #[cfg(mcx_ctimer)]

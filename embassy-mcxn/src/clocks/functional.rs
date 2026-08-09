@@ -323,6 +323,34 @@ macro_rules! impl_adc_functional_clock {
 impl_adc_functional_clock!(0);
 impl_adc_functional_clock!(1);
 
+// FlexCAN. The SYSCON accessors are named `flexcan{n}clksel`/`clkdiv`, not
+// `can{n}...`, and the mux's `Enum3` is `fro_hf`.
+//
+// NXP's own board example drives FlexCAN from PLL1 at 50 MHz, but this crate
+// has no PLL bring-up (see `ClocksConfig`), so `fro_hf` at 48 MHz is the
+// usable source. It divides cleanly for the standard bitrates, and
+// `crate::can` computes its bit timing against whatever rate this returns
+// rather than assuming NXP's 50 MHz.
+macro_rules! impl_can_functional_clock {
+    ($n:literal) => {
+        ::paste::paste! {
+            #[cfg(mcxn_can)]
+            impl_functional_clock! {
+                [<CAN $n>],
+                name: [<Can $n ClockSource>] / [<Can $n ClockConfig>],
+                sel: crate::pac::SYSCON0.[<flexcan $n clksel>](), [<Flexcan $n clkselSel>],
+                div: full(crate::pac::SYSCON0.[<flexcan $n clkdiv>](), [<Flexcan $n clkdiv>], 8),
+                sources: {
+                    FroHf48m => Enum3 @ 3 : ensure_fro_hf_48m,
+                }
+            }
+        }
+    };
+}
+
+impl_can_functional_clock!(0);
+impl_can_functional_clock!(1);
+
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
 // unlike the other two options it needs nothing from the VBAT power domain.
