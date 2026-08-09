@@ -11,6 +11,7 @@
 
 use super::Error;
 use crate::clocks::enable;
+use crate::delay::delay_us;
 use crate::pac;
 use crate::peripherals::{USBHS1__USBC, USBPHY};
 
@@ -107,7 +108,9 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     let csr = pac::SCG0.sosccsr();
     if csr.read().soscen() {
         csr.modify(|w| w.set_soscen(false));
-        cortex_m::asm::delay(1_000);
+        // Let the oscillator actually stop before restarting it; `soscvld`
+        // below is the real guard on it having come back.
+        delay_us(21);
         csr.modify(|w| w.set_soscen(true));
 
         let mut spins = 0u32;
@@ -142,9 +145,10 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // Regulator first, then a settling delay, and only then PLL power. Doing
     // these in one write, or without the delay, leaves the PLL unable to lock.
     phy.pll_sic_set().write(|w| w.set_pll_reg_enable(true));
-    // NXP wait at least 15 us; this is ~100 us at the 48 MHz reset clock and
-    // ~33 us at 150 MHz. Init-time only, so a spin is fine.
-    cortex_m::asm::delay(5_000);
+    // NXP require at least 15 us here (`SDK_DelayAtLeastUs(15U, ...)` in
+    // `CLOCK_EnableUsbhsPhyPllClock`). Init-time only, so a spin is fine, and
+    // this keeps the generous margin the previous cycle count happened to give.
+    delay_us(104);
 
     // `refbias_pwd` is deliberately left set, matching the vendor firmware -
     // clearing it was tried and does not help.

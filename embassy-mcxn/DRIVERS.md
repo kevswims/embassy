@@ -537,8 +537,9 @@ BUF21EN with settle delays). Also toggles the analog rail bit in
 - **`set_trim_2v1` is not verified on hardware.** Confirming it needs a meter on
   `VREF_OUT`; sweeping the trim while watching the ADC's internal `VREF BG+`
   channel (28) showed no response.
-- The settle delays are `cortex_m::asm::delay` counts **hardcoded for a 48 MHz
-  core**. They are correct at or below the reset default and too short above it.
+- The settle delays are stated in microseconds and resolved against
+  `Clocks::system_clk_hz` at run time (`crate::delay::delay_us`), so they hold at
+  any core frequency. They carry a 4x margin over the times the RM asks for.
 
 ---
 
@@ -822,9 +823,7 @@ than refusing to build or returning an error.
       on `WDT0CLKDIV`/`WDT1CLKDIV`. Only those two are known to latch `UNSTAB`
       high and never clear it; the rest are assumed-but-unverified to poll
       correctly. (`src/clocks/functional.rs:112`)
-- [ ] Verify `Vref::set_trim_2v1` against a meter on `VREF_OUT`, and scale the
-      settle delays by the actual core frequency instead of hardcoding 48 MHz.
-      (`src/vref.rs`)
+- [ ] Verify `Vref::set_trim_2v1` against a meter on `VREF_OUT`. (`src/vref.rs`)
 
 ### Documentation
 

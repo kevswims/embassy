@@ -31,6 +31,7 @@
 use embassy_hal_internal::{Peri, PeripheralType};
 
 use crate::clocks::{Gate, enable_and_reset};
+use crate::delay::delay_us;
 use crate::pac;
 use crate::pac::vref::{Buf21en, Chopen, Hcbgen, HiPwrLv, Icompen, LpbgBufEn, Lpbgen, Regen};
 
@@ -82,8 +83,9 @@ impl<'d, T: Instance> Vref<'d, T> {
             });
         });
         // The buffered output needs ~400us to settle, versus ~20us for the
-        // bandgap alone.
-        cortex_m::asm::delay(400 * 48 * 4);
+        // bandgap alone. Waited out with a 4x margin, matching the cycle count
+        // this replaced - init-time only, so over-waiting is free.
+        delay_us(1600);
 
         this
     }
@@ -105,7 +107,7 @@ impl<'d, T: Instance> Vref<'d, T> {
         let regs = T::info().regs();
         regs.utrim().modify(|w| w.set_trim2v1(trim & 0x0F));
         if regs.csr().read().chopen() == Chopen::Ena {
-            cortex_m::asm::delay(400 * 48 * 4);
+            delay_us(1600);
         }
     }
 
@@ -120,10 +122,9 @@ impl<'d, T: Instance> Vref<'d, T> {
 
         let regs = T::info().regs();
         regs.csr().modify(|w| w.set_lpbgen(Lpbgen::Ena));
-        // The bandgap needs ~20us to settle before its buffer is enabled;
-        // `delay` counts core cycles, so this is generous at any main_clk
-        // this crate currently supports (48 MHz reset default and below).
-        cortex_m::asm::delay(20 * 48 * 4);
+        // The bandgap needs ~20us to settle before its buffer is enabled, and
+        // is given the same 4x margin as the buffered path above.
+        delay_us(80);
         regs.csr().modify(|w| w.set_lpbg_buf_en(LpbgBufEn::Ena));
 
         Self { _peri: peri }
