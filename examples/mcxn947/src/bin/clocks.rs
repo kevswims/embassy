@@ -100,6 +100,30 @@ async fn main(_spawner: Spawner) {
     );
     defmt::info!("  AHBCLKCTRL0 {=u32:#010x}", ahbclkctrl0);
 
+    // The reset state of the core rail is not a documented constant, and
+    // `FMU0.FCTRL[RWSC]` resets to a BootROM-determined value rather than a
+    // specified one - so both are observed here rather than assumed. Raw words
+    // alongside the decoded view, since a reserved encoding decodes to `None`.
+    defmt::info!("=== power (SPC0 / FMU0) ===");
+    defmt::info!("  {}", hal::power::active_mode_status());
+    defmt::info!(
+        "  raw: CNTRL {=u32:#010x} ACTIVE_CFG {=u32:#010x} SRAMCTL {=u32:#010x} VD_STAT {=u32:#010x} FCTRL {=u32:#010x}",
+        pac::SPC0.cntrl().read().0,
+        pac::SPC0.active_cfg().read().0,
+        pac::SPC0.sramctl().read().0,
+        pac::SPC0.vd_stat().read().0,
+        pac::FMU0.fctrl().read().0,
+    );
+    // `VD_*_CFG[LVDRE]`/`[HVDRE]` turn a detect event into a hardware reset,
+    // and these registers survive everything short of a POR - so a rail change
+    // that trips a detector reboots the part rather than reporting anything.
+    defmt::info!(
+        "  detect cfg: VD_CORE_CFG {=u32:#010x} VD_SYS_CFG {=u32:#010x} VD_IO_CFG {=u32:#010x}",
+        pac::SPC0.vd_core_cfg().read().0,
+        pac::SPC0.vd_sys_cfg().read().0,
+        pac::SPC0.vd_io_cfg().read().0,
+    );
+
     // The PAC fieldsets do not model every reset-set bit, so a read-modify-write
     // (or worse, a plain write) could silently drop them. Gates go through the
     // atomic SET/CLR aliases specifically to avoid that; check it held.

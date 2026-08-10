@@ -8,11 +8,45 @@ pub enum ClockError {
     AlreadyInitialized,
     /// A clock query was made before [`super::init()`] was called.
     NeverInitialized,
-    /// `main_clk` is not currently sourced from `fro_hf` (the reset default).
+    /// `main_clk` is on a source this crate cannot describe.
     ///
-    /// Selecting/configuring other main clock sources (SOSC, PLL0, PLL1,
-    /// ROSC, ...) isn't implemented yet.
+    /// [`super::init()`] switches between FIRC's two ranges and parks on SIRC
+    /// to do it, so it tolerates finding either of those. Anything else (SOSC,
+    /// PLL0, PLL1, ROSC) means a bootloader moved the main clock somewhere
+    /// unexpected, and switching out from under that would be worse than
+    /// refusing.
     UnsupportedMainClockSource,
+
+    /// An SPC operation failed while moving the core rail.
+    Power(crate::power::PowerError),
+
+    /// The core rail sits on a reserved encoding, so no frequency limit can be
+    /// derived from it.
+    UnknownCoreVoltage,
+
+    /// No core voltage on this part supports the requested `main_clk`, or no
+    /// flash wait-state encoding exists for it (RM Tables 320 and 37).
+    MainClockUnsupportedFrequency(u32),
+
+    /// `SCG0.CSR[SCS]` never followed the source written to `RCCR[SCS]`.
+    ///
+    /// The source is selected but is not producing a clock.
+    MainClockNotStable,
+
+    /// FIRC was configured but never reported `FIRCCSR.FIRCVLD`.
+    FircNotValid,
+
+    /// PLL0 (APLL) never reported `APLLCSR.APLL_LOCK`.
+    Pll0NotLocked,
+
+    /// PLL0 locked, but its dividers read back a rate other than the one this
+    /// crate configures - most likely a `*REQ` latch write that did not take.
+    /// Carries the rate actually computed from the registers, in Hz.
+    Pll0UnexpectedRate(u32),
+
+    /// `SCG0.FIRCCSR.LK` is set and could not be cleared, so FIRC cannot be
+    /// reconfigured. Nothing in this crate sets it; a bootloader must have.
+    FircLocked,
 
     /// The requested SOSC frequency cannot be encoded in `SOSCCFG.RANGE`,
     /// which only spans 16-66 MHz.
@@ -64,6 +98,13 @@ pub struct Clocks {
     ///
     /// Not optional: if the CPU is executing, `main_clk` is running.
     pub main_clk_hz: u32,
+
+    /// The core rail voltage `init()` settled on.
+    ///
+    /// Derived from [`super::config::MainClock`], never chosen by the caller:
+    /// the lowest level that supports the requested frequency. Read-only here,
+    /// but [`crate::power`] can report and change it.
+    pub core_voltage: crate::power::CoreVoltage,
 
     /// Frequency of `system_clk` (`main_clk` divided by `AHBCLKDIV`), in Hz.
     ///
@@ -142,7 +183,8 @@ pub struct Clocks {
 
     /// `pll0_clk`, the APLL output.
     ///
-    /// Always `None`: PLL bring-up is not implemented.
+    /// `Some` only when [`super::config::MainClock::Pll0At150m`] brought it up;
+    /// PLL0 is not configured for any other purpose yet.
     pub pll0_clk: Option<u32>,
 
     /// `pll1_clk0`, the first SPLL output divider.
@@ -158,12 +200,10 @@ pub struct Clocks {
     /// The "PLL divided clock" node: `PLLCLKDIVSEL` picks PLL0 or `pll1_clk0`,
     /// `PLLCLKDIV` divides it.
     ///
-    /// This is a single, globally shared resource - it is the source that every
-    /// peripheral mux sees as its "PLL divided clock" input, so selecting a PLL
-    /// for one peripheral constrains all of them. It is therefore chosen once
-    /// by `init()` and never written by a driver.
+    /// A single, globally shared resource, so it would be chosen once by
+    /// `init()` rather than by a driver.
     ///
-    /// Always `None`: PLL bring-up is not implemented.
+    /// Always `None`: `PLLCLKDIVSEL`/`PLLCLKDIV` are not programmed yet.
     pub pll_div: Option<u32>,
 }
 
@@ -236,7 +276,11 @@ impl Clocks {
 
     /// `pll0_clk`.
     pub fn ensure_pll0_clk(&self) -> Result<u32, ClockError> {
-        Self::ensure(self.pll0_clk, "pll0_clk", "PLL bring-up is not implemented")
+        Self::ensure(
+            self.pll0_clk,
+            "pll0_clk",
+            "set ClocksConfig::main_clk to MainClock::Pll0At150m",
+        )
     }
 
     /// `pll1_clk0`.
@@ -251,6 +295,6 @@ impl Clocks {
 
     /// The shared "PLL divided clock" node.
     pub fn ensure_pll_div(&self) -> Result<u32, ClockError> {
-        Self::ensure(self.pll_div, "pll_div", "PLL bring-up is not implemented")
+        Self::ensure(self.pll_div, "pll_div", "pll_div is not implemented")
     }
 }

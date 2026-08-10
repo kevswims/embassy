@@ -1,10 +1,10 @@
 //! Module for MCXN947 family
 //!
-//! `init` configures the reset-default main clock (verifying it, see `clocks`),
-//! enables interrupts, brings up both eDMA controllers, and enables the
-//! PORT/GPIO clock gates. The clock tree does not support switching the main
-//! clock source away from its reset default (`fro_hf`) yet - see
-//! `crate::clocks` for details.
+//! `init` brings up the clock tree - including the main clock, which
+//! `ClocksConfig::main_clk` can take to 144 MHz along with the core voltage and
+//! flash wait states that requires - then enables interrupts, brings up both
+//! eDMA controllers, and enables the PORT/GPIO clock gates. See `crate::clocks`
+//! for the ordering the main-clock move depends on.
 
 use crate::_generated::Peripherals;
 

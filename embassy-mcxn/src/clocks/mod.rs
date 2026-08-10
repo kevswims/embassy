@@ -5,15 +5,28 @@
 //! functional clock. Four things are worth knowing about how it is put
 //! together.
 //!
-//! **`main_clk` stays on its reset default.** RM "Chapter 33 Clocking"
-//! documents `fro_hf` (SCG's FIRC, `SCG0.RCCR.SCS == Firc`) as the default main
-//! clock at 48 MHz. [`init()`] verifies that rather than configuring it, and
-//! returns [`ClockError::UnsupportedMainClockSource`] if the main clock has
-//! already been switched elsewhere. Raising it is not just a matter of writing
-//! `FIRCCFG.RANGE`: the core LDO level in `SPC0` and the flash read wait states
-//! in `FMU0` have to go up first, in that order, or the next instruction fetch
-//! faults. `AHBCLKDIV` *can* be configured, but division only - `system_clk`
-//! can go below 48 MHz, not above.
+//! **`main_clk` is selected by [`config::MainClock`].** It defaults to FIRC at
+//! 48 MHz, the reset value, which costs no register writes at all. Selecting
+//! [`config::MainClock::FroHf144m`] instead moves it to 144 MHz, and [`init()`]
+//! owns the whole sequence that requires: park the core on SIRC, raise the
+//! `SPC0` core rail, retime the SRAM, raise the `FMU0` flash wait states, then
+//! the FIRC range, then attach. The core voltage is derived from the requested
+//! frequency rather than chosen by the caller, so the two cannot be mismatched;
+//! the result is readable as [`Clocks::core_voltage`]. See `main_clk.rs` for
+//! why each step sits where it does, and `DRIVERS.md`'s hazards section for
+//! what happens when they are reordered.
+//!
+//! [`config::MainClock::Pll0At150m`] goes one step further, to the fastest rate
+//! the part supports, and takes the same prologue - but sources `main_clk` from
+//! PLL0 with FIRC left at 48 MHz as its reference.
+//!
+//! That difference matters beyond the 6 MHz: raising the FIRC range also raises
+//! [`Clocks::fro_hf`], which is what every peripheral mux's `fro_hf` input
+//! receives, so dividers sized for 48 MHz need revisiting at 144 MHz. The PLL0
+//! path leaves `fro_hf` alone, so it costs no divider rework.
+//!
+//! `AHBCLKDIV` is division only, so `system_clk` can sit below `main_clk` but
+//! never above it.
 //!
 //! **Sources must be enabled before a peripheral can select them.** Most of the
 //! fan-out gates in `SYSCON0.CLOCK_CTRL` are clear at reset, and `FROHFDIV`
@@ -32,8 +45,9 @@
 //!
 //! **[`Clocks`] is written once, by [`init()`].** That is what makes handing
 //! out a shared `&Clocks` sound, and it is also how the genuinely shared nodes
-//! stay coherent - `pll_div` in particular is a single resource that every
-//! peripheral mux sees as its "PLL divided clock" input.
+//! stay coherent - [`Clocks::pll_div`] in particular is one select and one
+//! divider, so the rate chosen for it constrains every consumer at once.
+
 //!
 //! Peripheral clock gating (SYSCON `AHBCLKCTRLn`/`PRESETCTRLn`) lives in the
 //! `gate` submodule, and the per-peripheral mux/divider layer in `functional`.
@@ -45,6 +59,8 @@ use config::ClocksConfig;
 pub mod config;
 mod functional;
 mod gate;
+mod main_clk;
+mod pll;
 mod source;
 mod types;
 
@@ -66,7 +82,7 @@ pub use functional::{
 pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
 #[cfg(mcxn_can)]
 pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
-pub use config::{SoscConfig, SoscMode};
+pub use config::{MainClock, SoscConfig, SoscMode};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 
@@ -90,10 +106,14 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         }
     })?;
 
-    let main_clk_hz = source::verify_main_clock()?;
+    // First: it rewrites `FIRCCSR` (so it must precede `record_firc`) and it
+    // settles the rate every later step derives from.
+    let outcome = main_clk::switch(settings.main_clk)?;
+    let main_clk_hz = outcome.main_clk_hz;
 
     let mut clocks = Clocks {
         main_clk_hz,
+        core_voltage: outcome.core_voltage,
         // Filled in below, once AHBCLKDIV is known.
         system_clk_hz: main_clk_hz,
         fro_12m: None,
@@ -106,7 +126,7 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         clk_in: None,
         clk_16k: None,
         xtal32k: None,
-        pll0_clk: None,
+        pll0_clk: outcome.pll0_hz,
         pll1_clk0: None,
         pll1_clk1: None,
         pll_div: None,

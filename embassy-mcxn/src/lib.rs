@@ -37,6 +37,7 @@ pub mod lptmr;
 pub mod lpuart;
 #[cfg(mcxn_ostimer)]
 pub mod ostimer;
+pub mod power;
 #[cfg(mcxn_cmc)]
 pub mod reset_reason;
 #[cfg(mcx_rtc5xx)]

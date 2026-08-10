@@ -51,6 +51,53 @@ impl<const BITS: u32> Div<BITS> {
     }
 }
 
+/// What drives `main_clk`, and therefore the CPU.
+///
+/// Raising this is not a single register write: the SPC core rail and the FMU
+/// flash read wait states have to move first, and the core has to be parked on
+/// a slow source while they do. [`super::init()`] owns that whole sequence,
+/// which is why this is a closed set of validated operating points rather than
+/// a frequency the caller picks - each one needs a hand-verified
+/// (voltage, wait-state, source) triple.
+///
+/// The required core voltage is *derived*, never specified, so a caller cannot
+/// pair a frequency with a rail that will not support it. The result is
+/// readable afterwards as [`super::Clocks::core_voltage`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum MainClock {
+    /// FIRC at 48 MHz - the reset default.
+    ///
+    /// Costs no register writes when the part is already here, which it is out
+    /// of reset. The rail is left wherever reset left it (1.0 V on
+    /// FRDM-MCXN947).
+    #[default]
+    FroHf48m,
+
+    /// FIRC at 144 MHz (`SCG0.FIRCCFG.RANGE = Firc144mhz`).
+    ///
+    /// Takes the core rail to 1.2 V (overdrive) and the flash read wait states
+    /// to 3, both before the frequency rises.
+    ///
+    /// Note this also changes what every peripheral mux's `fro_hf` input
+    /// delivers - see [`super::Clocks::fro_hf`]. Dividers sized for 48 MHz
+    /// need revisiting; [`crate::adc`] rejects an out-of-range result rather
+    /// than converting out of spec.
+    FroHf144m,
+
+    /// PLL0 (APLL) at 150 MHz, referenced from FIRC's 48 MHz tap.
+    ///
+    /// The fastest `main_clk` this part supports. Takes the core rail to 1.2 V
+    /// and the flash read wait states to 3, as [`Self::FroHf144m`] does.
+    ///
+    /// Unlike [`Self::FroHf144m`] this leaves FIRC - and therefore
+    /// [`super::Clocks::fro_hf`] and every peripheral mux selecting it - at
+    /// 48 MHz, so dividers sized for the reset default stay correct. It also
+    /// fills in [`super::Clocks::pll0_clk`].
+    Pll0At150m,
+}
+
 /// How the SOSC input is driven.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -89,10 +136,8 @@ pub struct SoscConfig {
 /// lock are off by default: SOSC because it is board-specific, the PLLs
 /// because they are not implemented at all - see the module docs.
 ///
-/// [`super::init()`] does not change the main clock source. It stays on its
-/// reset default of FIRC at 48 MHz, because raising `main_clk` requires
-/// raising the core LDO voltage (`SPC0`) and the flash read wait states
-/// (`FMU0`) in a specific order first.
+/// [`Self::main_clk`] selects what drives the core. It defaults to the reset
+/// value, so the default configuration performs no main-clock writes at all.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ClocksConfig {
@@ -153,10 +198,15 @@ pub struct ClocksConfig {
     /// `system_clk` = `main_clk` / this divisor (`AHBCLKDIV`).
     ///
     /// `None` (the default) leaves the reset value of divide-by-1. Only
-    /// division is available: raising `main_clk` above its 48 MHz reset value
-    /// needs `SPC0` voltage and `FMU0` wait-state changes that are not
-    /// implemented.
+    /// division is available - to raise the rate the core runs at, set
+    /// [`Self::main_clk`].
     pub ahb_div: Option<Div<8>>,
+
+    /// What `main_clk` runs from.
+    ///
+    /// Defaults to [`MainClock::FroHf48m`], the reset value, which costs no
+    /// register writes and cannot brown the part out.
+    pub main_clk: MainClock,
 
     /// Enable `clk_16k`, the VBAT domain's FRO16K (`VBAT0.FROCTLA.FRO_EN` +
     /// `VBAT0.FROCLKE.CLKE`).
@@ -179,6 +229,7 @@ impl Default for ClocksConfig {
             sosc: None,
             fro_hf_div: None,
             ahb_div: None,
+            main_clk: MainClock::FroHf48m,
             enable_clk_16k: false,
         }
     }

@@ -27,7 +27,8 @@ copy is not covered.
 
 | Peripheral | Instances usable | API | DMA | Example |
 | --- | --- | --- | --- | --- |
-| Clocks | — | blocking `init` | — | `clocks.rs` |
+| Clocks | — | blocking `init` (48 / 144 / 150 MHz) | — | `clocks.rs`, `clocks_144m.rs`, `clocks_150m.rs` |
+| Power / SPC | SPC0 | blocking | — | `power_overdrive.rs` |
 | GPIO / PORT | GPIO0–5, PORT0–5 | blocking only | — | `blinky.rs` |
 | eDMA | DMA0, DMA1 (16 ch each) | async + blocking wait | n/a | `dma_mem_to_mem.rs`, `dma_ctimer.rs` |
 | LPUART (LP_FLEXCOMM) | LPUART0–9 | async | yes (TX, RX, ring RX) | `uart_loopback.rs`, `uart_dma_loopback.rs`, `uart_ring_rx.rs` |
@@ -51,7 +52,8 @@ Everything else on the die is unimplemented — see
 
 ## Clocks — `src/clocks/`
 
-`init()` verifies the main clock, optionally programs a few dividers, records
+`init()` selects the main clock (raising the core rail and flash wait states
+when asked for 144 or 150 MHz), optionally programs a few dividers, records
 every source rate in a `Clocks` struct, and provides the `Gate` (bus clock +
 reset) and `FunctionalClock` (peripheral source mux + divider) traits that
 every driver constructor is bounded on.
@@ -60,8 +62,9 @@ every driver constructor is bounded on.
 
 | Node | State |
 | --- | --- |
-| `main_clk` | **Verify-only.** Must already be FIRC (`SCG0.RCCR.SCS`), at 48 or 144 MHz per `FIRCCFG.RANGE`. Never written. |
-| `system_clk` | `main_clk / AHBCLKDIV`. **Division only.** |
+| `main_clk` | Selected by `ClocksConfig::main_clk`: FIRC at 48 MHz (reset default, no writes), FIRC at 144 MHz, or PLL0 at 150 MHz. The core voltage and flash wait states move with it. |
+| `system_clk` | `main_clk / AHBCLKDIV`. **Division only** — to go faster, raise `main_clk`. |
+| core voltage | Derived from `main_clk`, recorded as `Clocks::core_voltage`. 1.0 V at reset; 1.2 V at 144/150 MHz. |
 | `fro_12m` (SIRC) | Recorded if `SIRCCSR.SIRC_CLK_PERIPH_EN` (on at reset). |
 | `fro_hf` | FIRC output at whatever `FIRCCFG.RANGE` selects. **This is what a peripheral mux's `fro_hf` input receives.** Not optional. |
 | `fro_hf_48m` / `fro_hf_144m` | The two fixed-rate taps, from `FIRCCSR.FIRC_SCLK/FCLK_PERIPH_EN`. Distinct from `fro_hf` — see the hazards section. |
@@ -70,15 +73,25 @@ every driver constructor is bounded on.
 | `clk_16k` (VBAT FRO16K) | Off by default; `enable_clk_16k`. **See the hardware warning below.** |
 | `clk_in` (SOSC) | Programmed from `ClocksConfig::sosc` (crystal or external clock, 16–66 MHz). `None` otherwise. |
 | `xtal32k` (OSC32K) | **Not implemented** — always `None`. |
-| `pll0_clk`, `pll1_clk0`, `pll1_clk1`, `pll_div` | **Not implemented** — always `None`. |
+| `pll0_clk` | 150 MHz when `MainClock::Pll0At150m` is selected; `None` otherwise. Not configurable for any other rate or purpose. |
+| `pll1_clk0`, `pll1_clk1`, `pll_div` | **Not implemented** — always `None`. |
 
 **Limitations**
 
-- **The main clock cannot be raised.** Going above the reset rate is not just
-  an `FIRCCFG.RANGE` write: the `SPC0` core LDO level and the `FMU0` flash read
-  wait states have to go up first, in that order, or the next instruction fetch
-  faults. None of that is implemented. `AHBCLKDIV` divides, so `system_clk` can
-  go *below* `main_clk` but never above it.
+- **Three main-clock operating points**: FIRC at 48 MHz, FIRC at 144 MHz, PLL0 at
+  150 MHz. Each needs a hand-verified (voltage, wait-state, source) triple, so
+  `MainClock` is a closed enum rather than a frequency the caller picks.
+- **PLL0 is only configurable as a 150 MHz `main_clk` source.** One divider chain
+  (N=8, M=50, P=2 from FIRC's 48 MHz tap), no arbitrary-rate solver, no
+  spread-spectrum, and it cannot be brought up *without* also becoming
+  `main_clk`. PLL1 is untouched.
+- **Core voltage is only ever raised, never lowered.** Lowering needs the
+  mirrored ordering and interacts with the voltage detectors; see
+  `src/power.rs`. A part that boots at 1.0 V and is taken to 1.2 V stays there.
+- **`MainClock::FroHf144m` raises `fro_hf`**, and therefore what every peripheral
+  mux's `fro_hf` input delivers. Dividers sized for 48 MHz must be resized; the
+  examples derive theirs from `Clocks::fro_hf`. `Pll0At150m` does *not* have this
+  problem — it leaves FIRC at 48 MHz, so a faster core costs no divider rework.
 - **No PLLs, no external oscillators.** Any peripheral that needs a rate the
   FRO tree can't produce is out of reach.
 - `CLKUNLOCK` is never written.
@@ -534,6 +547,39 @@ disable-on-fire interrupt handler.
 
 ---
 
+## Power / SPC — `src/power.rs`
+
+SPC0's active-mode regulator configuration. `active_mode_status()` reads back
+the whole picture (both regulators' enables, levels and drive strengths, the
+SRAM timing margin, `FMU0.FCTRL[RWSC]`, `ACTIVE_VDELAY`, and whether any voltage
+detector is armed). `set_active_mode()` raises the core rail,
+`set_sram_margin()` retimes the SRAM, and `set_flash_wait_states()` programs
+`RWSC`. `max_hz()` and `flash_wait_states()` are RM Table 320 and Table 37 as
+`const fn` lookups.
+
+`clocks::init()` is the intended caller and drives all of it in the right order;
+the module is public because the low-power work will live here too.
+
+**Limitations**
+
+- **Raises only.** `set_active_mode` never lowers the rail — lowering needs the
+  mirrored ordering and the detector interaction, neither implemented.
+- **Active mode only.** `LP_CFG`, `LP_CFG1`, `LPWKUP_DELAY` and the low-power
+  entry paths are untouched, as are the DCDC burst controls and `SYSLDO`'s
+  level.
+- **`ACTIVE_VDELAY` is read but never written**; it is left at its reset value
+  (200 on FRDM-MCXN947).
+- **The SRAM margin tops out at 1.1 V.** `SRAMCTL[VSM] = 0b11` (1.2 V) is
+  Reserved per RM §37.7.7 even though NXP's SDK writes it at overdrive. 1.1 V is
+  the conservative direction — see `sram_margin_for`'s docs.
+- The voltage detectors are muted and restored around a level change; a caller
+  that has its own reason to arm or disarm them has no API for it.
+- `VD_CORE_CFG`/`VD_SYS_CFG`/`VD_IO_CFG` are never written. `LVDRE` is set and
+  `LOCK`ed at reset, so a core LVD event resets the part and that cannot be
+  changed — see the hazards section.
+
+---
+
 ## VREF — `src/vref.rs`
 
 VREF0. Two modes: `new_bandgap_only` (LPBG only, enough to bias the ADC) and
@@ -707,8 +753,42 @@ predicates and an `IntoIterator` over `ResetReason`.
 
 ## Unverified / hazardous hardware paths
 
-Four known-bad or known-unverified behaviours are load-bearing in the current
+Five known-bad or known-unverified behaviours are load-bearing in the current
 design. They are the reason several APIs look the way they do.
+
+0. **Raising the core rail needs three things done right, or the part resets —
+   `src/power.rs::set_active_mode`, exercised by
+   `examples/mcxn947/src/bin/power_overdrive.rs`.**
+   All three were established by bisecting the sequence one register write at a
+   time on hardware.
+
+   1. **Mute the voltage detectors across the transition.** `VD_CORE_CFG` reads
+      `0x00010001` on this part: `LVDRE` set (a core LVD event drives a
+      *hardware reset*) and `LOCK` set, so `LVDRE` cannot be cleared, and the
+      register survives everything short of a POR. Re-trimming the regulator
+      dips `VDD_CORE` enough to trip it. The detect *enables* in `ACTIVE_CFG`
+      are not locked and are the way out — the same thing NXP's board code does
+      around power-mode changes (`SPC_EnableActiveModeCoreLowVoltageDetect(..,
+      false)` in `host_sleep.c`). `VD_STAT` is cleared before re-arming so a
+      flag latched while muted does not fire immediately.
+   2. **Walk both regulators up in lockstep**, one level per round. Taking DCDC
+      to 1.2 V while `CORELDO_VDD_LVL` still read 1.0 V reset the part every
+      time: both drive `VDD_CORE`, and a two-level disagreement is not
+      survivable. Interleaving them is what turned a reset loop into a clean
+      transition.
+   3. **Park `main_clk` low first.** Doing this at 48 MHz did not merely reset
+      the part, it **wedged** it: `probe-rs` lost the access port (`Target
+      device responded with a FAULT response`) and could not reattach,
+      `--connect-under-reset` included, at any speed from 100 kHz to 4 MHz.
+      Recovery took the ISP button. At 12 MHz the same fault is a survivable
+      reset. Every NXP `BOARD_BootClock*` parks on FRO12M before touching the
+      rails.
+
+   `ACTIVE_VDELAY` is **not** implicated — it reads 200 at reset, not 0.
+
+   Corollary for examples: **never put an unguarded SPC write on a boot path.**
+   A wedge there re-wedges on every reset before a probe can halt the core, so
+   `power_overdrive.rs` waits 5 s first. Keep that guard.
 
 1. **VBAT domain configuration — `src/clocks/source.rs:176`.**
    `configure_vbat` (the path behind `ClocksConfig::enable_clk_16k`) is
@@ -764,7 +844,7 @@ Peripherals present in the PAC with **no driver**:
 - **Security / crypto:** TRNG, PKC0, ELS, PUF, ITRC0, GDET, TDET0, CDOG0/1.
 - **System / other:** FMU0 — **there is no flash driver**, despite the
   `embedded-storage` dependency being present; SMARTDMA0, POWERQUAD, TRDC,
-  PINT0, WUU0, SPC0 (only a single VREF-related bit is poked), CACHE64, EWM0,
+  PINT0, WUU0, CACHE64, EWM0,
   SEMA42_0, MAILBOX, PLU0, NPX0, OTPC0, MPU/SAU.
 - **No `cm33_core1` (second core) support.**
 
@@ -880,9 +960,13 @@ than refusing to build or returning an error.
       exercise interrupt and isochronous endpoints; `trap`: a re-enable of an
       already-enabled endpoint is ignored rather than reconfigured, because
       reconfiguring retires a primed queue head.
-- [ ] **Clocks** — PLL bring-up, OSC32K (`xtal32k`), and a
-      real main-clock switch (requires sequencing `SPC0` LDO and `FMU0` wait
-      states first).
+- [ ] **Clocks** — `pll_div` (`PLLCLKDIVSEL`/`PLLCLKDIV`) and the per-mux PLL
+      source variants; PLL1; an arbitrary-rate PLL solver; and OSC32K
+      (`xtal32k`).
+- [ ] **Power** — lowering the core voltage, which needs the reverse ordering
+      and the voltage-detector interaction worked out; the low-power modes
+      (`LP_CFG`, `LPWKUP_DELAY`, deep sleep); and `ACTIVE_VDELAY` is read but
+      never written.
 - [ ] **New drivers**, roughly by expected demand: LPSPI, LPI2C, FMU0 flash
       (the `embedded-storage` dep is present but unused), FlexCAN, eFlexPWM,
       USB.
@@ -906,7 +990,10 @@ These are the only executable coverage the crate has. They use `defmt-rtt` and
 | --- | --- |
 | `hello.rs` | minimal `init` + defmt |
 | `blinky.rs` | GPIO output |
-| `clocks.rs` | clock tree reporting |
+| `clocks.rs` | clock tree reporting, plus the reset SPC/FMU state |
+| `clocks_144m.rs` | `main_clk` at 144 MHz, cross-checked against `clk_1m`, with an ADC read at the new rate |
+| `clocks_150m.rs` | `main_clk` from PLL0 at 150 MHz, with `fro_hf` left at 48 MHz |
+| `power_overdrive.rs` | core rail to 1.2 V with `main_clk` left alone |
 | `timer.rs` | `embassy-time` / OSTIMER0 |
 | `dma_mem_to_mem.rs` | eDMA memory-to-memory |
 | `dma_ctimer.rs` | eDMA paced by a CTIMER match request |

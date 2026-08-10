@@ -14,8 +14,8 @@ const SIRC_HZ: u32 = 12_000_000;
 
 /// The two FIRC fan-out taps to peripherals, independently gated by
 /// `FIRCCSR.FIRC_SCLK_PERIPH_EN` and `FIRC_FCLK_PERIPH_EN`.
-const FIRC_SCLK_HZ: u32 = 48_000_000;
-const FIRC_FCLK_HZ: u32 = 144_000_000;
+pub(super) const FIRC_SCLK_HZ: u32 = 48_000_000;
+pub(super) const FIRC_FCLK_HZ: u32 = 144_000_000;
 
 /// Program a divider whose register has `div`, `halt` and `unstab` but no
 /// `reset` field. `FROHFDIV` is the only one this driver touches.
@@ -53,25 +53,6 @@ macro_rules! apply_div_no_halt {
             while r.read().unstab() == [<$divty Unstab>]::Ongoing {}
         }
     }};
-}
-
-/// Confirm `main_clk` is still on its reset-default source and report its rate.
-///
-/// Switching `main_clk` is not implemented, so this verifies rather than
-/// configures. Raising the FIRC range would additionally require raising the
-/// core LDO level in `SPC0` and the flash read wait states in `FMU0`, in that
-/// order, which is why the range is only read here.
-pub(super) fn verify_main_clock() -> Result<u32, ClockError> {
-    use pac::scg::{FirccfgRange, RccrScs};
-
-    if pac::SCG0.rccr().read().scs() != RccrScs::Firc {
-        return Err(ClockError::UnsupportedMainClockSource);
-    }
-
-    Ok(match pac::SCG0.firccfg().read().range() {
-        FirccfgRange::Firc48mhz => FIRC_SCLK_HZ,
-        FirccfgRange::Firc144mhz => FIRC_FCLK_HZ,
-    })
 }
 
 /// Record SIRC's peripheral fan-out.
@@ -238,8 +219,8 @@ pub(super) fn configure_fro_hf_div(cfg: &ClocksConfig, clocks: &mut Clocks) {
 
 /// Program `AHBCLKDIV` if asked for, and report the resulting divisor.
 ///
-/// Division only. `main_clk` cannot currently be raised, so `system_clk` can
-/// only be taken below 48 MHz, which needs no voltage or wait-state change.
+/// Division only, so `system_clk` always sits at or below `main_clk`. Raising
+/// the rate itself is `ClocksConfig::main_clk`'s job.
 pub(super) fn configure_ahb_div(cfg: &ClocksConfig) -> u32 {
     match cfg.ahb_div {
         Some(div) => {
