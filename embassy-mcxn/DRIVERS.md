@@ -63,7 +63,8 @@ every driver constructor is bounded on.
 | `main_clk` | **Verify-only.** Must already be FIRC (`SCG0.RCCR.SCS`), at 48 or 144 MHz per `FIRCCFG.RANGE`. Never written. |
 | `system_clk` | `main_clk / AHBCLKDIV`. **Division only.** |
 | `fro_12m` (SIRC) | Recorded if `SIRCCSR.SIRC_CLK_PERIPH_EN` (on at reset). |
-| `fro_hf_48m` / `fro_hf_144m` | Recorded from `FIRCCSR.FIRC_SCLK/FCLK_PERIPH_EN`. |
+| `fro_hf` | FIRC output at whatever `FIRCCFG.RANGE` selects. **This is what a peripheral mux's `fro_hf` input receives.** Not optional. |
+| `fro_hf_48m` / `fro_hf_144m` | The two fixed-rate taps, from `FIRCCSR.FIRC_SCLK/FCLK_PERIPH_EN`. Distinct from `fro_hf` — see the hazards section. |
 | `fro_hf_div` | Programmed from `ClocksConfig::fro_hf_div`; halted otherwise. |
 | `clk_1m` | `CLOCK_CTRL.FRO1MHZ_ENA` + `FRO1MHZ_CLK_ENA`. On by default. |
 | `clk_16k` (VBAT FRO16K) | Off by default; `enable_clk_16k`. **See the hardware warning below.** |
@@ -97,7 +98,7 @@ CTIMER0/1, INPUTMUX0, LPUART0–9. Two special cases:
   reset is a no-op.
 
 **Peripherals with a `FunctionalClock`** (`clocks/functional.rs`): LPUART0–9
-(`Fro12m`, `FroHfDiv`), ADC0/1 (`Fro12m`, `FroHf48m`), CAN0/1 (`FroHf48m`
+(`Fro12m`, `FroHfDiv`), ADC0/1 (`Fro12m`, `FroHf`), CAN0/1 (`FroHf`
 only), OSTIMER0, WWDT0/1 (hardwired `clk_1m`), CTIMER0/1 (`clk_1m`), plus
 LPTMR0/1 and RTC0 which implement the trait in their own modules to resolve a
 frequency only.
@@ -105,8 +106,12 @@ frequency only.
 - LPUART deliberately omits `clk_1m`: at 1 MHz the baud generator can't reach
   any usable baud rate.
 - FlexCAN would prefer PLL1 at 50 MHz, as NXP's own board example uses; with no
-  PLL bring-up, `fro_hf` at 48 MHz is the only option, and bit timing is solved
-  against it rather than copied from NXP's tables.
+  PLL bring-up, `fro_hf` is the only option, and bit timing is solved against
+  whatever rate the mux resolves to rather than copied from NXP's tables.
+- **ADC0/1 and CAN0/1's `FroHf` follows `FIRCCFG.RANGE`**, so their divider —
+  not the source select — is what keeps the resolved rate legal if the FIRC
+  range is ever raised. `Adc::new` enforces its own window; FlexCAN's solver
+  fails with `UnsupportedBitrate` instead.
 - CTIMER's `CTIMERCLKSEL` also offers PLL and `fro_hf` — not brought up.
 - WWDT1's `clk_16k` and `fro_hf_div` options would need the impl to grow a
   source field; neither is useful yet.
@@ -518,6 +523,11 @@ disable-on-fire interrupt handler.
   averaging/looping/compare, and DMA into the result FIFO are all unexposed.
 - No differential mode, no 12-bit mode, no continuous or hardware-triggered
   conversion, no DMA.
+- **`ADCK` is range-checked to 6–48 MHz** (RM 41.6.1, high-speed 16-bit) at
+  construction, returning `Error::ClockOutOfRange`. Because the mux's `FroHf`
+  input tracks `FIRCCFG.RANGE`, callers must size `Adc*ClockConfig::div` for the
+  *current* FIRC range rather than assuming 48 MHz — the examples derive it from
+  `Clocks::fro_hf`.
 - The calibration loops bail out after a magic `5_000_000` spins with only a
   `defmt::warn!` and then continue — with `defmt` off, a failed calibration is
   silent and the ADC is unusable.
@@ -697,7 +707,7 @@ predicates and an `IntoIterator` over `ResetReason`.
 
 ## Unverified / hazardous hardware paths
 
-Three known-bad or known-unverified behaviours are load-bearing in the current
+Four known-bad or known-unverified behaviours are load-bearing in the current
 design. They are the reason several APIs look the way they do.
 
 1. **VBAT domain configuration — `src/clocks/source.rs:176`.**
@@ -721,6 +731,22 @@ design. They are the reason several APIs look the way they do.
    cleared and never clear it, so polling it would hang forever. Hence
    `apply_div_no_poll!`. **The other ~55 SYSCON dividers have not been checked
    for the same behaviour** — assume nothing about them.
+
+4. **A mux's `fro_hf` is not the gated 48/144 MHz taps — `src/clocks/functional.rs:316,344`.**
+   `Clocks::fro_hf` follows `SCG0.FIRCCFG.RANGE`; `fro_hf_48m` / `fro_hf_144m`
+   are separate fan-outs pinned to their rates. A `*CLKSEL` selecting "fro_hf"
+   gets the former. NXP's `CLOCK_GetAdcClkFreq` (`fsl_clock.c:1197`) resolves
+   mux value 2 through `CLOCK_GetFroHfFreq` (`:2479`, reads `FIRCCFG.RANGE`),
+   while the taps have their own accessors (`:2503`, `:2513`).
+
+   ADC0/1 and CAN0/1 previously resolved this input as a flat 48 MHz. The
+   symptom was latent — correct at the reset default, and only wrong once
+   `FIRCCFG.RANGE` moves, at which point the ADC would convert at 144 MHz ADCK
+   against a 48 MHz ceiling **while `Clocks` reported 48 MHz**: out of spec and
+   silently mis-reported, with no error anywhere. Now resolved through
+   `ensure_fro_hf`, with `Adc::new` range-checking the result
+   (`Error::ClockOutOfRange`). Any mux gaining a `fro_hf` option must do the
+   same.
 
 ---
 

@@ -72,6 +72,9 @@ async fn main(_spawner: Spawner) {
         defmt::info!("  main_clk       {} Hz", c.main_clk_hz);
         defmt::info!("  system_clk     {} Hz", c.system_clk_hz);
         report("fro_12m", c.fro_12m);
+        // The node a peripheral mux's `fro_hf` input actually receives; the
+        // two below are the separately gated fixed-rate taps.
+        defmt::info!("  fro_hf         {} Hz", c.fro_hf);
         report("fro_hf_48m", c.fro_hf_48m);
         report("fro_hf_144m", c.fro_hf_144m);
         report("fro_hf_div", c.fro_hf_div);

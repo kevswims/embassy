@@ -302,6 +302,12 @@ impl_lpuart_functional_clock!(9);
 // `FunctionalClock::configure()` (see `crate::rtc`, `crate::lptmr`). ADC has
 // no such restriction. `clk_1m` is deliberately absent: at 1 MHz the ADC's
 // conversion clock would be far below its usable range.
+//
+// `FroHf` is `Clocks::fro_hf` - the FIRC output at whatever `FIRCCFG.RANGE`
+// selects - not the fixed 48 MHz tap. At a 144 MHz range this mux delivers
+// 144 MHz, so the divider has to bring ADCK back inside RM 41.6.1's window;
+// `crate::adc` rejects a resolved rate outside it rather than converting out
+// of spec.
 macro_rules! impl_adc_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
@@ -313,7 +319,7 @@ macro_rules! impl_adc_functional_clock {
                 div: full(crate::pac::SYSCON0.[<adc $n clkdiv>](), [<Adc $n clkdiv>], 3),
                 sources: {
                     Fro12m => Enum0x3 @ 3 : ensure_fro_12m,
-                    FroHf48m => Enum0x2 @ 2 : ensure_fro_hf_48m,
+                    FroHf => Enum0x2 @ 2 : ensure_fro_hf,
                 }
             }
         }
@@ -327,10 +333,10 @@ impl_adc_functional_clock!(1);
 // `can{n}...`, and the mux's `Enum3` is `fro_hf`.
 //
 // NXP's own board example drives FlexCAN from PLL1 at 50 MHz, but this crate
-// has no PLL bring-up (see `ClocksConfig`), so `fro_hf` at 48 MHz is the
-// usable source. It divides cleanly for the standard bitrates, and
+// has no PLL bring-up (see `ClocksConfig`), so `fro_hf` is the usable source.
 // `crate::can` computes its bit timing against whatever rate this returns
-// rather than assuming NXP's 50 MHz.
+// rather than assuming NXP's 50 MHz - which matters because `fro_hf` follows
+// `FIRCCFG.RANGE` and so is 144 MHz, not 48, once the FIRC range is raised.
 macro_rules! impl_can_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
@@ -341,7 +347,7 @@ macro_rules! impl_can_functional_clock {
                 sel: crate::pac::SYSCON0.[<flexcan $n clksel>](), [<Flexcan $n clkselSel>],
                 div: full(crate::pac::SYSCON0.[<flexcan $n clkdiv>](), [<Flexcan $n clkdiv>], 8),
                 sources: {
-                    FroHf48m => Enum3 @ 3 : ensure_fro_hf_48m,
+                    FroHf => Enum3 @ 3 : ensure_fro_hf,
                 }
             }
         }

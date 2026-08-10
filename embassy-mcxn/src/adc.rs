@@ -52,9 +52,17 @@
 //! restriction.
 //!
 //! Per RM 41.6.1 `ADCK` must be 6-24 MHz in low-power mode, 6-48 MHz for
-//! high-speed 16-bit, and 6-60 MHz for high-speed 12-bit. This driver
-//! selects high power (`Cfg.pwrsel`), so 48 MHz `fro_hf` and 12 MHz
-//! `fro_12m` are both in range for the 16-bit conversions it issues.
+//! high-speed 16-bit, and 6-60 MHz for high-speed 12-bit. This driver selects
+//! high power (`Cfg.pwrsel`) and issues 16-bit conversions, so the resolved
+//! rate has to land in 6-48 MHz; [`Adc::new`] rejects anything else with
+//! [`Error::ClockOutOfRange`] rather than converting out of spec.
+//!
+//! Mind which source that is. The mux's `fro_hf` input is
+//! [`crate::clocks::Clocks::fro_hf`], which follows `SCG0.FIRCCFG.RANGE` - so
+//! it is 48 MHz at the reset default but 144 MHz once the FIRC range is
+//! raised, and the divider has to absorb the difference. It is *not* the
+//! fixed 48 MHz `FIRC_SCLK` tap. `fro_12m` is a flat 12 MHz and always in
+//! range.
 use core::future::Future;
 use core::marker::PhantomData;
 use core::task::Poll;
@@ -94,7 +102,23 @@ fn gain_conv_result(mut gain_adjustment: f32) -> u32 {
 pub enum Error {
     /// Clock configuration error.
     ClockSetup(ClockError),
+
+    /// The resolved conversion clock (`ADCK`) is outside the range this driver
+    /// needs, in Hz.
+    ///
+    /// RM 41.6.1 requires 6-48 MHz for the high-speed 16-bit conversions
+    /// configured here. The usual cause is a source that moved without its
+    /// divider following: `fro_hf` tracks `SCG0.FIRCCFG.RANGE`, so a mux left
+    /// on divide-by-1 delivers 144 MHz once the FIRC range is raised. Raise
+    /// `Adc*ClockConfig::div`.
+    ClockOutOfRange(u32),
 }
+
+/// `ADCK` bounds for the high-speed 16-bit mode this driver configures
+/// (RM 41.6.1). Low-power mode and 12-bit conversions have wider windows, but
+/// neither is implemented.
+const ADCK_MIN_HZ: u32 = 6_000_000;
+const ADCK_MAX_HZ: u32 = 48_000_000;
 
 /// ADC configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +148,14 @@ impl<'d, T: Instance> Adc<'d, T> {
     where
         T: crate::clocks::FunctionalClock<Config = C>,
     {
-        unsafe { enable_and_reset_with_clock::<T>(clock).map_err(Error::ClockSetup)? };
+        let adck_hz = unsafe { enable_and_reset_with_clock::<T>(clock).map_err(Error::ClockSetup)? };
+
+        // Checked before any conversion is issued: an out-of-range ADCK does
+        // not fault, it just converts out of spec, so nothing downstream would
+        // report it.
+        if !(ADCK_MIN_HZ..=ADCK_MAX_HZ).contains(&adck_hz) {
+            return Err(Error::ClockOutOfRange(adck_hz));
+        }
 
         let regs = T::info().regs();
 

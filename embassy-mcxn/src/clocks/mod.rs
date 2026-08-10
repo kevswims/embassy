@@ -97,6 +97,8 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
         // Filled in below, once AHBCLKDIV is known.
         system_clk_hz: main_clk_hz,
         fro_12m: None,
+        // Overwritten by `record_firc` below, which reads `FIRCCFG.RANGE`.
+        fro_hf: main_clk_hz,
         fro_hf_48m: None,
         fro_hf_144m: None,
         fro_hf_div: None,

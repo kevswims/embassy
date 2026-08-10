@@ -40,9 +40,14 @@ async fn main(_spawner: Spawner) {
         pac::VREF0.utrim().read().0
     );
 
+    // See `adc.rs`: `fro_hf` tracks `FIRCCFG.RANGE`, so the divisor is derived
+    // rather than assumed. Divide-by-1 at the 48 MHz reset default.
+    const ADCK_MAX_HZ: u32 = 48_000_000;
+    let fro_hf = hal::clocks::with_clocks(|c| c.fro_hf).unwrap();
+
     let clock = Adc0ClockConfig {
-        source: Adc0ClockSource::FroHf48m,
-        div: Div::no_div(),
+        source: Adc0ClockSource::FroHf,
+        div: Div::from_divisor(fro_hf.div_ceil(ADCK_MAX_HZ)).unwrap(),
     };
     let adc = Adc::new(p.ADC0, Irqs, Config::default(), &clock).unwrap();
 

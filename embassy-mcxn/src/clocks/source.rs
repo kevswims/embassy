@@ -84,13 +84,22 @@ pub(super) fn record_sirc(clocks: &mut Clocks) {
     }
 }
 
-/// Record FIRC's two peripheral fan-out taps.
+/// Record `fro_hf` and FIRC's two fixed-rate peripheral fan-out taps.
 ///
-/// These are independent of `FIRCCFG.RANGE`, which selects what `main_clk`
-/// sees: the 48 MHz and 144 MHz taps are separately gated and both are enabled
-/// at reset.
+/// Three distinct nodes, and conflating them is the trap here. `fro_hf` is the
+/// FIRC output at whatever `FIRCCFG.RANGE` selects, and is what a peripheral
+/// `*CLKSEL` receives when it selects "fro_hf". The 48 MHz and 144 MHz taps are
+/// separately gated fan-outs pinned to those rates regardless of `RANGE`, and
+/// both are enabled at reset.
 pub(super) fn record_firc(clocks: &mut Clocks) {
     let csr = pac::SCG0.firccsr().read();
+
+    // Same register `main_clk` is read from, and deliberately so: `fro_hf` and
+    // `main_clk` are the same signal whenever FIRC drives the core.
+    clocks.fro_hf = match pac::SCG0.firccfg().read().range() {
+        pac::scg::FirccfgRange::Firc48mhz => FIRC_SCLK_HZ,
+        pac::scg::FirccfgRange::Firc144mhz => FIRC_FCLK_HZ,
+    };
 
     if csr.firc_sclk_periph_en() {
         clocks.fro_hf_48m = Some(FIRC_SCLK_HZ);
@@ -211,8 +220,12 @@ pub(super) fn configure_clock_ctrl(cfg: &ClocksConfig, clocks: &mut Clocks) {
 /// Bring `fro_hf_div` up, if asked for.
 ///
 /// `FROHFDIV` resets halted, so the node stays unavailable unless a divisor is
-/// requested. The input is `fro_hf` at whatever rate `FIRCCFG.RANGE` selects -
-/// the same value `main_clk` runs at.
+/// requested.
+///
+/// Divides `fro_hf`, not `main_clk`. Those are the same signal while FIRC drives
+/// the core, but they part company as soon as `main_clk` comes from a PLL - so
+/// this reads [`Clocks::fro_hf`], which `record_firc` must therefore have
+/// already filled in.
 pub(super) fn configure_fro_hf_div(cfg: &ClocksConfig, clocks: &mut Clocks) {
     let Some(div) = cfg.fro_hf_div else {
         return;
@@ -220,7 +233,7 @@ pub(super) fn configure_fro_hf_div(cfg: &ClocksConfig, clocks: &mut Clocks) {
 
     apply_div_no_reset!(pac::SYSCON0.frohfdiv(), Frohfdiv, div);
 
-    clocks.fro_hf_div = Some(clocks.main_clk_hz / div.into_divisor());
+    clocks.fro_hf_div = Some(clocks.fro_hf / div.into_divisor());
 }
 
 /// Program `AHBCLKDIV` if asked for, and report the resulting divisor.

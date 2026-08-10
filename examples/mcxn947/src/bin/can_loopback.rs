@@ -32,9 +32,16 @@ async fn main(_spawner: Spawner) {
     defmt::info!("CAN loopback example");
 
     // ---- CAN1: CAN-FD loopback ----
+    // Normalise the FlexCAN protocol clock to 48 MHz whatever `FIRCCFG.RANGE`
+    // is: `fro_hf` follows it, and the bit-timing solver only accepts exact
+    // integer divisions of whatever rate it is handed.
+    const CAN_CLK_MAX_HZ: u32 = 48_000_000;
+    let fro_hf = hal::clocks::with_clocks(|c| c.fro_hf).unwrap();
+    let can_div = Div::from_divisor(fro_hf.div_ceil(CAN_CLK_MAX_HZ)).unwrap();
+
     let clock1 = Can1ClockConfig {
-        source: Can1ClockSource::FroHf48m,
-        div: Div::no_div(),
+        source: Can1ClockSource::FroHf,
+        div: can_div,
     };
     let mut can1 = Can::new(
         p.CAN1,
@@ -112,8 +119,8 @@ async fn main(_spawner: Spawner) {
     // Nothing is wired to the pins, so this frame cannot be acknowledged and
     // must never come back. A timeout here is the pass condition.
     let clock0 = Can0ClockConfig {
-        source: Can0ClockSource::FroHf48m,
-        div: Div::no_div(),
+        source: Can0ClockSource::FroHf,
+        div: can_div,
     };
     let mut can0 = Can::new(
         p.CAN0,

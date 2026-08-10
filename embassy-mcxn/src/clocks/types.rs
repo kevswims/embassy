@@ -80,15 +80,32 @@ pub struct Clocks {
     /// running.
     pub fro_12m: Option<u32>,
 
-    /// `fro_hf` at 48 MHz, from `SCG0.FIRCCSR.FIRC_SCLK_PERIPH_EN`.
+    /// `fro_hf`, the FIRC output at whatever rate `SCG0.FIRCCFG.RANGE`
+    /// selects - 48 or 144 MHz.
     ///
-    /// This is the fan-out that also feeds the PLLs' reference input.
+    /// **This is what a peripheral mux's `fro_hf` input receives**, and it is
+    /// *not* either of the two gated taps below. A `*CLKSEL` selecting `fro_hf`
+    /// follows `FIRCCFG.RANGE`, so raising the FIRC range raises this node and
+    /// every peripheral selecting it. NXP's own `CLOCK_GetAdcClkFreq` resolves
+    /// mux value 2 through `CLOCK_GetFroHfFreq`, which reads `FIRCCFG.RANGE`;
+    /// the taps have their own separate accessors.
+    ///
+    /// Not optional: FIRC is running whenever the CPU is, either as `main_clk`
+    /// itself or as the PLLs' reference.
+    pub fro_hf: u32,
+
+    /// The 48 MHz FIRC tap, gated by `SCG0.FIRCCSR.FIRC_SCLK_PERIPH_EN`.
+    ///
+    /// A dedicated fan-out held at 48 MHz independently of `FIRCCFG.RANGE`,
+    /// and the reference the PLLs take. It is a distinct node from
+    /// [`Self::fro_hf`] - only consumers documented as taking *this* tap should
+    /// use it, not peripherals whose mux offers a generic "fro_hf".
     pub fro_hf_48m: Option<u32>,
 
-    /// `fro_hf` at 144 MHz, from `SCG0.FIRCCSR.FIRC_FCLK_PERIPH_EN`.
+    /// The 144 MHz FIRC tap, gated by `SCG0.FIRCCSR.FIRC_FCLK_PERIPH_EN`.
     ///
-    /// Available as a peripheral source regardless of what `main_clk` runs at:
-    /// the two FIRC fan-outs are independent of `FIRCCFG.RANGE`.
+    /// Like [`Self::fro_hf_48m`], a fixed-rate fan-out independent of
+    /// `FIRCCFG.RANGE` - not what a peripheral mux's `fro_hf` input sees.
     pub fro_hf_144m: Option<u32>,
 
     /// `fro_hf_div`, `fro_hf` through `FROHFDIV`.
@@ -161,7 +178,16 @@ impl Clocks {
         Self::ensure(self.fro_12m, "fro_12m", "SCG0.SIRCCSR.SIRC_CLK_PERIPH_EN is clear")
     }
 
-    /// `fro_hf` at 48 MHz.
+    /// `fro_hf`, the rate a peripheral mux's `fro_hf` input actually receives.
+    ///
+    /// Infallible - [`Clocks::fro_hf`] is not optional - but shaped like the
+    /// other accessors so the `impl_functional_clock!` source tables can call
+    /// it uniformly.
+    pub fn ensure_fro_hf(&self) -> Result<u32, ClockError> {
+        Ok(self.fro_hf)
+    }
+
+    /// The 48 MHz FIRC tap.
     pub fn ensure_fro_hf_48m(&self) -> Result<u32, ClockError> {
         Self::ensure(
             self.fro_hf_48m,

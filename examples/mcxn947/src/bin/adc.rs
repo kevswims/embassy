@@ -33,9 +33,16 @@ async fn main(_spawner: Spawner) {
     // Supplies the ADC's bias current - must outlive the `Adc`.
     let _vref = Vref::new_bandgap_only(p.VREF0);
 
+    // `fro_hf` follows `FIRCCFG.RANGE`, so derive the divisor rather than
+    // assuming 48 MHz: ADCK has to stay inside RM 41.6.1's window for the
+    // high-speed 16-bit conversions this driver issues. At the 48 MHz reset
+    // default this is divide-by-1, exactly as before.
+    const ADCK_MAX_HZ: u32 = 48_000_000;
+    let fro_hf = hal::clocks::with_clocks(|c| c.fro_hf).unwrap();
+
     let clock = Adc0ClockConfig {
-        source: Adc0ClockSource::FroHf48m,
-        div: Div::no_div(),
+        source: Adc0ClockSource::FroHf,
+        div: Div::from_divisor(fro_hf.div_ceil(ADCK_MAX_HZ)).unwrap(),
     };
     let adc = Adc::new(p.ADC0, Irqs, Config::default(), &clock).unwrap();
 
