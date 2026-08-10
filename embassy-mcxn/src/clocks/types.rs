@@ -36,6 +36,13 @@ pub enum ClockError {
     /// FIRC was configured but never reported `FIRCCSR.FIRCVLD`.
     FircNotValid,
 
+    /// `PLLCLKDIV` never cleared `UNSTAB` after being programmed.
+    ///
+    /// Some SYSCON dividers latch that flag and never clear it, so this may
+    /// indicate a divider that works but cannot report it - see
+    /// `apply_div_no_poll!`.
+    PllDivNotStable,
+
     /// PLL0 (APLL) never reported `APLLCSR.APLL_LOCK`.
     Pll0NotLocked,
 
@@ -200,10 +207,16 @@ pub struct Clocks {
     /// The "PLL divided clock" node: `PLLCLKDIVSEL` picks PLL0 or `pll1_clk0`,
     /// `PLLCLKDIV` divides it.
     ///
-    /// A single, globally shared resource, so it would be chosen once by
-    /// `init()` rather than by a driver.
+    /// A single, globally shared resource - one select and one divider feed
+    /// every consumer - so it is chosen once by `init()` and never written by a
+    /// driver.
     ///
-    /// Always `None`: `PLLCLKDIVSEL`/`PLLCLKDIV` are not programmed yet.
+    /// Its only consumer on this chip is the LP_FLEXCOMM mux (`FCCLKSEL`'s "PLL
+    /// divided clock" input), which LPUART0-9 select through. Peripherals whose
+    /// own mux offers a PLL - ADC, FlexCAN, CTIMER, ENET - take PLL0 or
+    /// `pll1_clk0` *directly* and do not pass through here.
+    ///
+    /// `None` unless [`super::config::ClocksConfig::pll_div`] was set.
     pub pll_div: Option<u32>,
 }
 
@@ -295,6 +308,6 @@ impl Clocks {
 
     /// The shared "PLL divided clock" node.
     pub fn ensure_pll_div(&self) -> Result<u32, ClockError> {
-        Self::ensure(self.pll_div, "pll_div", "pll_div is not implemented")
+        Self::ensure(self.pll_div, "pll_div", "set ClocksConfig::pll_div")
     }
 }

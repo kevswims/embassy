@@ -135,6 +135,38 @@ macro_rules! apply_div_no_poll {
     }};
 }
 
+/// Program `CTIMERCLKDIV`, the one SYSCON divider whose fieldset does not match
+/// the others.
+///
+/// Two differences, both cosmetic rather than semantic - the bit polarities are
+/// the same as everywhere else (0 is running / released / stable):
+///
+/// - `reset` is a bare `bool`, not a `*Reset` enum. `CTIMERCLKDIV` is the only
+///   divider on this chip like that; all 28 others have the typed field.
+/// - `halt` and `unstab` are spelled `Enable`/`Disable` rather than `Run`/`Halt`
+///   and `Stable`/`Ongoing`, with `Enable` meaning running and stable.
+///
+/// Like [`apply_div_no_poll!`] this does not wait on `UNSTAB`, matching what the
+/// hand-written CTIMER impl this replaced did.
+macro_rules! apply_div_ctimer {
+    ($reg:expr, $divty:ident, $div:expr) => {{
+        ::paste::paste! {
+            use crate::pac::syscon::[<$divty Halt>];
+
+            let r = $reg;
+            r.modify(|w| {
+                w.set_div($div.into_bits());
+                w.set_halt([<$divty Halt>]::Disable);
+                w.set_reset(true);
+            });
+            r.modify(|w| {
+                w.set_halt([<$divty Halt>]::Enable);
+                w.set_reset(false);
+            });
+        }
+    }};
+}
+
 /// Implement [`FunctionalClock`] for a peripheral, generating its source enum,
 /// its config struct, and the `configure()` body.
 ///
@@ -226,6 +258,43 @@ macro_rules! impl_functional_clock {
         }
     };
 
+    // As `full`, but for `CTIMERCLKDIV`'s odd fieldset - see
+    // `apply_div_ctimer!`.
+    (
+        $periph:ident,
+        name: $src_enum:ident / $cfg_struct:ident,
+        sel: $sel:expr, $sel_ty:ident,
+        div: ctimer($div_reg:expr, $divty:ident, $bits:expr),
+        sources: {
+            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+        }
+    ) => {
+        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+
+        #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        pub struct $cfg_struct {
+            /// Which source to select.
+            pub source: $src_enum,
+            /// Divisor applied to the selected source.
+            pub div: crate::clocks::config::Div<$bits>,
+        }
+
+        impl crate::clocks::FunctionalClock for crate::peripherals::$periph {
+            type Config = $cfg_struct;
+
+            fn configure(
+                cfg: &Self::Config,
+                clocks: &crate::clocks::Clocks,
+            ) -> Result<u32, crate::clocks::ClockError> {
+                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
+                apply_div_ctimer!($div_reg, $divty, cfg.div);
+                Ok(src_hz / cfg.div.into_divisor())
+            }
+        }
+    };
+
     // Shared: the source enum plus its compile-time pin against the PAC's raw
     // values (see the doc comment above).
     (@sources $periph:ident, $src_enum:ident, $sel_ty:ident, { $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ }) => {
@@ -277,6 +346,7 @@ macro_rules! impl_lpuart_functional_clock {
                 sel: crate::pac::SYSCON0.fcclksel($n), FcclkselSel,
                 div: full(crate::pac::SYSCON0.flexcommclkdiv($n), Flexcommclkdiv, 8),
                 sources: {
+                    PllDiv   => Enum0x1 @ 1 : ensure_pll_div,
                     Fro12m   => Enum0x2 @ 2 : ensure_fro_12m,
                     FroHfDiv => Enum0x3 @ 3 : ensure_fro_hf_div,
                 }
@@ -318,8 +388,9 @@ macro_rules! impl_adc_functional_clock {
                 sel: crate::pac::SYSCON0.[<adc $n clksel>](), [<Adc $n clkselSel>],
                 div: full(crate::pac::SYSCON0.[<adc $n clkdiv>](), [<Adc $n clkdiv>], 3),
                 sources: {
+                    Pll0   => Enum0x1 @ 1 : ensure_pll0_clk,
                     Fro12m => Enum0x3 @ 3 : ensure_fro_12m,
-                    FroHf => Enum0x2 @ 2 : ensure_fro_hf,
+                    FroHf  => Enum0x2 @ 2 : ensure_fro_hf,
                 }
             }
         }
@@ -347,6 +418,7 @@ macro_rules! impl_can_functional_clock {
                 sel: crate::pac::SYSCON0.[<flexcan $n clksel>](), [<Flexcan $n clkselSel>],
                 div: full(crate::pac::SYSCON0.[<flexcan $n clkdiv>](), [<Flexcan $n clkdiv>], 8),
                 sources: {
+                    Pll0  => Enum1 @ 1 : ensure_pll0_clk,
                     FroHf => Enum3 @ 3 : ensure_fro_hf,
                 }
             }
@@ -423,61 +495,42 @@ impl crate::clocks::FunctionalClock for crate::peripherals::WWDT1 {
     }
 }
 
-/// Functional clock configuration for a `CTIMERn`.
-///
-/// Sourced from `clk_1m`. `CTIMERCLKSEL` offers PLL and `fro_hf` options too,
-/// but those are not brought up yet, so this only needs a divisor.
-///
-/// `CTIMERCLKSEL`/`CTIMERCLKDIV` are arrays of five, one per instance, so
-/// [`impl_ctimer_functional_clock!`] is generic in the instance number rather
-/// than this being hand-written per instance like WWDT0/WWDT1.
+// CTIMER0/1. `CTIMERCLKSEL`/`CTIMERCLKDIV` are arrays of five, one per instance,
+// so this is generic in the instance number rather than hand-written per
+// instance like WWDT0/WWDT1.
+//
+// `CTIMERCLKSEL` resets to 0xF ("no clock"), so the mux has to be written even
+// to get the nominal default - which the generated `configure` always does.
+//
+// `PLL1_clk0` (`Enum0x2`) is omitted because PLL1 is not implemented, and the
+// SAI MCLK and LP-oscillator options because neither is a node `Clocks` models.
 macro_rules! impl_ctimer_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
             #[cfg(mcx_ctimer)]
-            #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-            #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-            pub struct [<Ctimer $n ClockConfig>] {
-                /// Divisor applied to `clk_1m`.
-                pub div: crate::clocks::config::Div<8>,
+            impl_functional_clock! {
+                [<CTIMER $n>],
+                name: [<Ctimer $n ClockSource>] / [<Ctimer $n ClockConfig>],
+                sel: crate::pac::SYSCON0.ctimerclksel($n), CtimerclkselSel,
+                div: ctimer(crate::pac::SYSCON0.ctimerclkdiv($n), Ctimerclkdiv, 8),
+                sources: {
+                    Clk1M  => Enum0x0 @ 0 : ensure_clk_1m,
+                    Pll0   => Enum0x1 @ 1 : ensure_pll0_clk,
+                    FroHf  => Enum0x3 @ 3 : ensure_fro_hf,
+                    Fro12m => Enum0x4 @ 4 : ensure_fro_12m,
+                }
             }
 
+            // `clk_1m` undivided, which is what this config resolved to before
+            // it grew a source field. Kept so existing callers that only care
+            // about a 1 MHz tick keep working unchanged.
             #[cfg(mcx_ctimer)]
-            impl crate::clocks::FunctionalClock for crate::peripherals::[<CTIMER $n>] {
-                type Config = [<Ctimer $n ClockConfig>];
-
-                fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError> {
-                    use crate::pac::syscon::{CtimerclkdivHalt, CtimerclkselSel};
-
-                    // CTIMERCLKSEL resets to 0xF ("no clock"), so the mux must
-                    // be written even to get the nominal default. Enum0x0 is
-                    // FRO_1M, i.e. clk_1m.
-                    const _: () = assert!(CtimerclkselSel::Enum0x0.to_bits() == 0);
-
-                    let src_hz = clocks.ensure_clk_1m()?;
-
-                    crate::pac::SYSCON0
-                        .ctimerclksel($n)
-                        .modify(|w| w.set_sel(CtimerclkselSel::Enum0x0));
-
-                    // This divider has its own shape: `reset` is a bare bool
-                    // rather than an enum, and `halt`/`unstab` are spelled
-                    // Enable/Disable rather than Run/Halt and Stable/Ongoing -
-                    // `Enable` meaning running and stable respectively. So
-                    // none of the shared divider macros fit. Like every other
-                    // SYSCON divider it also resets halted.
-                    let d = crate::pac::SYSCON0.ctimerclkdiv($n);
-                    d.modify(|w| {
-                        w.set_div(cfg.div.into_bits());
-                        w.set_halt(CtimerclkdivHalt::Disable);
-                        w.set_reset(true);
-                    });
-                    d.modify(|w| {
-                        w.set_halt(CtimerclkdivHalt::Enable);
-                        w.set_reset(false);
-                    });
-
-                    Ok(src_hz / cfg.div.into_divisor())
+            impl Default for [<Ctimer $n ClockConfig>] {
+                fn default() -> Self {
+                    Self {
+                        source: [<Ctimer $n ClockSource>]::Clk1M,
+                        div: crate::clocks::config::Div::no_div(),
+                    }
                 }
             }
         }

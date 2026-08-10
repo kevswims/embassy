@@ -53,8 +53,8 @@ Everything else on the die is unimplemented — see
 ## Clocks — `src/clocks/`
 
 `init()` selects the main clock (raising the core rail and flash wait states
-when asked for 144 or 150 MHz), optionally programs a few dividers, records
-every source rate in a `Clocks` struct, and provides the `Gate` (bus clock +
+when asked for 144 MHz), optionally programs a few dividers, records every
+source rate in a `Clocks` struct, and provides the `Gate` (bus clock +
 reset) and `FunctionalClock` (peripheral source mux + divider) traits that
 every driver constructor is bounded on.
 
@@ -64,7 +64,7 @@ every driver constructor is bounded on.
 | --- | --- |
 | `main_clk` | Selected by `ClocksConfig::main_clk`: FIRC at 48 MHz (reset default, no writes), FIRC at 144 MHz, or PLL0 at 150 MHz. The core voltage and flash wait states move with it. |
 | `system_clk` | `main_clk / AHBCLKDIV`. **Division only** — to go faster, raise `main_clk`. |
-| core voltage | Derived from `main_clk`, recorded as `Clocks::core_voltage`. 1.0 V at reset; 1.2 V at 144/150 MHz. |
+| core voltage | Derived from `main_clk`, recorded as `Clocks::core_voltage`. 1.0 V at reset; 1.2 V at 144 MHz. |
 | `fro_12m` (SIRC) | Recorded if `SIRCCSR.SIRC_CLK_PERIPH_EN` (on at reset). |
 | `fro_hf` | FIRC output at whatever `FIRCCFG.RANGE` selects. **This is what a peripheral mux's `fro_hf` input receives.** Not optional. |
 | `fro_hf_48m` / `fro_hf_144m` | The two fixed-rate taps, from `FIRCCSR.FIRC_SCLK/FCLK_PERIPH_EN`. Distinct from `fro_hf` — see the hazards section. |
@@ -74,7 +74,8 @@ every driver constructor is bounded on.
 | `clk_in` (SOSC) | Programmed from `ClocksConfig::sosc` (crystal or external clock, 16–66 MHz). `None` otherwise. |
 | `xtal32k` (OSC32K) | **Not implemented** — always `None`. |
 | `pll0_clk` | 150 MHz when `MainClock::Pll0At150m` is selected; `None` otherwise. Not configurable for any other rate or purpose. |
-| `pll1_clk0`, `pll1_clk1`, `pll_div` | **Not implemented** — always `None`. |
+| `pll_div` | `PLLCLKDIVSEL` (PLL0 or `pll1_clk0`) + `PLLCLKDIV`, from `ClocksConfig::pll_div`. Halted otherwise. **Feeds LP_FLEXCOMM only** — see below. |
+| `pll1_clk0`, `pll1_clk1` | **Not implemented** — always `None`. |
 
 **Limitations**
 
@@ -85,6 +86,19 @@ every driver constructor is bounded on.
   (N=8, M=50, P=2 from FIRC's 48 MHz tap), no arbitrary-rate solver, no
   spread-spectrum, and it cannot be brought up *without* also becoming
   `main_clk`. PLL1 is untouched.
+- **`pll_div` feeds one mux, not all of them.** `FCCLKSEL`'s "PLL divided
+  clock" — i.e. LP_FLEXCOMM, so LPUART0–9 — is its only consumer on this chip.
+  Every other PLL-capable mux (ADC, FlexCAN, CTIMER, ENET) takes PLL0 or
+  `pll1_clk0` *directly* and divides it itself, so `PLLCLKDIV` does not affect
+  them. NXP's `CLOCK_GetLPFlexCommClkFreq` resolves case 1 through
+  `CLOCK_GetPllClkDivFreq`, while `CLOCK_GetAdcClkFreq` case 1 goes straight to
+  `CLOCK_GetPll0OutFreq`.
+- **`PllDivSource::Pll1Clk0` is rejected**: PLL1 is not implemented, so only
+  PLL0 can feed `pll_div`.
+- **ENET's RMII reference still cannot come from PLL0.** The mux supports it
+  (`EnetrmiiclkselSel::Enum1`) and `enetrmiiclkdiv` exists, so 150/3 = 50 MHz is
+  reachable — but `RmiiRefClock` has only an `External` variant. Left untouched
+  deliberately: `src/enet/mod.rs` is being modified by in-flight PTP work.
 - **Core voltage is only ever raised, never lowered.** Lowering needs the
   mirrored ordering and interacts with the voltage detectors; see
   `src/power.rs`. A part that boots at 1.0 V and is taken to 1.2 V stays there.
@@ -111,21 +125,32 @@ CTIMER0/1, INPUTMUX0, LPUART0–9. Two special cases:
   reset is a no-op.
 
 **Peripherals with a `FunctionalClock`** (`clocks/functional.rs`): LPUART0–9
-(`Fro12m`, `FroHfDiv`), ADC0/1 (`Fro12m`, `FroHf`), CAN0/1 (`FroHf`
-only), OSTIMER0, WWDT0/1 (hardwired `clk_1m`), CTIMER0/1 (`clk_1m`), plus
+(`PllDiv`, `Fro12m`, `FroHfDiv`), ADC0/1 (`Pll0`, `Fro12m`, `FroHf`), CAN0/1
+(`Pll0`, `FroHf`), CTIMER0/1 (`Clk1M`, `Pll0`, `FroHf`, `Fro12m`), OSTIMER0,
+WWDT0/1 (hardwired `clk_1m`), plus
 LPTMR0/1 and RTC0 which implement the trait in their own modules to resolve a
 frequency only.
 
 - LPUART deliberately omits `clk_1m`: at 1 MHz the baud generator can't reach
   any usable baud rate.
-- FlexCAN would prefer PLL1 at 50 MHz, as NXP's own board example uses; with no
-  PLL bring-up, `fro_hf` is the only option, and bit timing is solved against
-  whatever rate the mux resolves to rather than copied from NXP's tables.
+- FlexCAN can now reach the 50 MHz NXP's own board example runs it at, via
+  `Pll0` at 150 MHz divided by 3 — verified in FD loopback with bit-rate
+  switching (`pll_sources.rs`). NXP take it from PLL1; the rate is what matters.
+  Bit timing is solved against whatever rate the mux resolves to either way.
 - **ADC0/1 and CAN0/1's `FroHf` follows `FIRCCFG.RANGE`**, so their divider —
   not the source select — is what keeps the resolved rate legal if the FIRC
   range is ever raised. `Adc::new` enforces its own window; FlexCAN's solver
   fails with `UnsupportedBitrate` instead.
-- CTIMER's `CTIMERCLKSEL` also offers PLL and `fro_hf` — not brought up.
+- CTIMER0/1 select from four sources. `Ctimer*ClockConfig::default()` is
+  `Clk1M` undivided, matching what the config resolved to before it grew a
+  source field, so existing callers are unaffected. `PLL1_clk0` is omitted
+  (PLL1 unimplemented), as are the SAI MCLK and LP-oscillator inputs — neither
+  is a node `Clocks` models.
+- **`CTIMERCLKDIV` is the only SYSCON divider with a bare-`bool` `reset`** (the
+  other 28 have a typed `*Reset` enum) and spells `halt`/`unstab`
+  `Enable`/`Disable` rather than `Run`/`Halt` and `Stable`/`Ongoing`. Bit
+  polarities match the rest, so only the types differ — hence
+  `apply_div_ctimer!` and the macro's `div: ctimer(...)` arm.
 - WWDT1's `clk_16k` and `fro_hf_div` options would need the impl to grow a
   source field; neither is useful yet.
 
@@ -538,9 +563,10 @@ disable-on-fire interrupt handler.
   conversion, no DMA.
 - **`ADCK` is range-checked to 6–48 MHz** (RM 41.6.1, high-speed 16-bit) at
   construction, returning `Error::ClockOutOfRange`. Because the mux's `FroHf`
-  input tracks `FIRCCFG.RANGE`, callers must size `Adc*ClockConfig::div` for the
-  *current* FIRC range rather than assuming 48 MHz — the examples derive it from
-  `Clocks::fro_hf`.
+  input tracks `FIRCCFG.RANGE`, callers must size `Adc*ClockConfig::div` for
+  the *current* FIRC range rather than assuming 48 MHz — the examples derive it
+  from `Clocks::fro_hf`. The wider low-power and 12-bit windows do not apply:
+  neither mode is implemented.
 - The calibration loops bail out after a magic `5_000_000` spins with only a
   `defmt::warn!` and then continue — with `defmt` off, a failed calibration is
   silent and the ADC is unusable.
@@ -627,7 +653,8 @@ BUF21EN with settle delays). Also toggles the analog rail bit in
   for 2/3/4. Only two of the five timers are actually usable.
 - **The prescaler is hardcoded to 0** (`PR.PRVAL = 0`); there is no prescaler
   API, so the timer always counts at the full functional-clock rate.
-- Only `clk_1m` as a source (see the clocks section).
+- Four selectable sources (`Clk1M`, `Pll0`, `FroHf`, `Fro12m`); `PLL1_clk0` and
+  the SAI/LP-oscillator mux inputs are not offered. See the clocks section.
 - PWM is single-edge only: **no center-aligned or dual-edge PWM, no
   complementary outputs, no dead-time insertion.**
 - **No plain interrupt-on-match / one-shot timer API**, no counter or
@@ -809,8 +836,10 @@ design. They are the reason several APIs look the way they do.
 3. **`WDTnCLKDIV` never clears `UNSTAB` — `src/clocks/functional.rs:112`.**
    `WDT0CLKDIV` and `WDT1CLKDIV` latch `UNSTAB` high the moment `HALT` is
    cleared and never clear it, so polling it would hang forever. Hence
-   `apply_div_no_poll!`. **The other ~55 SYSCON dividers have not been checked
-   for the same behaviour** — assume nothing about them.
+   `apply_div_no_poll!`. `FROHFDIV`, `AHBCLKDIV` and `PLLCLKDIV` *do* clear it
+   (the last confirmed by `configure_pll_div`'s capped poll returning without
+   timing out). **The remaining ~52 SYSCON dividers have not been checked** —
+   assume nothing about them, and prefer a capped poll to an unbounded one.
 
 4. **A mux's `fro_hf` is not the gated 48/144 MHz taps — `src/clocks/functional.rs:316,344`.**
    `Clocks::fro_hf` follows `SCG0.FIRCCFG.RANGE`; `fro_hf_48m` / `fro_hf_144m`
@@ -960,8 +989,9 @@ than refusing to build or returning an error.
       exercise interrupt and isochronous endpoints; `trap`: a re-enable of an
       already-enabled endpoint is ignored rather than reconfigured, because
       reconfiguring retires a primed queue head.
-- [ ] **Clocks** — `pll_div` (`PLLCLKDIVSEL`/`PLLCLKDIV`) and the per-mux PLL
-      source variants; PLL1; an arbitrary-rate PLL solver; and OSC32K
+- [ ] **Clocks** — a PLL0 source for ENET's RMII reference (`RmiiRefClock` needs
+      an internal variant; deferred while PTP work is in flight in
+      `src/enet/`); PLL1; an arbitrary-rate PLL solver; and OSC32K
       (`xtal32k`).
 - [ ] **Power** — lowering the core voltage, which needs the reverse ordering
       and the voltage-detector interaction worked out; the low-power modes
@@ -993,6 +1023,7 @@ These are the only executable coverage the crate has. They use `defmt-rtt` and
 | `clocks.rs` | clock tree reporting, plus the reset SPC/FMU state |
 | `clocks_144m.rs` | `main_clk` at 144 MHz, cross-checked against `clk_1m`, with an ADC read at the new rate |
 | `clocks_150m.rs` | `main_clk` from PLL0 at 150 MHz, with `fro_hf` left at 48 MHz |
+| `pll_sources.rs` | `pll_div` to LPUART, and PLL0 direct to FlexCAN (FD loopback), ADC and CTIMER |
 | `power_overdrive.rs` | core rail to 1.2 V with `main_clk` left alone |
 | `timer.rs` | `embassy-time` / OSTIMER0 |
 | `dma_mem_to_mem.rs` | eDMA memory-to-memory |

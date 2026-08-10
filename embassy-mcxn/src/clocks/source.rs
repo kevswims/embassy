@@ -5,7 +5,7 @@
 //! for the hardware to report the result stable, then record what happened into
 //! [`Clocks`]. Nothing else in the crate writes these registers.
 
-use super::config::{ClocksConfig, Div, SoscMode};
+use super::config::{ClocksConfig, Div, PllDivSource, SoscMode};
 use super::types::{ClockError, Clocks};
 use crate::pac;
 
@@ -230,6 +230,63 @@ pub(super) fn configure_ahb_div(cfg: &ClocksConfig) -> u32 {
         // Reset value divides by 1. `AHBCLKDIV.div` divides by `div + 1`.
         None => pac::SYSCON0.ahbclkdiv().read().div() as u32 + 1,
     }
+}
+
+/// Bring `pll_div` up, if asked for.
+///
+/// `PLLCLKDIVSEL` picks which PLL to divide and `PLLCLKDIV` divides it. Both are
+/// single, globally shared resources - every consumer of the "PLL divided clock"
+/// mux input sees the same rate - which is why this is decided once here rather
+/// than by whichever driver happens to be constructed first.
+///
+/// The only consumer on this chip is the LP_FLEXCOMM mux (`FCCLKSEL`), i.e.
+/// LPUART0-9. Peripherals whose own mux offers a PLL take it directly.
+///
+/// `PLLCLKDIV` resets halted, so the node stays unavailable unless requested.
+pub(super) fn configure_pll_div(cfg: &ClocksConfig, clocks: &mut Clocks) -> Result<(), ClockError> {
+    use pac::syscon::{PllclkdivHalt, PllclkdivReset, PllclkdivUnstab, PllclkdivselSel};
+
+    let Some(pll_div) = cfg.pll_div else {
+        return Ok(());
+    };
+
+    // Resolve the source first: a divider programmed against a PLL that was
+    // never brought up would record a plausible rate for a dead clock.
+    let (sel, src_hz) = match pll_div.source {
+        PllDivSource::Pll0 => (PllclkdivselSel::Enum0, clocks.ensure_pll0_clk()?),
+        PllDivSource::Pll1Clk0 => (PllclkdivselSel::Enum1, clocks.ensure_pll1_clk0()?),
+    };
+
+    pac::SYSCON0.pllclkdivsel().modify(|w| w.set_sel(sel));
+
+    // Full-shape divider: halt and assert reset while writing the divisor, then
+    // release both.
+    let d = pac::SYSCON0.pllclkdiv();
+    d.modify(|w| {
+        w.set_div(pll_div.div.into_bits());
+        w.set_halt(PllclkdivHalt::Halt);
+        w.set_reset(PllclkdivReset::Asserted);
+    });
+    d.modify(|w| {
+        w.set_halt(PllclkdivHalt::Run);
+        w.set_reset(PllclkdivReset::Released);
+    });
+
+    // Capped rather than unbounded: `WDT0CLKDIV`/`WDT1CLKDIV` latch `UNSTAB`
+    // high and never clear it (see `apply_div_no_poll!`), and none of the other
+    // SYSCON dividers have been shown to behave. A hang here would happen at
+    // boot, before a probe can attach, so a stuck flag is reported instead.
+    let mut spins = 0u32;
+    while d.read().unstab() == PllclkdivUnstab::Ongoing {
+        spins += 1;
+        if spins > 5_000_000 {
+            return Err(ClockError::PllDivNotStable);
+        }
+    }
+
+    clocks.pll_div = Some(src_hz / pll_div.div.into_divisor());
+
+    Ok(())
 }
 
 /// FRO16K's fixed rate.

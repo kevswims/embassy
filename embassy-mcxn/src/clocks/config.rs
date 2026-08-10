@@ -98,6 +98,43 @@ pub enum MainClock {
     Pll0At150m,
 }
 
+/// Which PLL feeds the shared `pll_div` node (`SYSCON0.PLLCLKDIVSEL`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PllDivSource {
+    /// PLL0 (APLL). Requires [`MainClock::Pll0At150m`], which is the only thing
+    /// that brings PLL0 up.
+    Pll0,
+
+    /// `pll1_clk0` (SPLL). **Not usable yet** — PLL1 bring-up is not
+    /// implemented, so selecting this is rejected with
+    /// [`super::ClockError::BadConfig`].
+    Pll1Clk0,
+}
+
+/// Bring up `pll_div`, the divided PLL clock (`PLLCLKDIVSEL` + `PLLCLKDIV`).
+///
+/// A single globally shared node: one select and one divider feed every
+/// consumer, so the rate chosen here constrains all of them at once. That is why
+/// it is configured by [`super::init()`] rather than by a driver.
+///
+/// Its only consumer on this chip is the LP_FLEXCOMM mux
+/// (`FCCLKSEL`'s "PLL divided clock"), which is what LPUART0-9 select through.
+/// Peripherals whose mux offers a PLL take PLL0 or `pll1_clk0` *directly*, not
+/// through here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PllDivConfig {
+    /// Which PLL to divide.
+    pub source: PllDivSource,
+
+    /// Divisor applied to it (`PLLCLKDIV`).
+    ///
+    /// PLL0 at 150 MHz divided by 3 gives 50 MHz, which is the rate most of
+    /// this mux's consumers want.
+    pub div: Div<8>,
+}
+
 /// How the SOSC input is driven.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -202,6 +239,14 @@ pub struct ClocksConfig {
     /// [`Self::main_clk`].
     pub ahb_div: Option<Div<8>>,
 
+    /// Bring up `pll_div`, the shared divided-PLL node.
+    ///
+    /// `None` (the default) leaves `PLLCLKDIV` in its reset state, which is
+    /// *halted*, so [`super::Clocks::pll_div`] stays `None` and any peripheral
+    /// selecting it is rejected. Requires a PLL to be running - see
+    /// [`PllDivSource`].
+    pub pll_div: Option<PllDivConfig>,
+
     /// What `main_clk` runs from.
     ///
     /// Defaults to [`MainClock::FroHf48m`], the reset value, which costs no
@@ -229,6 +274,7 @@ impl Default for ClocksConfig {
             sosc: None,
             fro_hf_div: None,
             ahb_div: None,
+            pll_div: None,
             main_clk: MainClock::FroHf48m,
             enable_clk_16k: false,
         }

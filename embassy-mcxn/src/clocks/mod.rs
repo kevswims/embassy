@@ -47,7 +47,11 @@
 //! out a shared `&Clocks` sound, and it is also how the genuinely shared nodes
 //! stay coherent - [`Clocks::pll_div`] in particular is one select and one
 //! divider, so the rate chosen for it constrains every consumer at once.
-
+//!
+//! Note which consumers those are: `pll_div` feeds the LP_FLEXCOMM mux
+//! (`FCCLKSEL`), and nothing else on this chip. Peripherals whose own mux offers
+//! a PLL - ADC, FlexCAN, CTIMER, ENET - take PLL0 or `pll1_clk0` *directly*, so
+//! they are unaffected by `PLLCLKDIV`.
 //!
 //! Peripheral clock gating (SYSCON `AHBCLKCTRLn`/`PRESETCTRLn`) lives in the
 //! `gate` submodule, and the per-peripheral mux/divider layer in `functional`.
@@ -66,7 +70,7 @@ mod types;
 
 pub use functional::{FunctionalClock, enable_and_reset_with_clock};
 #[cfg(mcx_ctimer)]
-pub use functional::{Ctimer0ClockConfig, Ctimer1ClockConfig};
+pub use functional::{Ctimer0ClockConfig, Ctimer0ClockSource, Ctimer1ClockConfig, Ctimer1ClockSource};
 #[cfg(mcx_wwdt)]
 pub use functional::WwdtClockConfig;
 #[cfg(mcxn_ostimer)]
@@ -82,7 +86,7 @@ pub use functional::{
 pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
 #[cfg(mcxn_can)]
 pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
-pub use config::{MainClock, SoscConfig, SoscMode};
+pub use config::{MainClock, PllDivConfig, PllDivSource, SoscConfig, SoscMode};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};
 
@@ -138,6 +142,8 @@ pub fn init(settings: ClocksConfig) -> Result<(), ClockError> {
     // which want a source already running behind them.
     source::configure_sosc(&settings, &mut clocks)?;
     source::configure_clock_ctrl(&settings, &mut clocks);
+    // After `main_clk::switch`, which is what brings PLL0 up at all.
+    source::configure_pll_div(&settings, &mut clocks)?;
     // Needs main_clk_hz already recorded: FROHFDIV divides `fro_hf`.
     source::configure_fro_hf_div(&settings, &mut clocks);
     source::configure_vbat(&settings, &mut clocks);
