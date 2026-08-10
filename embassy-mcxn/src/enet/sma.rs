@@ -39,9 +39,9 @@ impl<T: Instance> Sma<T> {
 /// Pick `MAC_MDIO_ADDRESS.CR` for the CSR (bus) clock frequency.
 ///
 /// Boundaries are the DWMAC CSR-clock ranges. The MCXN947 MAC has the extended
-/// divider set, but `system_clk` tops out at 48 MHz today so only the low rows
-/// are reachable in practice; the rest are here so this stays correct if the
-/// clock tree grows PLL support.
+/// divider set, and `system_clk` reaches 150 MHz on this part, so the upper
+/// rows are reachable in practice - the divider has to follow the main clock
+/// or MDC lands outside the clause-22 limit.
 fn clock_range_for(csr_clk_hz: u32) -> u8 {
     match csr_clk_hz / 1_000_000 {
         0..=34 => 2,    // CSR / 16

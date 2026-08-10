@@ -368,8 +368,9 @@ read-only `PtpTimeProvider`. `set_addend` is the servo knob - a discipline loop
 drives it around `nominal_addend`.
 
 The reference is `enet0_tx_clk` (`SYSCON0.ENETPTPREFCLKSEL = 4`), the same
-externally-supplied 50 MHz RMII clock the MAC runs on, matching NXP's PTP
-example - so PTP needs no PLL. That fixes the usable increment range: the
+50 MHz RMII clock the MAC runs on, matching NXP's PTP example - so the
+timestamp unit needs no clock source of its own. That fixes the usable
+increment range: the
 subsecond increment must be **strictly greater than 20 ns** (one reference
 period) or the required addend exceeds 32 bits, which is why the default is
 32 ns (`nominal_addend = 0xA000_0000`) rather than the STM32 driver's 8 ns.
@@ -412,9 +413,21 @@ the DMA do not clear `RDES1`. If the context descriptor has not landed yet the
 packet is deliberately left queued for one more poll rather than delivered
 without its timestamp.
 
-**Not yet verified on hardware**, unlike the clock. Also note egress timestamps
-are only reaped from `Driver::receive`, so an application that exclusively
-transmits would never collect them; `embassy-net` polls both.
+Verified on hardware, two ways. Through MAC loopback, four PTPv2 Sync messages
+each produced both an egress and an ingress timestamp, with packet ids matching
+and `rx - tx` a consistent 256 ns (8 x the 32 ns clock increment). Against live
+PTP traffic on a real network, every Sync (UDP 319, an *event* message) was
+timestamped and no Follow_Up or Announce (UDP 320, *general* messages) was -
+4/4 and 0/8 amid ~190 frames of unrelated traffic, which is the evidence that
+`TSEVNTENA`/`SNAPTYPSEL` classification works rather than the MAC stamping
+indiscriminately.
+
+Still untested: participating in a real master/slave exchange, which needs a
+PTP servo and protocol state machine on top of this driver.
+
+Note egress timestamps are only reaped from `Driver::receive`, so an
+application that exclusively transmits would never collect them; `embassy-net`
+polls both.
 
 **Magic-packet wake** (`enable_magic_packet_wake`, `magic_packet_received`,
 `wait_for_wake`) arms the MAC's Wake-on-LAN detector. Ordinary traffic keeps
@@ -443,20 +456,24 @@ keep draining the RX ring - which anything running `embassy-net` does anyway.
 
 - **RMII only.** MII pin traits are generated (`Txd2Pin`, `RxClkPin`, …) but no
   MII constructor exists, and the FRDM-MCXN947 routes only TXD0/TXD1 anyway.
-- **The 50 MHz RMII reference clock must come from off-chip** on
-  `ENET0_TX_CLK`. `RmiiRefClock` has only an `External` variant: sourcing it
-  internally needs PLL0, CLKIN or PLL1_clk0, none of which `src/clocks/` can
-  bring up. On the FRDM-MCXN947 this requires the board modification NXP's
-  Ethernet examples call for — **JP13 shorted 2-3 and R274 populated**; R274 is
-  not fitted from the factory.
+- **The RMII reference clock is 50 MHz on `ENET0_TX_CLK`**, either supplied by
+  the board (`RmiiRefClock::External`, the default and how the FRDM-MCXN947 is
+  wired) or generated on-chip by dividing PLL0 (`RmiiRefClock::Pll0`, which
+  needs `MainClock::Pll0At150m` - 150 MHz divides by exactly 3). A PLL0
+  frequency that is not an exact multiple of 50 MHz is rejected rather than
+  approximated. `CLKIN` and `pll1_clk0` are selectable in hardware but not
+  offered, the latter because PLL1 bring-up is unimplemented.
+- On the FRDM-MCXN947 the external reference requires the board modification
+  NXP's Ethernet examples call for — **JP13 shorted 2-3 and R274 populated**;
+  R274 is not fitted from the factory.
 - **Fixed at 100 Mbit full duplex.** The MAC is configured once and does not
   follow the PHY's autonegotiation result, so a link that settles at 10 Mbit or
   half duplex will not work.
 - **One DMA channel and one MTL queue.** `dma_ch1_*` and the second TX/RX queue,
   and hence AVB/DCB traffic classes, are unused.
-- **PTP per-packet timestamping is implemented but not yet hardware-verified.**
-  The clock is (see below); the descriptor timestamp path builds and is wired
-  end to end, but has not been run on silicon.
+- **PTP is verified for the clock and for per-packet timestamping**, but no PTP
+  protocol stack or servo sits on top of it, so the board cannot yet
+  synchronise to a grandmaster.
 - **Magic-packet detection is polled, not interrupt-driven.** See the wake
   notes below; the `ETHERNET_MACLP` vector is unhandled.
 - **No MMC statistics counters.** The PAC does not model the MMC block at all,
@@ -1041,7 +1058,8 @@ These are the only executable coverage the crate has. They use `defmt-rtt` and
 | `eth_refclk_check.rs` | samples `ENET0_TX_CLK` to check the RMII reference clock is present |
 | `eth_ptp_clock.rs` | ENET0 PTP clock: rate, absolute set, +/- steps, addend servo |
 | `eth_wake.rs` | ENET0 magic-packet (Wake-on-LAN) detection |
-| `eth_ptp_loopback.rs` | ENET0 PTP per-packet timestamping via MAC loopback (untested on hardware) |
+| `eth_ptp_loopback.rs` | ENET0 PTP per-packet timestamping via MAC loopback |
+| `eth_ptp_master.rs` | ENET0 PTP timestamping of live PTP traffic; checks event vs general classification |
 | `adc.rs` | LPADC one-shot conversion |
 | `adc_vref_buffered.rs` | LPADC with a buffered VREF |
 | `ctimer_match.rs` | `MatchOutput` |

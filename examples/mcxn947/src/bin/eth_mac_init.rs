@@ -127,13 +127,23 @@ async fn main(_spawner: Spawner) -> ! {
         let mtl_rx = regs.mtl_rxq0_operation_mode().read();
         info!(
             "DMA rx_control={:#010x} sr={:?} rbsz_13_y={} rx_pbl={} | tx_control={:#010x} st={:?} tx_pbl={}",
-            rxc.0, rxc.sr(), rxc.rbsz_13_y(), rxc.rx_pbl(),
-            txc.0, txc.st(), txc.tx_pbl(),
+            rxc.0,
+            rxc.sr(),
+            rxc.rbsz_13_y(),
+            rxc.rx_pbl(),
+            txc.0,
+            txc.st(),
+            txc.tx_pbl(),
         );
         info!(
             "MTL txq0={:#010x} txqen={:?} tsf={} tqs={} | rxq0={:#010x} rsf={} rqs={}",
-            mtl_tx.0, mtl_tx.txqen(), mtl_tx.tsf(), mtl_tx.tqs(),
-            mtl_rx.0, mtl_rx.rsf(), mtl_rx.rqs(),
+            mtl_tx.0,
+            mtl_tx.txqen(),
+            mtl_tx.tsf(),
+            mtl_tx.tqs(),
+            mtl_rx.0,
+            mtl_rx.rsf(),
+            mtl_rx.rqs(),
         );
         info!(
             "current_app_rxdesc={:#010x} rx_tail={:#010x}",

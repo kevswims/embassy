@@ -13,7 +13,7 @@ defmt = "1.0"
 defmt-rtt = "1.0"
 embassy-executor = { version = "0.10.0", path = "../../embassy-executor", default-features = false, features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-futures = { version = "0.1.2", path = "../../embassy-futures" }
-embassy-mcxn = { version = "0.1.0", path = "../../embassy-mcxn", features = ["defmt", "unstable-pac", "mcxn947"] }
+embassy-mcxn = { version = "0.1.0", path = "../../embassy-mcxn", features = ["defmt", "unstable-pac", "mcxn947", "ptp"] }
 embassy-net-driver = { version = "0.2.0", path = "../../embassy-net-driver" }
 embassy-net = { version = "0.9.1", path = "../../embassy-net", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet", "dns"] }
 embassy-time = { version = "0.5.1", path = "../../embassy-time", features = ["defmt"] }

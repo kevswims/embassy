@@ -30,7 +30,9 @@ bind_interrupts!(struct Irqs {
 
 type Device = Enet<'static, ENET0, GenericPhy<Sma<ENET0>>>;
 
-const REMOTE_ENDPOINT: (Ipv4Address, u16) = (Ipv4Address::new(10, 42, 0, 1), 8000);
+/// Where the TCP client half connects. Change this to the machine running the
+/// listener - the example has no way to discover it.
+const REMOTE_ENDPOINT: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 100), 8000);
 
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {

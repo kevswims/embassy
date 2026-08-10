@@ -76,6 +76,9 @@ defmt = ["dep:defmt", "nxp-pac/defmt", "embassy-net-driver/defmt", "embassy-usb-
 
 unstable-pac = []
 
+## Enable Ethernet PTP (IEEE 1588) hardware timestamping.
+ptp = ["embassy-net-driver/packetmeta-id"]
+
 # dummy feature to silence embassy-hal-internal lint
 rt = []
 

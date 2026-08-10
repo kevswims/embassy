@@ -5,8 +5,9 @@
 //! nothing to do with the eDMA controllers in [`crate::dma`].
 //!
 //! Only RMII is wired up today, which is what the FRDM-MCXN947 board supports -
-//! it routes TXD0/TXD1 only. The 50 MHz RMII reference clock must be supplied
-//! externally on `ENET0_TX_CLK`; see [`RmiiRefClock`].
+//! it routes TXD0/TXD1 only. The 50 MHz RMII reference clock arrives on
+//! `ENET0_TX_CLK`, either from the board or divided down from PLL0; see
+//! [`RmiiRefClock`].
 //!
 //! # Example
 //!
@@ -28,6 +29,10 @@
 
 mod descriptors;
 mod generic_phy;
+#[cfg(feature = "ptp")]
+mod ptp;
+#[cfg(feature = "ptp")]
+mod ptp_clock;
 mod sma;
 
 use core::marker::PhantomData;
@@ -41,6 +46,12 @@ use embassy_sync::waitqueue::AtomicWaker;
 
 use self::descriptors::{RDes, RDesRing, TDes, TDesRing};
 pub use self::generic_phy::GenericPhy;
+#[cfg(feature = "ptp")]
+use self::ptp::{PacketState, PtpTimestampSink};
+#[cfg(feature = "ptp")]
+pub use self::ptp::{PtpTimestamp, PtpTimestampStore};
+#[cfg(feature = "ptp")]
+pub use self::ptp_clock::{PTP_REF_CLOCK_HZ, PtpClock, PtpClockConfig, PtpSubsecondIncrement, PtpTimeProvider};
 pub use self::sma::{Sma, StationManagement};
 use crate::clocks::Gate;
 use crate::interrupt::typelevel::{self, Handler, Interrupt as _};
@@ -76,16 +87,46 @@ pub struct PacketQueue<const TX: usize, const RX: usize> {
     rx_desc: [RDes; RX],
     tx_buf: [Packet<TX_BUFFER_SIZE>; TX],
     rx_buf: [Packet<RX_BUFFER_SIZE>; RX],
+    #[cfg(feature = "ptp")]
+    packet_state: PacketState<TX, RX>,
 }
 
 impl<const TX: usize, const RX: usize> PacketQueue<TX, RX> {
     /// Create a new packet queue.
+    ///
+    /// With the `ptp` feature enabled this queue discards timestamps; use
+    /// [`PacketQueue::new_with_ptp`] to keep them.
     pub const fn new() -> Self {
+        Self::new_inner(
+            #[cfg(feature = "ptp")]
+            PtpTimestampSink::new(),
+        )
+    }
+
+    /// Create a packet queue that records hardware PTP timestamps into
+    /// `timestamps`.
+    ///
+    /// Look a timestamp up by the [`embassy_net_driver::PacketMeta`] id of the
+    /// packet it belongs to. The store's depth is independent of the ring
+    /// depth, so timestamp history can outlive the descriptors.
+    ///
+    /// The MAC PTP clock must be started separately with [`Enet::start_ptp`]
+    /// before the hardware produces any timestamps.
+    #[cfg(feature = "ptp")]
+    pub const fn new_with_ptp<const PTP_TX: usize, const PTP_RX: usize>(
+        timestamps: &'static PtpTimestampStore<PTP_TX, PTP_RX>,
+    ) -> Self {
+        Self::new_inner(PtpTimestampSink::from_store(timestamps))
+    }
+
+    const fn new_inner(#[cfg(feature = "ptp")] ptp: PtpTimestampSink) -> Self {
         Self {
             tx_desc: [const { TDes::new() }; TX],
             rx_desc: [const { RDes::new() }; RX],
             tx_buf: [Packet([0; TX_BUFFER_SIZE]); TX],
             rx_buf: [Packet([0; RX_BUFFER_SIZE]); RX],
+            #[cfg(feature = "ptp")]
+            packet_state: PacketState::new(ptp),
         }
     }
 
@@ -99,6 +140,26 @@ impl<const TX: usize, const RX: usize> PacketQueue<TX, RX> {
     pub fn init(this: &mut MaybeUninit<Self>) {
         unsafe {
             this.as_mut_ptr().write_bytes(0u8, 1);
+            // All-zeros is not a valid `PacketState` by contract, so write it
+            // properly rather than relying on the memset.
+            #[cfg(feature = "ptp")]
+            (&raw mut (*this.as_mut_ptr()).packet_state).write(PacketState::new(PtpTimestampSink::new()));
+        }
+    }
+
+    /// Initialise a packet queue in place, recording PTP timestamps.
+    ///
+    /// The in-place counterpart of [`PacketQueue::new_with_ptp`]; see
+    /// [`PacketQueue::init`] for why this exists.
+    #[cfg(feature = "ptp")]
+    pub fn init_with_ptp<const PTP_TX: usize, const PTP_RX: usize>(
+        this: &mut MaybeUninit<Self>,
+        timestamps: &'static PtpTimestampStore<PTP_TX, PTP_RX>,
+    ) {
+        unsafe {
+            this.as_mut_ptr().write_bytes(0u8, 1);
+            (&raw mut (*this.as_mut_ptr()).packet_state)
+                .write(PacketState::new(PtpTimestampSink::from_store(timestamps)));
         }
     }
 }
@@ -118,12 +179,20 @@ pub enum RmiiRefClock {
     ///
     /// This is how the FRDM-MCXN947 is wired, and it is what NXP's own SDK
     /// selects (`CLOCK_AttachClk(kNONE_to_ENETRMII)`).
-    ///
-    /// Sourcing the reference internally is not offered: `ENETRMIICLKSEL` can
-    /// only select PLL0, CLKIN or PLL1_clk0, and [`crate::clocks`] cannot bring
-    /// any of those up yet.
     #[default]
     External,
+
+    /// Generated on-chip by dividing PLL0 down to 50 MHz, and driven out on
+    /// `ENET0_TX_CLK` to the PHY.
+    ///
+    /// Requires PLL0 to be running, which today means
+    /// [`crate::clocks::config::MainClock::Pll0At150m`] - 150 MHz divides by
+    /// exactly 3. A PLL0 frequency that is not an exact multiple of 50 MHz is
+    /// rejected rather than approximated: RMII has no tolerance to spare.
+    ///
+    /// On a board wired for an external reference this will fight the PHY, so
+    /// only select it if the reference genuinely flows MCU to PHY.
+    Pll0,
 }
 
 /// Ethernet driver configuration.
@@ -157,6 +226,19 @@ pub enum Error {
     /// [`crate::clocks::init`] has not run, so the CSR clock frequency needed
     /// to derive the MDIO divider is unknown.
     ClockNotConfigured,
+
+    /// The requested RMII reference clock could not be produced.
+    ClockSetup(crate::clocks::ClockError),
+
+    /// PLL0 is running at a frequency that cannot be divided to exactly
+    /// 50 MHz for RMII. Carries the PLL0 frequency in Hz.
+    RmiiRefClockNotDivisible(u32),
+}
+
+impl From<crate::clocks::ClockError> for Error {
+    fn from(e: crate::clocks::ClockError) -> Self {
+        Self::ClockSetup(e)
+    }
 }
 
 /// Trait for an Ethernet PHY.
@@ -208,6 +290,50 @@ pub(crate) fn dma_addr<T>(ptr: *const T) -> u32 {
     (ptr as u32) & !0x1000_0000
 }
 
+/// RMII always runs at 50 MHz - that is the standard, not a board choice.
+const RMII_REF_CLOCK_HZ: u32 = 50_000_000;
+
+/// Point `ENETRMIICLKSEL`/`ENETRMIICLKDIV` at the requested reference.
+fn configure_rmii_ref_clock(source: RmiiRefClock) -> Result<(), Error> {
+    use pac::syscon::{EnetrmiiclkdivHalt, EnetrmiiclkdivReset, EnetrmiiclkdivUnstab, EnetrmiiclkselSel};
+
+    let sel = pac::SYSCON0.enetrmiiclksel();
+
+    let divisor = match source {
+        RmiiRefClock::External => {
+            // "No clock" is what tells the RMII block to take its reference
+            // from the pad rather than from a SYSCON source.
+            sel.modify(|w| w.set_sel(EnetrmiiclkselSel::Enum0));
+            return Ok(());
+        }
+        RmiiRefClock::Pll0 => {
+            let pll0 = crate::clocks::with_clocks(|c| c.ensure_pll0_clk()).ok_or(Error::ClockNotConfigured)??;
+            if pll0 % RMII_REF_CLOCK_HZ != 0 {
+                return Err(Error::RmiiRefClockNotDivisible(pll0));
+            }
+            sel.modify(|w| w.set_sel(EnetrmiiclkselSel::Enum1));
+            pll0 / RMII_REF_CLOCK_HZ
+        }
+    };
+
+    // ENETRMIICLKDIV resets *halted*, like every other SYSCON divider - and a
+    // halted divider produces nothing at all, which downstream looks like a
+    // missing reference clock rather than a misconfigured one.
+    let div = pac::SYSCON0.enetrmiiclkdiv();
+    div.modify(|w| {
+        w.set_div((divisor - 1) as u8);
+        w.set_halt(EnetrmiiclkdivHalt::Halt);
+        w.set_reset(EnetrmiiclkdivReset::Asserted);
+    });
+    div.modify(|w| {
+        w.set_halt(EnetrmiiclkdivHalt::Run);
+        w.set_reset(EnetrmiiclkdivReset::Released);
+    });
+    while div.read().unstab() == EnetrmiiclkdivUnstab::Ongoing {}
+
+    Ok(())
+}
+
 /// Bring up only the MDIO interface, without starting the MAC.
 ///
 /// Useful for identifying a PHY during board bring-up: MDC is derived from the
@@ -242,6 +368,8 @@ pub struct Enet<'d, T: Instance, P: Phy> {
     phy: P,
     mac_addr: [u8; 6],
     link_state: LinkState,
+    #[cfg(feature = "ptp")]
+    ptp_clock_taken: bool,
 }
 
 impl<'d, T: Instance> Enet<'d, T, GenericPhy<Sma<T>>> {
@@ -270,7 +398,7 @@ impl<'d, T: Instance> Enet<'d, T, GenericPhy<Sma<T>>> {
     ) -> Result<Self, Error> {
         let csr_clk_hz = crate::clocks::with_clocks(|c| c.system_clk_hz).ok_or(Error::ClockNotConfigured)?;
 
-        Self::init_hardware(
+        Self::init_hardware_checked(
             config,
             &[
                 ref_clk.mux(),
@@ -283,7 +411,7 @@ impl<'d, T: Instance> Enet<'d, T, GenericPhy<Sma<T>>> {
                 mdio.mux(),
                 mdc.mux(),
             ],
-        );
+        )?;
 
         let phy = GenericPhy::new_auto(Sma::new(csr_clk_hz));
         Ok(Self::finish(queue, peri, irq, phy, mac_addr, config))
@@ -316,7 +444,7 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         // missing clock setup fails the same way on both constructors.
         crate::clocks::with_clocks(|c| c.system_clk_hz).ok_or(Error::ClockNotConfigured)?;
 
-        Self::init_hardware(
+        Self::init_hardware_checked(
             config,
             &[
                 ref_clk.mux(),
@@ -329,9 +457,96 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
                 mdio.mux(),
                 mdc.mux(),
             ],
-        );
+        )?;
 
         Ok(Self::finish(queue, peri, irq, phy, mac_addr, config))
+    }
+
+    /// Start the MAC's PTP (IEEE 1588) clock.
+    ///
+    /// Routes the PTP reference clock, programs the timestamp unit in
+    /// fine-update nanosecond-rollover mode, and zeroes the system time.
+    ///
+    /// # Panics
+    ///
+    /// If called more than once, or if this MAC has no timestamp unit.
+    #[cfg(feature = "ptp")]
+    pub fn start_ptp(&mut self, config: PtpClockConfig) -> PtpClock<T> {
+        assert!(!self.ptp_clock_taken, "PTP clock already started");
+
+        // The synthesised core may omit the timestamp unit entirely; fail
+        // loudly rather than silently producing zero timestamps.
+        assert!(
+            T::info().regs().mac_hw_feature0().read().tssel(),
+            "this ENET instance has no IEEE 1588 timestamp unit"
+        );
+
+        let clock = PtpClock::start(config);
+        self.ptp_clock_taken = true;
+        clock
+    }
+
+    /// Arm magic-packet (Wake-on-LAN) detection.
+    ///
+    /// Once armed, a frame carrying the standard magic pattern - six `0xFF`
+    /// bytes followed by this interface's MAC address sixteen times, anywhere
+    /// in the payload - latches `MGKPRCVD`. Observe it with
+    /// [`Enet::magic_packet_received`] or [`Enet::wait_for_wake`].
+    ///
+    /// Ordinary traffic keeps flowing while armed, and the MCU is not put into
+    /// any low-power state.
+    ///
+    /// # Why this is polled, not interrupt-driven
+    ///
+    /// Measured on MCXN947 silicon, contradicting what the register map
+    /// suggests:
+    ///
+    /// - Setting `MAC_INTERRUPT_ENABLE.PMTIE` **suppresses detection entirely**
+    ///   - `MGKPRCVD` then never latches. So this deliberately leaves it clear.
+    /// - `MAC_INTERRUPT_STATUS.PMTIS` never asserts and the `ETHERNET_PMT`
+    ///   vector never fires, with or without `PMTIE`.
+    ///
+    /// With `PMTIE` clear, detection is reliable. There is therefore no
+    /// interrupt to wait on, and [`Enet::wait_for_wake`] polls.
+    ///
+    /// Note also that NXP's SDK arms this together with `PWRDWN` (a MAC
+    /// power-down state that drops all ordinary traffic). That was measured to
+    /// stop detection working here, so `PWRDWN` is left clear.
+    pub fn enable_magic_packet_wake(&mut self) {
+        let regs = T::info().regs();
+
+        // Reading is what clears a previously latched event.
+        let _ = regs.mac_pmt_control_status().read();
+        regs.mac_pmt_control_status().modify(|w| w.set_mgkpkten(true));
+    }
+
+    /// Stop detecting magic packets.
+    pub fn disable_magic_packet_wake(&mut self) {
+        T::info()
+            .regs()
+            .mac_pmt_control_status()
+            .modify(|w| w.set_mgkpkten(false));
+    }
+
+    /// Check for a magic packet, consuming the event.
+    ///
+    /// `MGKPRCVD` is read-clear, so a `true` result is consumed by this call.
+    pub fn magic_packet_received(&mut self) -> bool {
+        T::info().regs().mac_pmt_control_status().read().mgkprcvd()
+    }
+
+    /// Wait for a magic packet, polling every `interval`.
+    ///
+    /// See [`Enet::enable_magic_packet_wake`] for why this polls rather than
+    /// waiting on an interrupt. Detection latches in hardware, so a packet
+    /// arriving between polls is not missed - only delayed by up to `interval`.
+    pub async fn wait_for_wake(&mut self, interval: embassy_time::Duration) {
+        loop {
+            if self.magic_packet_received() {
+                return;
+            }
+            embassy_time::Timer::after(interval).await;
+        }
     }
 
     /// Access the PHY.
@@ -345,14 +560,8 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
     }
 
     /// Clock, reset and configure the MAC, up to but not including starting it.
-    fn init_hardware(config: Config, _muxed_pins: &[()]) {
-        match config.rmii_ref_clock {
-            // Selecting "no clock" is what tells the RMII block to take its
-            // reference from the pad rather than from a SYSCON source.
-            RmiiRefClock::External => pac::SYSCON0
-                .enetrmiiclksel()
-                .modify(|w| w.set_sel(pac::syscon::EnetrmiiclkselSel::Enum0)),
-        }
+    fn init_hardware_checked(config: Config, _muxed_pins: &[()]) -> Result<(), Error> {
+        configure_rmii_ref_clock(config.rmii_ref_clock)?;
 
         // The PHY interface must be selected before the MAC leaves reset.
         pac::SYSCON0
@@ -420,6 +629,8 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
             w.set_rbsz_x_0(0);
             w.set_rbsz_13_y((RX_BUFFER_SIZE >> 2) as u16);
         });
+
+        Ok(())
     }
 
     fn finish<const TX: usize, const RX: usize>(
@@ -445,14 +656,31 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
             )
         });
 
+        #[cfg(feature = "ptp")]
+        let (tx_state, rx_state) = queue.packet_state.split();
+
         let mut this = Self {
             _peri: peri,
             _pins: PhantomData,
-            tx: TDesRing::new(regs, &mut queue.tx_desc, &mut queue.tx_buf),
-            rx: RDesRing::new(regs, &mut queue.rx_desc, &mut queue.rx_buf),
+            tx: TDesRing::new(
+                regs,
+                &mut queue.tx_desc,
+                &mut queue.tx_buf,
+                #[cfg(feature = "ptp")]
+                tx_state,
+            ),
+            rx: RDesRing::new(
+                regs,
+                &mut queue.rx_desc,
+                &mut queue.rx_buf,
+                #[cfg(feature = "ptp")]
+                rx_state,
+            ),
             phy,
             mac_addr,
             link_state: LinkState::Down,
+            #[cfg(feature = "ptp")]
+            ptp_clock_taken: false,
         };
 
         // Every descriptor write must be visible before the engines start.
@@ -530,6 +758,12 @@ impl<'d, T: Instance, P: Phy> embassy_net_driver::Driver for Enet<'d, T, P> {
     fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         WAKER.register(cx.waker());
 
+        // Reap egress timestamps for anything the DMA has finished with. This
+        // is the only place that happens, so it must run before the early
+        // return below.
+        #[cfg(feature = "ptp")]
+        self.tx.collect_completed();
+
         // Only hand out an RX token together with a TX token, so the stack can
         // always answer the packet it just received.
         // The token holds a raw pointer rather than a slice so the ring can be
@@ -589,6 +823,11 @@ pub struct RxToken<'a, 'd> {
 }
 
 impl<'a, 'd> embassy_net_driver::RxToken for RxToken<'a, 'd> {
+    #[cfg(feature = "ptp")]
+    fn meta(&self) -> embassy_net_driver::PacketMeta {
+        self.rx.meta()
+    }
+
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -607,6 +846,11 @@ pub struct TxToken<'a, 'd> {
 }
 
 impl<'a, 'd> embassy_net_driver::TxToken for TxToken<'a, 'd> {
+    #[cfg(feature = "ptp")]
+    fn set_meta(&mut self, meta: embassy_net_driver::PacketMeta) {
+        self.tx.set_meta(meta);
+    }
+
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -639,7 +883,7 @@ pub(crate) trait SealedInstance: Gate {
 /// ENET instance.
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
-    /// Interrupt for this instance.
+    /// Data-path interrupt for this instance.
     type Interrupt: typelevel::Interrupt;
 }
 
