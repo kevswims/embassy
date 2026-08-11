@@ -2,8 +2,8 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `03fb4910` (*mcxn: add FlexCAN driver (classic + CAN-FD, loopback
-verified)*).
+As of commit `9c31ea91` (*mcxn: add ENET PTP timestamping, magic-packet wake,
+and PLL0 RMII clock*).
 This document describes committed code only; work in progress in the working
 copy is not covered.
 
