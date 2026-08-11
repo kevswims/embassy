@@ -69,7 +69,7 @@ fn main() {
 /// 119, but a generator emits macro calls that only compile once the driver
 /// defining them lands. Adding a family here is the last step of implementing
 /// its pin traits, not the first.
-const PIN_FAMILIES: &[&str] = &["ctimer", "enet", "lpuart"];
+const PIN_FAMILIES: &[&str] = &["ctimer", "enet", "flexspi", "lpuart"];
 
 /// Pin-impl generators, keyed by the family name checked against
 /// [`PIN_FAMILIES`]. GPIO is absent because it is unconditional.
@@ -225,7 +225,7 @@ fn generate_instance_calls() -> TokenStream {
     // a name here without the matching macro breaks the build, so this list
     // grows as drivers land.
     const REQUIRES_INSTANCE: &[&str] = &[
-        "adc", "can", "crc", "ctimer", "enet", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt",
+        "adc", "can", "crc", "ctimer", "enet", "flexspi", "gpio", "lptmr", "lpuart", "rtc", "vref", "wwdt",
     ];
 
     let peripheral_regex = Regex::new(r"(^.*\D)(\d+)?").unwrap();
@@ -474,6 +474,10 @@ fn generate_spi_pin_impls() -> TokenStream {
 fn generate_flexspi_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
+    // Signals are named `<port>_<signal>`, where port is A or B and signal is
+    // one of DATA0-7, DQS, SCLK, SS0_b, SS1_b. Only the first two `_`-separated
+    // components are used, which drops the active-low suffix: `A_SS0_b` becomes
+    // port `A`, signal `Ss0`.
     let flexspi_regex = Regex::new(r"^FLEXSPI\d+").unwrap();
     for flexspi in METADATA.peripherals.iter().filter(|p| flexspi_regex.is_match(p.name)) {
         let flexspi_name = format_ident!("{}", flexspi.name);
@@ -485,11 +489,12 @@ fn generate_flexspi_pin_impls() -> TokenStream {
 
             for pin in signal.pins {
                 let pin_name = format_ident!("{}", pin.pin);
+                let mux = format_ident!("Mux{}", pin.alt);
                 let feature_gate = pin_feature_gate(pin.pin);
 
                 generated.extend(quote! {
                     #feature_gate
-                    crate::impl_flexspi_pin!(#pin_name, #flexspi_name, #port, #signal_name);
+                    crate::impl_flexspi_pin!(#pin_name, #flexspi_name, #mux, #port, #signal_name);
                 });
             }
         }

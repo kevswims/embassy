@@ -86,6 +86,8 @@ pub use functional::{
 pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
 #[cfg(mcxn_can)]
 pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
+#[cfg(mcxn_flexspi)]
+pub use functional::{FlexspiClockConfig, FlexspiClockSource};
 pub use config::{MainClock, PllDivConfig, PllDivSource, SoscConfig, SoscMode};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
 pub use types::{Clocks, ClockError};

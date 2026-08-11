@@ -30,6 +30,8 @@ pub mod ctimer;
 pub mod dma;
 #[cfg(mcxn_enet)]
 pub mod enet;
+#[cfg(mcxn_flexspi)]
+pub mod flexspi;
 pub mod gpio;
 #[cfg(mcxn_lptmr)]
 pub mod lptmr;

@@ -429,6 +429,33 @@ macro_rules! impl_can_functional_clock {
 impl_can_functional_clock!(0);
 impl_can_functional_clock!(1);
 
+// FlexSPI's serial root clock. The SYSCON accessors are spelled with an
+// underscore the other peripherals' are not - `flex_spiclksel`/`flex_spiclkdiv`
+// - and the divider field is only 3 bits wide, so the reachable range is /1../8.
+//
+// The mux has four real sources (RM "Chapter 33 Clocking", figure 136); PLL1 and
+// the USB PLL are absent here because this crate cannot bring either up. Its
+// reset state is `SEL = no clock` *and* `CLKDIV.HALT = 1`, and none of the board
+// clock presets change that, so unlike most peripherals FlexSPI arrives with no
+// functional clock at all - `enable_and_reset_with_clock` is what first routes
+// one.
+//
+// `fro_hf` follows `SCG0.FIRCCFG.RANGE`, so it delivers 144 MHz once the FIRC
+// range is raised; the divider has to bring the result back inside RM Table
+// 320's window (300/200/100 MHz for OD/SD/MD), which `crate::flexspi` range
+// checks rather than assuming.
+#[cfg(mcxn_flexspi)]
+impl_functional_clock! {
+    FLEXSPI0,
+    name: FlexspiClockSource / FlexspiClockConfig,
+    sel: crate::pac::SYSCON0.flex_spiclksel(), FlexSpiclkselSel,
+    div: full(crate::pac::SYSCON0.flex_spiclkdiv(), FlexSpiclkdiv, 3),
+    sources: {
+        Pll0  => Enum1 @ 1 : ensure_pll0_clk,
+        FroHf => Enum3 @ 3 : ensure_fro_hf,
+    }
+}
+
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
 // unlike the other two options it needs nothing from the VBAT power domain.

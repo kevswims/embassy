@@ -2,10 +2,10 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `9c31ea91` (*mcxn: add ENET PTP timestamping, magic-packet wake,
-and PLL0 RMII clock*).
-This document describes committed code only; work in progress in the working
-copy is not covered.
+As of commit `939bb471` (*mcxn: point DRIVERS.md at the ENET PTP commit*), plus
+the FlexSPI driver landing in this same change.
+This document otherwise describes committed code only; other work in progress in
+the working copy is not covered.
 
 ## Scope
 
@@ -33,6 +33,7 @@ copy is not covered.
 | eDMA | DMA0, DMA1 (16 ch each) | async + blocking wait | n/a | `dma_mem_to_mem.rs`, `dma_ctimer.rs` |
 | LPUART (LP_FLEXCOMM) | LPUART0–9 | async | yes (TX, RX, ring RX) | `uart_loopback.rs`, `uart_dma_loopback.rs`, `uart_ring_rx.rs` |
 | FlexCAN | CAN0, CAN1 | async | no | `can_loopback.rs` |
+| FlexSPI (serial NOR) | FLEXSPI0 | async + blocking | yes (mem-to-mem to the IP FIFOs) | `flexspi_quad_*.rs`, `flexspi_soak.rs`, `flexspi_stress.rs`, `flexspi_cancel_soak.rs` |
 | ENET (Ethernet MAC) | ENET0 | `embassy-net-driver` | own descriptor DMA | `eth.rs`, `eth_loopback.rs`, `eth_ptp_clock.rs` |
 | USB HS (device) | USBHS1 | `embassy-usb-driver` | own descriptor DMA | `usb_bulk_loopback.rs` |
 | LPADC | ADC0, ADC1 | async | no | `adc.rs`, `adc_vref_buffered.rs` |
@@ -301,6 +302,119 @@ part, and that the driver depends on:
   peripheral base rather than PAC fieldsets.
 - Module handshakes (low-power, soft reset, freeze) spin up to
   `HANDSHAKE_SPINS = 1_000_000` and then return `Error::Timeout`.
+
+---
+
+## FlexSPI (serial NOR) — `src/flexspi/`
+
+FLEXSPI0, driving a single external serial NOR flash on either port. `Flexspi`
+comes in three flavours — `new_blocking`, `new_async` (peripheral interrupt) and
+`new_with_dma` (two eDMA channels) — and `NorFlash` wraps it with
+`blocking_vendor_id` / `blocking_erase_sector` / `blocking_read` /
+`blocking_page_program` plus `*_async` twins. Everything device-specific lives in
+a caller-supplied `FlashConfig`: geometry, busy-bit position and polarity, and a
+`const`-built 16-sequence `LookupTable` (`src/flexspi/lookup.rs`) that the
+constructor uploads once behind the `LUTKEY`/`LUTCR` lock. `Command` names the
+canonical NXP sequence indices, so a LUT written against the SDK's
+`NOR_CMD_LUT_SEQ_IDX_*` transfers directly.
+
+Bring-up follows the order NXP's own driver uses rather than RM 10.5's: leave stop
+mode, software reset, write `MCR0` with `MDIS` set, configure `AHBCR`, the device
+slot's `FLSHxyCR0`/`CR1`/`CR2`, `FLSHCR4` and `DLLxCR`, then clear `MDIS` and load
+the LUT (which is inaccessible while `MDIS` is set). `MCR0.RXCLKSRC` is fixed at
+loopback-from-DQS-pad, which pins the delay line to a fixed one-cell override
+independent of the serial clock and removes any DLL lock polling — at the price of
+requiring the DQS pad be muxed even though a quad NOR has no DQS signal. IP
+commands clear `FLSHCR2.CLRINSTRPTR` and both FIFOs, then poll or wait on
+`INTR.IPCMDDONE`; `STS1.IPCMDERRCODE` is surfaced as `IoError::Command`.
+
+Reads are split into 128-byte chunks — the `RFDR` window — and drained after the
+command completes rather than streamed against the watermark. Programs stream
+against `INTR.IPTXWE`. Erase and program invalidate both layers of cached flash
+contents (the controller's AHB prefetch buffers and CACHE64) so a subsequent
+memory-mapped read sees the new data. The AHB window is exposed as a pointer via
+`memory_mapped_ptr()` rather than an `enable`/`disable` pair, because the AHB read
+path is configured at construction and is simply always live.
+
+Pin traits are generated for every FlexSPI signal in the PAC metadata — `DATA0`
+through `DATA7`, `DQS`, `SCLK`, `SS0_b`, `SS1_b` on both port A (`PORT3`) and port
+B (`PORT2`), all ALT 8. `SsPin::CHIP_INDEX` maps a chip-select pad to one of the
+four device slots, ordered A1, A2, B1, B2 — the order the `FLSHCR1`/`FLSHCR2`
+register arrays are indexed in, so a slot's port is `CHIP_INDEX >> 1`. `mux()` applies
+NXP's board settings: fast slew, low drive, input buffer enabled, pull disabled —
+except `DATA2`/`DATA3`, which get a pull-up because they double as the flash's
+`/WP` and `/HOLD` in single-pad framing.
+
+Verified on the FRDM-MCXN947 against its on-board W25Q64: JEDEC ID `0xef`, and
+erase / program / read-back through all three transports, including odd and
+unaligned read lengths, cross-page and cross-sector reads, partial-page programs,
+selective erase, and memory-mapped read-back. `flexspi_stress.rs` passes all
+three phases; `flexspi_soak.rs` ran 448 rounds (1792 erases, 3.5 MiB written,
+7.8 MiB read) with no mismatch and no stale memory-mapped read;
+`flexspi_cancel_soak.rs` survived 4602 cancellations (2832 dropped in flight,
+3540 software-reset recoveries). All of that was at a ~48 MHz serial root clock
+from `fro_hf` on device slot A1.
+
+**Limitations**
+
+- **One flash device at a time.** `chip_index` comes from the chip-select pin, and
+  only slot 0 (`A_SS0_b`) is tested; the constructor `defmt::warn!`s on any other.
+  Nothing programs the other slots' `FLSHxyCR0`, so their sizes stay 0.
+- **Only the port-A quad path is exercised on hardware.** Octal (`DATA4`-`DATA7`)
+  and port B have pin traits and device slots but no example and no test.
+- **Only ~48 MHz has been run.** The examples drive FlexSPI from `fro_hf`; nothing
+  has been measured at the 75 MHz the board's own boot configuration uses, let
+  alone at the RM's ceilings.
+- **No dual/octal or DDR configuration surface.** The LUT can express all of it —
+  `lookup::opcodes::ddr`, `Pads::Two`/`Eight` — but nothing in the driver
+  configures `MCR2.SCKBDIFFOPT`, `MCR0.COMBINATIONEN`, data learning
+  (`MCR0.LEARNEN`, `DLPR`) or `FLSHCR4`'s write-mask modes.
+- **`MCR0.RXCLKSRC` is not configurable.** An externally strobed read
+  (`RXCLKSRC = 3`) would need the frequency-dependent DLL — `DLLCR.DLLEN` with
+  `SLVDLYTARGET`/`REFPHASEGAP`, a `STS2` lock wait and ERR011377's settle delay —
+  none of which is implemented. Consequently `DqsPin` is mandatory even for a
+  device without a DQS pin.
+- **Reads are capped at 128 bytes per IP command** (`IP_FIFO_CAPACITY_BYTES`) and
+  split above that. Both IP FIFOs are actually 1024 bytes; using the rest would
+  mean streaming against `IPRXFCR.RXWMRK` instead of draining the register window.
+- **Page programs must be 8-byte aligned** in both address and length, and must
+  not cross a page — otherwise `IoError::Misaligned`. The IP write path corrupts
+  the byte before a non-8-aligned start address.
+- **`page_size` is capped at 256** (`MAX_PAGE_SIZE`); the DMA path stages a page
+  in a stack buffer of that size.
+- **The DMA path is memory-to-memory, not request-paced.** Both channels copy
+  between RAM and the FIFO register windows while the driver waits on the
+  watermark interrupt. `FLEXSPI0Rx`/`FLEXSPI0Tx` and
+  `IPRXFCR.RXDMAEN`/`IPTXFCR.TXDMAEN` are unused, so a transfer still takes an
+  interrupt per watermark. Sub-word reads and non-8-byte-multiple writes fall back
+  to the CPU.
+- **`FLSHCR1` timing is hardcoded** to `TCSS`/`TCSH` = 3 and `CSINTERVAL` = 2,
+  with `CAS` = 0 and `WA` clear — NXP's values for this board. A device needing
+  different chip-select timing, a column address, or word addressing has no way to
+  ask for it.
+- **No `embedded-storage` implementation, deliberately.** `ERASE_SIZE`,
+  `WRITE_SIZE` and `capacity()` are associated constants of the attached device,
+  which this driver only learns at runtime from `FlashConfig`. Implement
+  `ReadNorFlash`/`NorFlash` in board or application code, where the device is
+  known at compile time. The `embedded-storage` dependency remains unused by the
+  crate.
+- **The serial root clock ceiling is only half-checked.** `Flexspi::new_*` rejects
+  above `SERIAL_ROOT_CLOCK_MAX_HZ` = 200 MHz (RM Table 320's normal-drive limit)
+  with `SetupError::ClockOutOfRange`, but overdrive allows 300 MHz and **mid drive
+  only 100 MHz**, and the driver does not read the SPC power mode to tell which
+  applies. A mid-drive caller must size the divider itself. RM Table 79's
+  `hclk > ¼ × serial root clock` requirement is likewise unchecked.
+- **PLL0 as the FlexSPI source drags the whole core with it.** The mux offers
+  PLL0, `fro_hf`, PLL1 and the USB PLL; only PLL0 and `fro_hf` have `Clocks`
+  accessors, and PLL0 only comes up as a side effect of
+  `ClocksConfig::main_clk = Pll0At150m`, which also moves the core to 150 MHz and
+  raises the core rail. The examples therefore run FlexSPI from `fro_hf`, not at
+  the 75 MHz-from-PLL0 the board's own boot configuration uses.
+- **No `Drop`.** Dropping a `Flexspi` leaves the clock gate on, the pads muxed and
+  the LUT loaded.
+- **XIP is out of scope.** Nothing here is `#[link_section]`-placed into RAM, so
+  none of it is safe to call while executing from the FlexSPI window; there is no
+  flash configuration block, and `examples/mcxn947/memory.x` has no window region.
 
 ---
 
@@ -797,7 +911,7 @@ predicates and an `IntoIterator` over `ResetReason`.
 
 ## Unverified / hazardous hardware paths
 
-Five known-bad or known-unverified behaviours are load-bearing in the current
+Eight known-bad or known-unverified behaviours are load-bearing in the current
 design. They are the reason several APIs look the way they do.
 
 0. **Raising the core rail needs three things done right, or the part resets —
@@ -874,13 +988,56 @@ design. They are the reason several APIs look the way they do.
    (`Error::ClockOutOfRange`). Any mux gaining a `fro_hf` option must do the
    same.
 
+5. **A debugger can trigger a spurious FlexSPI AHB write —
+   `src/flexspi/lookup.rs:48`, `src/flexspi/mod.rs:728`.**
+   The boot ROM leaves `FLSHCR2.AWRSEQID` pointing at LUT sequence 9 without
+   filling that sequence in. NXP's board support notes that a debugger attaching
+   and setting a software breakpoint in FlexSPI-mapped flash then triggers an AHB
+   write command against whatever sequence 9 holds: a **hung AHB bus** if it is a
+   read, or a program to an arbitrary address if it is a write. The driver
+   therefore keeps sequence 9 as `STOP` and pins `AWRSEQID` there rather than at
+   the page-program sequence, which also means `lookup::Command::PageProgram` is
+   **10, not the 9 the NXP sequence numbering would give it**. A `FlashConfig`
+   that writes over slot 9 via `custom_command` reintroduces the hazard.
+
+6. **Flash contents are cached twice, and neither layer notices an IP write —
+   `src/flexspi/mod.rs:1134`.**
+   The controller prefetches flash into its own AHB receive buffers, and CACHE64
+   caches the memory-mapped window on top of that. An erase or program issued
+   over the IP path bypasses both, so a memory-mapped read afterwards returns
+   **pre-write data with no error anywhere** — the classic form being a sector
+   that reads back correctly through `blocking_read` and stale through the
+   window. `invalidate_memory_mapped` clears the controller's buffers first (so a
+   cache refill cannot repopulate from a stale prefetch) and then invalidates both
+   CACHE64 ways. `MCR2.CLRAHBBUFOPT` does **not** help: it only clears the buffers
+   on return from Stop mode. The sibling `embassy-mcxa` driver has no equivalent
+   invalidation, and its memory-mapped example only avoids the problem by
+   programming before it ever reads the window.
+
+   Confirmed on hardware: `flexspi_soak.rs` reads the window, erases and
+   reprograms, then reads it again every round, and its `stale_mmap` counter
+   stayed 0 across 448 rounds / 1792 erases.
+
+7. **`AHBCR.AFLASHBASE` must stay 0, and the window is read through
+   `0x9000_0000` — `src/flexspi/mod.rs:696`.**
+   The bus matrix presents the controller a window-relative offset, so there is no
+   base to subtract; a non-zero `AFLASHBASE` folds high bits into the flash
+   address until it exceeds `FLSHSZ` and bus-faults every memory-mapped access.
+   MCXN947 has **six aliases** of the window (`0x0800_0000`, `0x1800_0000`,
+   `0x8000_0000`, `0x9000_0000`, `0xA000_0000`, `0xB000_0000`), of which CACHE64
+   covers the `0x8000_0000`/`0x9000_0000` pair; `memory_mapped_ptr()` hands out the
+   Secure alias of that pair, matching the Secure aliases this crate links through.
+   Verified on hardware with `AFLASHBASE = 0`
+   (`flexspi_quad_memory_mapped.rs`, 4096 bytes through `0x9040_0000`). **The other
+   four aliases are untested.**
+
 ---
 
 ## Not implemented at all
 
 Peripherals present in the PAC with **no driver**:
 
-- **Serial / connectivity:** LPSPI0–9, LPI2C0–9, I3C0/1, FLEXIO0, FLEXSPI0,
+- **Serial / connectivity:** LPSPI0–9, LPI2C0–9, I3C0/1, FLEXIO0,
   USBFS0 / USBDCD0 / USBHS1_PHY_DCD, SAI0/1, PDM (MICFIL), USDHC0,
   EMVSIM0/1. (USBHS1 and USBPHY are driven in device mode — see the USB HS
   section.)
@@ -888,17 +1045,20 @@ Peripherals present in the PAC with **no driver**:
   UTICK0, FREQME0.
 - **Analog:** DAC0/1/2, OPAMP0–2, CMP0–2, SINC0, TSI0.
 - **Security / crypto:** TRNG, PKC0, ELS, PUF, ITRC0, GDET, TDET0, CDOG0/1.
-- **System / other:** FMU0 — **there is no flash driver**, despite the
-  `embedded-storage` dependency being present; SMARTDMA0, POWERQUAD, TRDC,
-  PINT0, WUU0, CACHE64, EWM0,
+- **System / other:** FMU0 — **there is no *internal* flash driver**, despite the
+  `embedded-storage` dependency being present (external serial NOR is covered by
+  FlexSPI, which also does not implement `embedded-storage` — see that section);
+  SMARTDMA0, POWERQUAD, TRDC, PINT0, WUU0, EWM0,
   SEMA42_0, MAILBOX, PLU0, NPX0, OTPC0, MPU/SAU.
+- **CACHE64 has no driver**, but `src/flexspi/mod.rs` reaches into
+  `CACHE64_CTRL0.CCR` to invalidate both ways after an erase or program. Nothing
+  else configures the cache, and `POLSEL0` is untouched.
 - **No `cm33_core1` (second core) support.**
 
-Note that ADC, FlexCAN, SPI, I2C, I3C and FlexSPI also have **no pin traits**,
-because
-`build.rs`'s `PIN_FAMILIES` is limited to `["ctimer", "enet", "lpuart"]` — the pin-mux
-metadata is present for every peripheral, but the generators stay off until a
-driver exists to define the macros they call.
+Note that ADC, FlexCAN, SPI, I2C and I3C also have **no pin traits**, because
+`build.rs`'s `PIN_FAMILIES` is limited to `["ctimer", "enet", "flexspi",
+"lpuart"]` — the pin-mux metadata is present for every peripheral, but the
+generators stay off until a driver exists to define the macros they call.
 
 ---
 
@@ -976,6 +1136,14 @@ than refusing to build or returning an error.
       high and never clear it; the rest are assumed-but-unverified to poll
       correctly. (`src/clocks/functional.rs:112`)
 - [ ] Verify `Vref::set_trim_2v1` against a meter on `VREF_OUT`. (`src/vref.rs`)
+- [ ] Measure whether the FlexSPI serial root clock can actually run at NXP's
+      75 MHz here, and above. Reaching 75 MHz needs PLL0, which this HAL only
+      starts as a side effect of `main_clk = Pll0At150m`; every FlexSPI example
+      settles for `fro_hf`, so **only ~48 MHz has been run on hardware**.
+- [ ] Exercise a FlexSPI device on port B or on an `SS1_b` slot. The slot
+      ordering (`SsPin::CHIP_INDEX`, A1/A2/B1/B2) is taken from the SVD's
+      `dimIndex` for the `FLSHCR1`/`FLSHCR2` arrays and is **not** what
+      `embassy-mcxa` uses; only slot 0 has been run.
 
 ### Documentation
 
@@ -998,6 +1166,16 @@ than refusing to build or returning an error.
       then bus-off and error-state reporting, more than one TX/RX message
       buffer, the RX FIFO and its filter table, per-buffer masks, and
       `embedded-can` impls.
+- [ ] **FlexSPI** — configurable `MCR0.RXCLKSRC` (which also means implementing
+      the frequency-dependent DLL and letting `DqsPin` go away for devices that
+      have no DQS); more than one flash device at a time; dual/octal and DDR
+      wiring beyond what the LUT alone expresses; configurable `FLSHCR1`
+      chip-select timing instead of NXP's hardcoded values; request-paced DMA via
+      `IPRXFCR.RXDMAEN`/`IPTXFCR.TXDMAEN` rather than memory-to-memory copies;
+      reads longer than the 128-byte register window, by streaming against the
+      RX watermark; a `Drop` that releases the clock gate; and XIP support (a
+      flash configuration block, RAM-placed functions, a `memory.x` window
+      region).
 - [ ] **CTIMER** — a prescaler API (currently pinned to 0), plain
       interrupt-on-match / one-shot timing, and center-aligned or dual-edge PWM.
 - [ ] **LPTMR** — periodic/free-running mode and the pulse-counter mode.
@@ -1051,6 +1229,13 @@ These are the only executable coverage the crate has. They use `defmt-rtt` and
 | `uart_dma_loopback.rs` | LPUART DMA TX/RX |
 | `uart_ring_rx.rs` | `RingBufferedUartRx` |
 | `can_loopback.rs` | FlexCAN classic + FD frames in internal loopback |
+| `flexspi_quad_polling.rs` | FlexSPI blocking erase/program/verify against the on-board W25Q64 |
+| `flexspi_quad_interrupt.rs` | the same self-test through the async (peripheral interrupt) path |
+| `flexspi_quad_dma.rs` | the same self-test with payloads moved by two eDMA channels |
+| `flexspi_quad_memory_mapped.rs` | IP-programs a sector, reads it back through the AHB window — the cache-invalidation test |
+| `flexspi_stress.rs` | the same corner-case matrix through all three transports, rebuilding the driver between phases |
+| `flexspi_soak.rs` | long-run blocking + AHB torture over a rotating sector window, with a never-erased canary |
+| `flexspi_cancel_soak.rs` | drops async/DMA futures mid-flight at a sweep of delays to prove cancel-safety |
 | `eth.rs` | ENET0 + `embassy-net`, DHCP then a TCP client |
 | `eth_loopback.rs` | ENET0 datapath self-test via `MAC_CONFIGURATION.LM`, no cable needed |
 | `eth_mac_init.rs` | ENET0 bring-up: MAC/MTL/DMA state dump, no network stack |
