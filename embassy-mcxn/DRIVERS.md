@@ -2,10 +2,9 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `939bb471` (*mcxn: point DRIVERS.md at the ENET PTP commit*), plus
-the FlexSPI driver landing in this same change.
-This document otherwise describes committed code only; other work in progress in
-the working copy is not covered.
+As of commit `46f3e50a` (*mcxn: add FlexSPI serial NOR driver*).
+This document describes committed code only; work in progress in the working
+copy is not covered.
 
 ## Scope
 
