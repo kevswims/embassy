@@ -34,7 +34,7 @@
 
 use crate::pac;
 use crate::pac::spc::{
-    ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, ActiveCfgDcdcVddDs, ActiveCfgDcdcVddLvl, Ack, Busy, Req, Vsm,
+    Ack, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, ActiveCfgDcdcVddDs, ActiveCfgDcdcVddLvl, Busy, Req, Vsm,
 };
 
 /// Bounded spin, matching the convention in `clocks::source` and `adc`. These
@@ -350,6 +350,69 @@ fn wait_not_busy() -> Result<(), PowerError> {
     Ok(())
 }
 
+/// Stop the VDD_CORE analog glitch detector from resetting the chip.
+///
+/// **This is what makes raising the core rail survivable.** Re-trimming the
+/// regulator puts a fast transient on `VDD_CORE`; the analog glitch detector
+/// (aGDET) sees it, and on this part that event is wired through the ITRC to
+/// `CHIP_RESET`. The board reboots partway through the transition, in a loop if
+/// it happens at boot.
+///
+/// It is *not* the low/high-voltage detectors. Those live in `VD_STAT`, which
+/// stays `0x0000_0000` across the whole transition, and the reset reason
+/// (`CMC0.SRS`) never reports `VoltageDetect` - which is why muting `ACTIVE_CFG`'s
+/// `*_LVDE`/`*_HVDE` bits does not help. The glitch detector is a *tamper* path,
+/// not a brown-out path.
+///
+/// NXP disable it unconditionally in `SystemInit`, before `main`, in every
+/// application for this part - `system_MCXN947_cm33_core0.c` under the comment
+/// "Disable aGDET interrupt and reset". `cortex-m-rt`'s startup does not, which
+/// is the entire difference between their 150 MHz bring-up working and ours
+/// resetting.
+///
+/// `GLITCH_DETECT_SC[LOCK]` protects `[RE]`, so the write is unlock, clear, lock.
+/// `0x3C` is NXP's value: maximum timeout, reset and interrupt both disabled,
+/// flag cleared.
+///
+/// # This disables a security feature
+///
+/// Glitch detection is anti-tamper. Leaving it armed is not an option on this
+/// part if the core voltage is ever changed, and NXP ship it disabled - but a
+/// product relying on glitch detection needs to know it is off. It is left
+/// disabled afterwards, as NXP leave it.
+///
+/// All three parts of NXP's block are required - disabling only the SPC analog
+/// detector was measured to still reset the chip, because the ITRC routes both
+/// the analog and the digital (`GDET0`/`GDET1`) detectors to `CHIP_RESET`.
+pub fn disable_core_glitch_detect() {
+    pac::SPC0.active_cfg().modify(|w| w.set_glitch_detect_disable(true));
+
+    let sc = pac::SPC0.glitch_detect_sc();
+    sc.modify(|w| w.set_lock(false));
+    sc.write(|w| {
+        w.set_timeout(0xF);
+        w.set_re(false);
+        w.set_ie(false);
+    });
+    sc.modify(|w| w.set_lock(true));
+
+    // Disabling the SPC detector alone is not sufficient - measured: the rail
+    // raise still reset the chip. The event reaches `CHIP_RESET` through the
+    // ITRC, and the *digital* detectors (`GDET0`/`GDET1`) feed the same path, so
+    // all three have to be dealt with. `OUT_SEL[4][0..1]` is the CHIP_RESET
+    // response; input 9 is aGDET and input 0 is dGDET, and selector `0b10`
+    // detaches them from it.
+    for m in 0..2 {
+        pac::ITRC0.ou_tx_sel(4).out_sel(m).modify(|w| {
+            w.set_in9_se_ln(0b10);
+            w.set_in0_se_ln(0b10);
+        });
+    }
+
+    pac::GDET0.gdet_enable1().write_value(pac::gdet::GdetEnable1(0));
+    pac::GDET1.gdet_enable1().write_value(pac::gdet::GdetEnable1(0));
+}
+
 /// Raise the active-mode core rail to `cfg`.
 ///
 /// Programs whichever of DCDC and LDO_CORE is enabled — NXP's board code
@@ -393,6 +456,10 @@ pub fn set_active_mode(cfg: &ActiveModeConfig) -> Result<(), PowerError> {
     {
         return Err(PowerError::LowDriveStrengthWithVoltageDetect);
     }
+
+    // Before any level moves: the transient this creates would otherwise reset
+    // the chip through the glitch detector. See `disable_core_glitch_detect`.
+    disable_core_glitch_detect();
 
     // A transition already in flight would make every read below stale.
     wait_not_busy()?;
@@ -508,7 +575,6 @@ fn raise_levels(
     }
 
     if coreldo_en {
-
         // Only now is the requested drive strength safe to apply.
         pac::SPC0
             .active_cfg()
