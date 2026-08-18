@@ -1254,6 +1254,17 @@ than refusing to build or returning an error.
 These are the only executable coverage the crate has. They use `defmt-rtt` and
 `panic-probe`.
 
+`dap_probe.rs` must be built `--release`. Its SWD engine is a software loop, so
+`opt-level = 0` does not make it slower, it makes it a different probe: measured
+1186 core cycles per bit unoptimised against 10 optimised, which is 40 kHz
+against 4.8 MHz SWCLK at a 48 MHz core. Nothing fails, so the only symptom is a
+probe that works and is 100x slower than it should be. The example logs the
+measured floor at startup for exactly this reason.
+
+Once `dap_probe.rs` is running, the board presents a *second* CMSIS-DAP probe to
+the host and `cargo run` stops being able to pick one. Flash with an explicit
+`--probe 1fc9:0143` (MCU-LINK's VID:PID) from then on.
+
 | Example | Exercises |
 | --- | --- |
 | `hello.rs` | minimal `init` + defmt |
@@ -1280,6 +1291,7 @@ These are the only executable coverage the crate has. They use `defmt-rtt` and
 | `flexspi_soak.rs` | long-run blocking + AHB torture over a rotating sector window, with a never-erased canary |
 | `flexspi_cancel_soak.rs` | drops async/DMA futures mid-flight at a sweep of delays to prove cancel-safety |
 | `swd_dpidr.rs` | bit-banged SWD host: reads a target's `DPIDR` and sweeps the achievable SWCLK. Debug-probe groundwork, not a HAL driver |
+| `dap_probe.rs` | a working CMSIS-DAP v2 debug probe: bit-banged SWD over USB HS, driven by probe-rs. Shares `src/swd.rs` (wire engine behind a `SwdBus` trait) and `src/dap.rs` (command dispatcher). Not a HAL driver |
 | `spc_probe.rs` | diagnostic: `set_active_mode` unrolled with a flushed log per register write, to find what wedges the 144/150 MHz paths |
 | `clk150_probe.rs` | diagnostic: calls `clocks::init(Pll0At150m)` from a bare `cortex_m_rt::entry` so the error `hal::init` unwraps is visible |
 | `clk150_steps.rs` | diagnostic: the 150 MHz bring-up replicated inline, one flushed log per register write. Pins the failure to the SPC rail raise |
