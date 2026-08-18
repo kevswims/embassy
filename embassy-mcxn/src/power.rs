@@ -430,13 +430,7 @@ pub fn disable_core_glitch_detect() {
 /// ISP-button recovery — see `DRIVERS.md`'s hazards section. Every NXP
 /// `BOARD_BootClock*` parks on FRO12M before touching the rails, and the
 /// current the core draws is the reason: a lighter load makes the regulator's
-/// transient small enough not to trip the voltage detectors, which are all
-/// armed at reset.
-///
-/// # Steps one level at a time
-///
-/// Mid -> Normal -> Over, waiting for `SC[BUSY]` at each step, rather than
-/// jumping two levels in one write. Each step is a smaller transient.
+/// transient smaller.
 ///
 /// # Never lowers
 ///
@@ -464,122 +458,69 @@ pub fn set_active_mode(cfg: &ActiveModeConfig) -> Result<(), PowerError> {
     // A transition already in flight would make every read below stale.
     wait_not_busy()?;
 
-    // Mute the voltage detectors across the transition.
-    //
-    // Re-trimming the regulator makes `VDD_CORE` dip briefly, and on this part
-    // `VD_CORE_CFG[LVDRE]` is set *and* `[LOCK]`ed at reset, so a core LVD
-    // event is wired straight to a hardware reset that cannot be disarmed. The
-    // observable symptom of leaving them armed is the part rebooting partway
-    // through this function - a reset loop if this runs at boot.
-    //
-    // The detect *enables* live in `ACTIVE_CFG` and are not locked, which is
-    // the way out, and is what NXP's own board code does around power-mode
-    // changes (`SPC_EnableActiveModeCoreLowVoltageDetect(.., false)` and
-    // friends in `host_sleep.c`). Whatever was enabled is restored afterwards.
-    let saved = pac::SPC0.active_cfg().read();
-    pac::SPC0.active_cfg().modify(|w| {
-        w.set_core_lvde(false);
-        w.set_sys_lvde(false);
-        w.set_io_lvde(false);
-        w.set_core_hvde(false);
-        w.set_sys_hvde(false);
-        w.set_io_hvde(false);
-    });
-    wait_not_busy()?;
-
-    let result = raise_levels(cfg, &status, cntrl.dcdc_en(), cntrl.coreldo_en());
-
-    // Discard anything the detectors latched while muted, so restoring the
-    // enables below does not immediately trip on a stale flag. `VD_STAT` is
-    // write-1-to-clear.
-    let flags = pac::SPC0.vd_stat().read();
-    pac::SPC0.vd_stat().write_value(flags);
-
-    pac::SPC0.active_cfg().modify(|w| {
-        w.set_core_lvde(saved.core_lvde());
-        w.set_sys_lvde(saved.sys_lvde());
-        w.set_io_lvde(saved.io_lvde());
-        w.set_core_hvde(saved.core_hvde());
-        w.set_sys_hvde(saved.sys_hvde());
-        w.set_io_hvde(saved.io_hvde());
-    });
-
-    result
+    // The LVD/HVD detectors are deliberately left armed across the transition.
+    // They are not what resets the part here: `VD_STAT` reads 0x00000000
+    // throughout and `CMC0.SRS` never reports `VoltageDetect`. Muting them
+    // would only widen the window in which a genuine brown-out goes unnoticed.
+    raise_levels(cfg, &status, cntrl.dcdc_en(), cntrl.coreldo_en())
 }
 
-/// The level walk itself, factored out so the detectors are restored on both
-/// the success and error paths.
+/// The rail writes themselves — one per regulator, straight to the target.
+///
+/// This is the shape `SPC_SetActiveModeDCDCRegulatorConfig` and
+/// `SPC_SetActiveModeCoreLDORegulatorConfig` have: set the level, wait for
+/// `SC[BUSY]` to clear, done. DCDC first, matching `BOARD_BootClockPLL150M`.
+///
+/// No intermediate levels, and no requirement that the two regulators stay in
+/// step with each other on the way up. Both were tried while the reset this
+/// function used to provoke was still being blamed on the rail, and neither is
+/// what fixed it — see [`disable_core_glitch_detect`].
 fn raise_levels(
     cfg: &ActiveModeConfig,
     status: &ActiveModeStatus,
     dcdc_en: bool,
     coreldo_en: bool,
 ) -> Result<(), PowerError> {
-    // An absent (reserved) read is treated as the lowest level: stepping up
-    // from there lands on a defined encoding, which beats leaving the rail on
-    // one the RM does not define.
-    let start = |current: Option<CoreVoltage>| current.unwrap_or(CoreVoltage::Mid);
+    // An absent (reserved) read is treated as the lowest level, so the write
+    // below lands on a defined encoding rather than leaving the rail on one the
+    // RM does not define. `max` is what makes this never lower the rail.
+    let target = |current: Option<CoreVoltage>| current.unwrap_or(CoreVoltage::Mid).max(cfg.core_voltage);
 
     if dcdc_en {
-        // Drive strength first, and never `Low` alongside an overdrive level.
-        pac::SPC0
-            .active_cfg()
-            .modify(|w| w.set_dcdc_vdd_ds(dcdc_ds(cfg.dcdc_drive_strength)));
+        let level = target(status.dcdc_voltage);
+        pac::SPC0.active_cfg().modify(|w| {
+            w.set_dcdc_vdd_lvl(match level {
+                CoreVoltage::Mid => ActiveCfgDcdcVddLvl::Dcdc01,
+                CoreVoltage::Normal => ActiveCfgDcdcVddLvl::Dcdc10,
+                CoreVoltage::Over => ActiveCfgDcdcVddLvl::Dcdc11,
+            });
+            w.set_dcdc_vdd_ds(dcdc_ds(cfg.dcdc_drive_strength));
+        });
         wait_not_busy()?;
     }
 
     if coreldo_en {
         // RM §37.7.8: the level can only be changed at normal drive strength,
         // and 1.2 V is not supported at low drive at all. `fsl_spc.c` forces
-        // this unconditionally before touching the level.
-        pac::SPC0
-            .active_cfg()
-            .modify(|w| w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Normal));
-        wait_not_busy()?;
-    }
-
-    // Walk both regulators up together, one level per round.
-    //
-    // They must stay within one level of each other. Taking DCDC all the way to
-    // 1.2 V while LDO_CORE still reads 1.0 V resets the part - the two are
-    // driving the same rail, and a two-level disagreement between them is not
-    // survivable. Observed directly: interleaving the steps is what turned this
-    // sequence from a reset loop into a clean transition.
-    let mut dcdc_level = start(status.dcdc_voltage);
-    let mut ldo_level = start(status.core_ldo_voltage);
-
-    while (dcdc_en && dcdc_level < cfg.core_voltage) || (coreldo_en && ldo_level < cfg.core_voltage) {
-        if dcdc_en && dcdc_level < cfg.core_voltage {
-            dcdc_level = step_up(dcdc_level);
-            pac::SPC0.active_cfg().modify(|w| {
-                w.set_dcdc_vdd_lvl(match dcdc_level {
-                    CoreVoltage::Mid => ActiveCfgDcdcVddLvl::Dcdc01,
-                    CoreVoltage::Normal => ActiveCfgDcdcVddLvl::Dcdc10,
-                    CoreVoltage::Over => ActiveCfgDcdcVddLvl::Dcdc11,
-                })
+        // normal before touching the level, so the level write carries it.
+        let level = target(status.core_ldo_voltage);
+        pac::SPC0.active_cfg().modify(|w| {
+            w.set_coreldo_vdd_lvl(match level {
+                CoreVoltage::Mid => ActiveCfgCoreldoVddLvl::Mid,
+                CoreVoltage::Normal => ActiveCfgCoreldoVddLvl::Normal,
+                CoreVoltage::Over => ActiveCfgCoreldoVddLvl::Over,
             });
+            w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Normal);
+        });
+        wait_not_busy()?;
+
+        // Only now is a weaker requested drive strength safe to apply.
+        if cfg.core_drive_strength != DriveStrength::Normal {
+            pac::SPC0
+                .active_cfg()
+                .modify(|w| w.set_coreldo_vdd_ds(coreldo_ds(cfg.core_drive_strength)));
             wait_not_busy()?;
         }
-
-        if coreldo_en && ldo_level < cfg.core_voltage {
-            ldo_level = step_up(ldo_level);
-            pac::SPC0.active_cfg().modify(|w| {
-                w.set_coreldo_vdd_lvl(match ldo_level {
-                    CoreVoltage::Mid => ActiveCfgCoreldoVddLvl::Mid,
-                    CoreVoltage::Normal => ActiveCfgCoreldoVddLvl::Normal,
-                    CoreVoltage::Over => ActiveCfgCoreldoVddLvl::Over,
-                })
-            });
-            wait_not_busy()?;
-        }
-    }
-
-    if coreldo_en {
-        // Only now is the requested drive strength safe to apply.
-        pac::SPC0
-            .active_cfg()
-            .modify(|w| w.set_coreldo_vdd_ds(coreldo_ds(cfg.core_drive_strength)));
-        wait_not_busy()?;
     }
 
     Ok(())
@@ -630,15 +571,6 @@ pub fn set_sram_margin(margin: SramMargin) -> Result<(), PowerError> {
 pub fn set_flash_wait_states(rwsc: u8) {
     pac::FMU0.fctrl().modify(|w| w.set_rwsc(rwsc));
     unsafe { core::arch::asm!("dsb sy", "isb sy", options(nomem, nostack, preserves_flags)) };
-}
-
-/// The next level up. Saturates at [`CoreVoltage::Over`]; callers only advance
-/// while strictly below their target, so the saturating arm is unreachable.
-const fn step_up(v: CoreVoltage) -> CoreVoltage {
-    match v {
-        CoreVoltage::Mid => CoreVoltage::Normal,
-        CoreVoltage::Normal | CoreVoltage::Over => CoreVoltage::Over,
-    }
 }
 
 fn coreldo_ds(ds: DriveStrength) -> ActiveCfgCoreldoVddDs {

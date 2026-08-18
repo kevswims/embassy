@@ -728,8 +728,11 @@ the module is public because the low-power work will live here too.
 - **The SRAM margin tops out at 1.1 V.** `SRAMCTL[VSM] = 0b11` (1.2 V) is
   Reserved per RM §37.7.7 even though NXP's SDK writes it at overdrive. 1.1 V is
   the conservative direction — see `sram_margin_for`'s docs.
-- The voltage detectors are muted and restored around a level change; a caller
-  that has its own reason to arm or disarm them has no API for it.
+- **The glitch detectors are disabled and left disabled.** `set_active_mode`
+  calls `disable_core_glitch_detect`, which detaches aGDET and dGDET from
+  `CHIP_RESET` — it has to, or the level change resets the part. There is no API
+  to re-arm them, and doing so would break any later rail change. The LVD/HVD
+  detectors are untouched and stay armed.
 - `VD_CORE_CFG`/`VD_SYS_CFG`/`VD_IO_CFG` are never written. `LVDRE` is set and
   `LOCK`ed at reset, so a core LVD event resets the part and that cannot be
   changed — see the hazards section.
@@ -913,27 +916,35 @@ predicates and an `IntoIterator` over `ResetReason`.
 Eight known-bad or known-unverified behaviours are load-bearing in the current
 design. They are the reason several APIs look the way they do.
 
-0. **Raising the core rail needs three things done right, or the part resets —
+0. **Raising the core rail needs two things done right, or the part resets —
    `src/power.rs::set_active_mode`, exercised by
    `examples/mcxn947/src/bin/power_overdrive.rs`.**
-   All three were established by bisecting the sequence one register write at a
-   time on hardware.
 
-   1. **Mute the voltage detectors across the transition.** `VD_CORE_CFG` reads
-      `0x00010001` on this part: `LVDRE` set (a core LVD event drives a
-      *hardware reset*) and `LOCK` set, so `LVDRE` cannot be cleared, and the
-      register survives everything short of a POR. Re-trimming the regulator
-      dips `VDD_CORE` enough to trip it. The detect *enables* in `ACTIVE_CFG`
-      are not locked and are the way out — the same thing NXP's board code does
-      around power-mode changes (`SPC_EnableActiveModeCoreLowVoltageDetect(..,
-      false)` in `host_sleep.c`). `VD_STAT` is cleared before re-arming so a
-      flag latched while muted does not fire immediately.
-   2. **Walk both regulators up in lockstep**, one level per round. Taking DCDC
-      to 1.2 V while `CORELDO_VDD_LVL` still read 1.0 V reset the part every
-      time: both drive `VDD_CORE`, and a two-level disagreement is not
-      survivable. Interleaving them is what turned a reset loop into a clean
-      transition.
-   3. **Park `main_clk` low first.** Doing this at 48 MHz did not merely reset
+   1. **Disable the VDD_CORE glitch detector first.** This is the actual cause of
+      the reset, and it is a *tamper* path rather than a brown-out path.
+      Re-trimming the regulator puts a fast transient on `VDD_CORE`; the **analog
+      glitch detector (aGDET)** sees it, and the ITRC routes that event to
+      `CHIP_RESET`.
+
+      The fix is `power::disable_core_glitch_detect`, called at the top of
+      `set_active_mode`. NXP do the same thing unconditionally in `SystemInit`,
+      before `main`, in **every** application for this part
+      (`system_MCXN947_cm33_core0.c`, "Disable aGDET interrupt and reset").
+      `cortex-m-rt`'s startup does not, which was the entire difference between
+      NXP's 150 MHz bring-up working and ours resetting.
+
+      **All three parts of NXP's block are required.** Disabling only the SPC
+      analog detector (`ACTIVE_CFG[GLITCH_DETECT_DISABLE]` plus
+      `GLITCH_DETECT_SC`) was measured to still reset the chip: the ITRC
+      (`OUT_SEL[4][0..1]`, input 9 = aGDET, input 0 = dGDET) and the digital
+      detectors (`GDET0`/`GDET1`) feed the same `CHIP_RESET` path.
+
+      **This disables a security feature.** Glitch detection is anti-tamper, and
+      it is left disabled afterwards, as NXP leave it. A product relying on glitch
+      detection needs to know it is off — but it cannot be left armed on this part
+      if the core voltage is ever changed.
+
+   2. **Park `main_clk` low first.** Doing this at 48 MHz did not merely reset
       the part, it **wedged** it: `probe-rs` lost the access port (`Target
       device responded with a FAULT response`) and could not reattach,
       `--connect-under-reset` included, at any speed from 100 kHz to 4 MHz.
@@ -941,48 +952,43 @@ design. They are the reason several APIs look the way they do.
       reset. Every NXP `BOARD_BootClock*` parks on FRO12M before touching the
       rails.
 
-   `ACTIVE_VDELAY` is **not** implicated — it reads 200 at reset, not 0.
+   With the glitch detector handled, the rail goes straight to its target in a
+   single write per regulator, DCDC then CORELDO, exactly as
+   `SPC_SetActiveModeDCDCRegulatorConfig` and
+   `SPC_SetActiveModeCoreLDORegulatorConfig` do.
+
+   Verified on hardware: `clocks_150m.rs` reports `main_clk 150000000 /
+   system_clk 150000000 / core Over` with a measured core clock of 149.41 MHz;
+   `clocks_144m.rs` reports 144 MHz measured at 143.44 MHz; `power_overdrive.rs`
+   takes both regulators from `Mid` straight to `Over` and restores `main_clk`.
+   The debug link stays up throughout, and `voltage_detects_enabled` reads `true`
+   the whole way.
+
+   **Three hypotheses were wrong and should not be re-tried.** All three looked
+   confirmed at the time, because each was tested by adding it to a sequence that
+   was failing for an unrelated reason:
+
+   - *Muting the LVD/HVD detectors across the transition.* `SPC0.VD_STAT` stays
+     `0x0000_0000` across the whole transition and `CMC0.SRS` never reports
+     `VoltageDetect`, so clearing `ACTIVE_CFG`'s `*_LVDE`/`*_HVDE` bits could
+     never have helped. The detectors are now left armed.
+   - *Walking both regulators up one level per round, in lockstep.* The claim was
+     that a two-level disagreement between DCDC and CORELDO — both drive
+     `VDD_CORE` — was unsurvivable. `power_overdrive.rs` now jumps `Mid` to `Over`
+     in one write per regulator, with DCDC fully ahead of CORELDO in between.
+   - *1.2 V destabilising the SWD link.* Disproven by building NXP's own
+     `hello_world` (see `../MCUXSDK_BUILD_NOTES.md`) and finding it runs at
+     150 MHz/1.2 V with SWD fully reliable — which is also what pointed at
+     `ACTIVE_CFG`'s glitch-detect bit.
+
+   `ACTIVE_VDELAY` is **not** implicated either — it reads 200 at reset, not 0.
 
    Corollary for examples: **never put an unguarded SPC write on a boot path.**
    A wedge there re-wedges on every reset before a probe can halt the core, so
    `power_overdrive.rs` waits 5 s first. Keep that guard.
 
-   **Root cause found, and it is not a voltage detector.** The reset is the
-   **VDD_CORE analog glitch detector (aGDET)**. Re-trimming the regulator puts a
-   fast transient on `VDD_CORE`; the glitch detector sees it, and the ITRC routes
-   that event to `CHIP_RESET`. It is a *tamper* path, which is why every
-   brown-out-shaped hypothesis was wrong:
-
-   - `SPC0.VD_STAT` stays `0x0000_0000` across the whole transition, and
-     `CMC0.SRS` never reports `VoltageDetect` — so muting `ACTIVE_CFG`'s
-     `*_LVDE`/`*_HVDE` bits, which this driver did, could never have helped.
-   - The fix is `power::disable_core_glitch_detect`, called at the top of
-     `set_active_mode`. NXP do the same thing unconditionally in `SystemInit`,
-     before `main`, in **every** application for this part
-     (`system_MCXN947_cm33_core0.c`, "Disable aGDET interrupt and reset").
-     `cortex-m-rt`'s startup does not, which was the entire difference between
-     NXP's 150 MHz bring-up working and ours resetting.
-   - **All three parts of NXP's block are required.** Disabling only the SPC
-     analog detector was measured to still reset the chip: the ITRC
-     (`OUT_SEL[4][0..1]`, input 9 = aGDET, input 0 = dGDET) and the digital
-     detectors (`GDET0`/`GDET1`) feed the same `CHIP_RESET` path.
-
-   Verified on hardware after the fix: `clocks_150m.rs` reports
-   `main_clk 150000000 / system_clk 150000000 / core Over` with a measured core
-   clock of 149.40 MHz; `clocks_144m.rs` reports 144 MHz measured at 143.42 MHz;
-   `power_overdrive.rs` raises both regulators to `Over` and restores `main_clk`.
-   The debug link stays up throughout.
-
-   **This disables a security feature.** Glitch detection is anti-tamper, and it
-   is left disabled afterwards, as NXP leave it. A product relying on glitch
-   detection needs to know it is off — but it cannot be left armed on this part if
-   the core voltage is ever changed.
-
-   How it was found: `spc_probe.rs`, `clk150_probe.rs`, `clk150_steps.rs` and
-   `clk150_late.rs` bisected the sequence to the rail raise; the answer came from
-   diffing against NXP's `SystemInit` after building their `hello_world` (see
-   `../MCUXSDK_BUILD_NOTES.md`), which runs at 150 MHz/1.2 V with SWD fully
-   reliable.
+   The instrumentation that found this stays in the tree: `spc_probe.rs`,
+   `clk150_probe.rs`, `clk150_steps.rs` and `clk150_late.rs`.
 
 1. **VBAT domain configuration — `src/clocks/source.rs:176`.**
    `configure_vbat` (the path behind `ClocksConfig::enable_clk_16k`) is
@@ -1172,12 +1178,6 @@ than refusing to build or returning an error.
       high and never clear it; the rest are assumed-but-unverified to poll
       correctly. (`src/clocks/functional.rs:112`)
 - [ ] Verify `Vref::set_trim_2v1` against a meter on `VREF_OUT`. (`src/vref.rs`)
-- [ ] Delete the level-walk and voltage-detector muting in
-      `power::set_active_mode`. Now known to be unnecessary: the detectors were
-      never implicated (`VD_STAT` stays 0) and the real cause was the glitch
-      detector, which is now handled. NXP go straight to the target level in one
-      write per regulator. Kept for now only because the working configuration
-      was not disturbed once the fix landed. (`src/power.rs`)
 - [ ] Measure whether the FlexSPI serial root clock can actually run at NXP's
       75 MHz here, and above. Reaching 75 MHz needs PLL0, which this HAL only
       starts as a side effect of `main_clk = Pll0At150m`; every FlexSPI example
