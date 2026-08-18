@@ -2,7 +2,8 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `46f3e50a` (*mcxn: add FlexSPI serial NOR driver*).
+As of commit `f829f3ed` (*mcxn: drop the level walk and detector muting from
+set_active_mode*).
 This document describes committed code only; work in progress in the working
 copy is not covered.
 
