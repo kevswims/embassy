@@ -149,4 +149,19 @@ impl<'d, D: Driver<'d>> CmsisDapV2Class<'d, D> {
     pub async fn read_packet(&mut self, data: &mut [u8]) -> Result<usize, EndpointError> {
         self.read_ep.read_transfer(data).await
     }
+
+    /// Take the trace endpoint out of the class.
+    ///
+    /// Trace is a continuous stream the target produces on its own schedule,
+    /// while commands are strictly request/response, so the two generally want to
+    /// be driven by separate tasks. Both cannot borrow the class at once, and
+    /// selecting over them instead would mean cancelling an in-flight command read
+    /// every time trace data arrives.
+    ///
+    /// Returns `None` if the class was built without trace, or if the endpoint has
+    /// already been taken. [`Self::write_trace`] returns
+    /// [`EndpointError::Disabled`] afterwards.
+    pub fn take_trace_endpoint(&mut self) -> Option<D::EndpointIn> {
+        self.trace_ep.take()
+    }
 }

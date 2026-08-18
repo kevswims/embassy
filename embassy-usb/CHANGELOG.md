@@ -75,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - USB host: debounce hub port connections and cleanup addresses after hub removal
 - USB host: call `UsbHostAllocator::device_removed` for each address freed on device removal
 - Generate `config.rs` in a deterministic order, so builds of the same source produce the same crate
+- `CMSIS-DAP v2`: add `take_trace_endpoint`, so SWO trace can be streamed from a task independent of command handling
 
 ## 0.6.0 - 2026-03-10
 
