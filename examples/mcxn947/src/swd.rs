@@ -289,8 +289,11 @@ impl<'d, C: GpioPin, D: GpioPin, R: GpioPin> BitBangSwd<'d, C, D, R> {
 impl<C: GpioPin, D: GpioPin, R: GpioPin> SwdBus for BitBangSwd<'_, C, D, R> {
     fn set_clock_hz(&mut self, hz: u32) -> u32 {
         let hz = hz.max(1);
-        let want_cycles = self.core_hz / hz;
-        self.half_period = want_cycles.saturating_sub(self.overhead) / 2;
+        // Round the cycle budget up, then the half-period up, so the produced rate
+        // never exceeds the requested one. Running faster than the host asked for
+        // is how a marginal link becomes an intermittent one.
+        let want_cycles = self.core_hz.div_ceil(hz);
+        self.half_period = want_cycles.saturating_sub(self.overhead).div_ceil(2);
         self.core_hz / (2 * self.half_period + self.overhead)
     }
 

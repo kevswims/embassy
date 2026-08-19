@@ -395,6 +395,12 @@ impl_syscon_gate!(CAN1, 2, clk: Ahbclkctrl2.set_flexcan1(true); rst: Presetctrl2
 #[cfg(mcxn_flexspi)]
 impl_syscon_gate!(FLEXSPI0, 0, clk: Ahbclkctrl0.set_flexspi(true); rst: Presetctrl0.set_flexspi_rst(), FlexspiRst);
 
+// FlexIO. The gate covers the register interface; the shifter/timer clock comes
+// from the `FLEXIOCLKSEL`/`FLEXIOCLKDIV` pair - see `impl_functional_clock!` for
+// `FLEXIO0` in `super::functional`.
+#[cfg(mcxn_flexio)]
+impl_syscon_gate!(FLEXIO0, 2, clk: Ahbclkctrl2.set_flexio(true); rst: Presetctrl2.set_flexio_rst(), FlexioRst);
+
 // ENET0's AHB bus interface only. The RMII reference clock reaches the block
 // from outside SYSCON's gating - see `crate::enet` for how it is sourced.
 #[cfg(mcxn_enet)]

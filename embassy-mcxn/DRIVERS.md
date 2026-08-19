@@ -1086,10 +1086,22 @@ design. They are the reason several APIs look the way they do.
 
 Peripherals present in the PAC with **no driver**:
 
-- **Serial / connectivity:** LPSPI0–9, LPI2C0–9, I3C0/1, FLEXIO0,
+- **Serial / connectivity:** LPSPI0–9, LPI2C0–9, I3C0/1,
   USBFS0 / USBDCD0 / USBHS1_PHY_DCD, SAI0/1, PDM (MICFIL), USDHC0,
   EMVSIM0/1. (USBHS1 and USBPHY are driven in device mode — see the USB HS
   section.)
+- **FLEXIO0 has no driver, but it can be brought up.** A `Gate` and a
+  `FunctionalClock` exist (`AHBCLKCTRL2.FLEXIO` / `PRESETCTRL2.FLEXIO_RST`, and
+  the `FLEXIOCLKSEL`/`FLEXIOCLKDIV` mux with PLL0, `clk_in`, `fro_hf` and
+  `fro_12m` reachable), so `enable_and_reset_with_clock` returns a running block
+  and a caller can program the shifters and timers directly. That is what
+  `examples/mcxn947/src/swd_flexio.rs` does. What is missing is any abstraction
+  over shifters and timers, and **pin traits: the PAC metadata carries no FlexIO
+  pin functions at all**, so there is nothing to generate `impl_flexio_pin!`
+  from. Callers must mux the pads themselves and supply FlexIO's own `FXIO_Dn`
+  index, which cannot be derived from the pad name and is not checkable —
+  NXP's board code is the only machine-readable source for either. Alt 6 on
+  every `FXIO_D` pad.
 - **Timers / motor control:** SCT0, eFlexPWM (PWM0/PWM1), QDC0/1, EVTG0, MRT0,
   UTICK0, FREQME0.
 - **Analog:** DAC0/1/2, OPAMP0–2, CMP0–2, SINC0, TSI0.
@@ -1275,6 +1287,17 @@ A host process claims the probe's USB interface exclusively, so SWD and SWO
 cannot be driven by two separate `probe-rs` invocations — the second reports
 `interface is busy (errno 16)`. Both together needs one session that does both.
 
+Measured SWD rates, for calibration. Bit-bang: 10 core cycles per bit, so
+4.8 MHz SWCLK at 48 MHz and 14.9 MHz at 150 MHz. FlexIO from PLL0 at 150 MHz:
+**25 MHz reliable, 37.5 MHz not** — 37.5 is exactly FlexIO's quarter-of-its-clock
+input sampling limit (RM 71.6.3) with no margin left for wire delay, and the
+divider is coarse enough that 25 and 37.5 MHz are adjacent steps. Marginal read
+throughput only goes 600 to 800 KB/s across that, because USB round-trips
+dominate rather than the wire. Note the FlexIO engine still *polls* the shifter
+status flag, so a transfer blocks the executor for its duration exactly as the
+bit-bang does; what changed is one register write per protocol phase instead of
+per bit.
+
 | Example | Exercises |
 | --- | --- |
 | `hello.rs` | minimal `init` + defmt |
@@ -1301,7 +1324,7 @@ cannot be driven by two separate `probe-rs` invocations — the second reports
 | `flexspi_soak.rs` | long-run blocking + AHB torture over a rotating sector window, with a never-erased canary |
 | `flexspi_cancel_soak.rs` | drops async/DMA futures mid-flight at a sweep of delays to prove cancel-safety |
 | `swd_dpidr.rs` | bit-banged SWD host: reads a target's `DPIDR` and sweeps the achievable SWCLK. Debug-probe groundwork, not a HAL driver |
-| `dap_probe.rs` | a working CMSIS-DAP v2 debug probe: bit-banged SWD plus SWO capture over USB HS, driven by probe-rs. Shares `src/swd.rs` (wire engine behind a `SwdBus` trait), `src/dap.rs` (command dispatcher) and `src/swo.rs` (SWO state and the polled-transport queue). Not a HAL driver |
+| `dap_probe.rs` | a working CMSIS-DAP v2 debug probe: SWD plus SWO capture over USB HS, driven by probe-rs. Shares `src/swd.rs` (the `SwdBus` trait and a GPIO bit-bang engine), `src/swd_flexio.rs` (the same trait on FlexIO shifters/timer, selected by `USE_FLEXIO`), `src/dap.rs` (command dispatcher) and `src/swo.rs` (SWO state and the polled-transport queue). Not a HAL driver |
 | `spc_probe.rs` | diagnostic: `set_active_mode` unrolled with a flushed log per register write, to find what wedges the 144/150 MHz paths |
 | `clk150_probe.rs` | diagnostic: calls `clocks::init(Pll0At150m)` from a bare `cortex_m_rt::entry` so the error `hal::init` unwraps is visible |
 | `clk150_steps.rs` | diagnostic: the 150 MHz bring-up replicated inline, one flushed log per register write. Pins the failure to the SPC rail raise |

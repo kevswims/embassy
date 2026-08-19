@@ -55,7 +55,9 @@ use embassy_usb::msos::windows_version;
 use embassy_usb::{Builder, Config, UsbDeviceSpeed};
 use hal::bind_interrupts;
 use hal::clocks::config::Div;
-use hal::clocks::{Lpuart2ClockConfig, Lpuart2ClockSource, MainClock, SoscConfig, SoscMode};
+use hal::clocks::{
+    Flexio0ClockConfig, Flexio0ClockSource, Lpuart2ClockConfig, Lpuart2ClockSource, MainClock, SoscConfig, SoscMode,
+};
 use hal::dma::DmaChannel;
 use hal::lpuart::Uart;
 use hal::pac;
@@ -66,6 +68,8 @@ use panic_probe as _;
 mod dap;
 #[path = "../swd.rs"]
 mod swd;
+#[path = "../swd_flexio.rs"]
+mod swd_flexio;
 #[path = "../swo.rs"]
 mod swo;
 
@@ -87,6 +91,24 @@ const CRYSTAL_HZ: u32 = 24_000_000;
 /// unconditionally). Set this to `false` for a probe that boots immediately and
 /// leaves the rail alone.
 const FAST_CORE: bool = true;
+
+/// Drive SWD from FlexIO instead of bit-banging GPIOs.
+///
+/// FlexIO moves the per-bit loop into hardware, so the rate stops depending on
+/// core cycles per bit and is instead capped by FlexIO's input sampling at a
+/// quarter of its own clock (RM 71.6.3) - 37.5 MHz from PLL0 at 150 MHz.
+///
+/// The tradeoff is that FlexIO owns both pads, so `DAP_SWJ_Pins` can no longer
+/// drive SWCLK and SWDIO individually. probe-rs only needs nRESET there, which
+/// still works.
+const USE_FLEXIO: bool = true;
+
+/// FlexIO's own pin index for each pad - the `FXIO_Dn` number. P1_18 is
+/// `FXIO_D26` and P1_19 is `FXIO_D27`, from NXP's board pin tables; the PAC
+/// metadata has no FlexIO pin functions, so there is nothing to generate this
+/// from and nothing to check it against.
+const SWCLK_FXIO: u8 = 26;
+const SWDIO_FXIO: u8 = 27;
 
 /// Bulk endpoint size, and what `DAP_Info(0xFF)` reports. The two must agree:
 /// probe-rs sizes its buffers from the latter and reads from the former, so a
@@ -253,58 +275,46 @@ async fn main(_spawner: Spawner) {
     let set_swo_baud = |baud: u32| swo_uart.set_baudrate(baud).ok();
     let swo = swo::Swo::new(&set_swo_baud, SWO_RING_LEN as u32);
 
-    let mut bus = swd::BitBangSwd::new(p.P1_18, p.P1_19, p.P1_12, core_hz);
-    // The floor of the achievable period, measured rather than assumed. This is
-    // the number that decides what SWCLK rates are reachable at all, and it is
-    // ruinous in an unoptimised build - see the note on building this example.
-    info!(
-        "bit-bang floor: {=u32} core cycles per bit, {=u32} Hz max SWCLK",
-        bus.overhead_cycles(),
-        bus.measure_swclk_hz()
-    );
-    let mut dap = dap::Dap::new(bus, PACKET_SIZE, SERIAL, Some(&swo), streaming);
-
+    // Both engines implement `SwdBus`, so everything downstream is identical.
+    // Only one branch runs, and each moves the pins it needs.
     let dap_fut = async {
-        let mut req = [0u8; PACKET_SIZE as usize];
-        let mut resp = [0u8; PACKET_SIZE as usize];
-        let mut reported_clock = 0u32;
+        if USE_FLEXIO {
+            // PLL0 is the only source that lifts FlexIO's quarter-clock input
+            // ceiling above 12 MHz, and it is only running when FAST_CORE brought
+            // main_clk up from it. Fall back rather than fail.
+            let (source, expect) = if FAST_CORE {
+                (Flexio0ClockSource::Pll0, "PLL0")
+            } else {
+                (Flexio0ClockSource::FroHf, "fro_hf")
+            };
+            let flexio_clock = Flexio0ClockConfig {
+                source,
+                div: Div::no_div(),
+            };
+            let flexio_hz =
+                unsafe { hal::clocks::enable_and_reset_with_clock::<hal::peripherals::FLEXIO0>(&flexio_clock) }
+                    .unwrap();
+            info!(
+                "SWD engine: FlexIO, clock {=str} at {=u32} Hz, max SWCLK {=u32} Hz",
+                expect,
+                flexio_hz,
+                flexio_hz / 4
+            );
 
-        loop {
-            class.wait_connection().await;
-            info!("host connected");
-
-            loop {
-                let n = match class.read_packet(&mut req).await {
-                    Ok(n) => n,
-                    Err(EndpointError::Disabled) => break,
-                    Err(e) => {
-                        warn!("read failed: {:?}", e);
-                        break;
-                    }
-                };
-
-                let len = dap.process(&req[..n], &mut resp);
-                if len == 0 {
-                    // Never expected: a silent command desynchronises the host
-                    // permanently, so this is worth seeing rather than ignoring.
-                    warn!("no response produced for a {}-byte command", n);
-                    continue;
-                }
-
-                // What the host asked for and what a bit-bang can produce are
-                // rarely the same number, and the difference is worth seeing.
-                if dap.clock_hz() != reported_clock {
-                    reported_clock = dap.clock_hz();
-                    info!("SWCLK now {=u32} Hz", reported_clock);
-                }
-
-                if let Err(e) = class.write_packet(&resp[..len]).await {
-                    warn!("write failed: {:?}", e);
-                    break;
-                }
-            }
-
-            info!("host disconnected");
+            let bus = swd_flexio::FlexioSwd::new(p.P1_18, SWCLK_FXIO, p.P1_19, SWDIO_FXIO, p.P1_12, flexio_hz);
+            let dap = dap::Dap::new(bus, PACKET_SIZE, SERIAL, Some(&swo), streaming);
+            serve(&mut class, dap).await;
+        } else {
+            let mut bus = swd::BitBangSwd::new(p.P1_18, p.P1_19, p.P1_12, core_hz);
+            // The floor of the achievable period, measured rather than assumed.
+            // It is ruinous in an unoptimised build - see the build note above.
+            info!(
+                "SWD engine: bit-bang, floor {=u32} core cycles per bit, {=u32} Hz max SWCLK",
+                bus.overhead_cycles(),
+                bus.measure_swclk_hz()
+            );
+            let dap = dap::Dap::new(bus, PACKET_SIZE, SERIAL, Some(&swo), streaming);
+            serve(&mut class, dap).await;
         }
     };
 
@@ -372,4 +382,57 @@ async fn main(_spawner: Spawner) {
     };
 
     join4(usb_fut, dap_fut, swo_fut, selftest_fut).await;
+}
+
+/// Serve CMSIS-DAP commands until the host goes away, then wait for the next one.
+///
+/// Generic over the wire engine so that the bit-bang and FlexIO implementations
+/// share every line of command handling - the whole point of `SwdBus` being a
+/// trait.
+async fn serve<'d, D, B>(class: &mut CmsisDapV2Class<'d, D>, mut dap: dap::Dap<'_, B>)
+where
+    D: embassy_usb::driver::Driver<'d>,
+    B: swd::SwdBus,
+{
+    let mut req = [0u8; PACKET_SIZE as usize];
+    let mut resp = [0u8; PACKET_SIZE as usize];
+    let mut reported_clock = 0u32;
+
+    loop {
+        class.wait_connection().await;
+        info!("host connected");
+
+        loop {
+            let n = match class.read_packet(&mut req).await {
+                Ok(n) => n,
+                Err(EndpointError::Disabled) => break,
+                Err(e) => {
+                    warn!("read failed: {:?}", e);
+                    break;
+                }
+            };
+
+            let len = dap.process(&req[..n], &mut resp);
+            if len == 0 {
+                // Never expected: a silent command desynchronises the host
+                // permanently, so this is worth seeing rather than ignoring.
+                warn!("no response produced for a {}-byte command", n);
+                continue;
+            }
+
+            // What the host asks for and what an engine can produce are rarely
+            // the same number, and the difference is worth seeing.
+            if dap.clock_hz() != reported_clock {
+                reported_clock = dap.clock_hz();
+                info!("SWCLK now {=u32} Hz", reported_clock);
+            }
+
+            if let Err(e) = class.write_packet(&resp[..len]).await {
+                warn!("write failed: {:?}", e);
+                break;
+            }
+        }
+
+        info!("host disconnected");
+    }
 }

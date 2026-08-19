@@ -456,6 +456,27 @@ impl_functional_clock! {
     }
 }
 
+// FlexIO's shifter/timer clock. All four implemented sources are reachable; the
+// mux also lists `pll1_clk0`, which PLL1 bring-up would have to exist for.
+//
+// The choice matters more here than for most peripherals: FlexIO samples input
+// pins at a quarter of this rate (RM 71.6.3), so it caps how fast anything
+// bidirectional built on FlexIO can run, and PLL0 at 150 MHz is the only source
+// that gets that ceiling above 12 MHz.
+#[cfg(mcxn_flexio)]
+impl_functional_clock! {
+    FLEXIO0,
+    name: Flexio0ClockSource / Flexio0ClockConfig,
+    sel: crate::pac::SYSCON0.flexioclksel(), FlexioclkselSel,
+    div: full(crate::pac::SYSCON0.flexioclkdiv(), Flexioclkdiv, 8),
+    sources: {
+        Pll0   => Enum1 @ 1 : ensure_pll0_clk,
+        ClkIn  => Enum2 @ 2 : ensure_clk_in,
+        FroHf  => Enum3 @ 3 : ensure_fro_hf,
+        Fro12m => Enum4 @ 4 : ensure_fro_12m,
+    }
+}
+
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
 // unlike the other two options it needs nothing from the VBAT power domain.
