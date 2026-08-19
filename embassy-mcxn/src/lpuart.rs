@@ -335,6 +335,49 @@ impl<'d, T: Instance + Gate + FunctionalClock, TxP: PeripheralType, RxP: Periphe
 }
 
 impl<T: Instance + Gate, TxP: PeripheralType, RxP: PeripheralType> Uart<'_, T, TxP, RxP> {
+    /// Reprogram the baud rate on a running UART, returning the rate actually
+    /// achieved.
+    ///
+    /// The achieved rate is `frequency() / (OSR * SBR)` and is within 3% of
+    /// `baudrate` or the call fails, which is the same tolerance
+    /// [`Uart::new`] applies.
+    ///
+    /// RM 66.5.2.1: `BAUD[SBR]` must not be written while the transmitter or
+    /// receiver is enabled, so both are stopped for the update and the FIFOs are
+    /// flushed before they come back. A byte arriving mid-call is lost, and a
+    /// [`RingBufferedUartRx`] over this UART should be cleared afterwards -
+    /// anything already in its buffer was framed at the old rate.
+    pub fn set_baudrate(&self, baudrate: u32) -> Result<u32, Error> {
+        let (osr, sbr) = calculate_baud(self.hz, baudrate).ok_or(Error::UnsupportedBaudrate)?;
+        let regs = T::regs();
+
+        let ctrl = regs.ctrl().read();
+        regs.ctrl().modify(|w| {
+            w.set_te(false);
+            w.set_re(false);
+        });
+
+        regs.baud().modify(|w| {
+            w.set_sbr(sbr as u16);
+            w.set_osr(Osr::from_bits((osr - 1) as u8));
+            // Required whenever OSR is 4..=7 (RM 66.5.2.1); harmless otherwise.
+            w.set_bothedge(osr < 8);
+        });
+
+        regs.fifo().modify(|w| {
+            w.set_txflush(Txflush::TxfifoRst);
+            w.set_rxflush(Rxflush::RxfifoRst);
+        });
+
+        // Restore whatever was enabled rather than assuming both were.
+        regs.ctrl().modify(|w| {
+            w.set_te(ctrl.te());
+            w.set_re(ctrl.re());
+        });
+
+        Ok(self.hz / (osr * sbr))
+    }
+
     /// The functional clock feeding the baud-rate generator, in Hz.
     pub fn frequency(&self) -> u32 {
         self.hz

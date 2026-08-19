@@ -216,6 +216,9 @@ the block, searches the baud space (OSR 4..=32, SBR 1..=8191, accepting within
 3%, `BOTHEDGE` for OSR < 8), configures parity (none/even/odd) and 1 or 2 stop
 bits, and enables and flushes both FIFOs.
 
+`set_baudrate` reprograms the rate on a live UART, returning what was achieved
+from the same 3%-tolerance search.
+
 Transfers: interrupt-driven async `write`/`read` — both take `&self`, so TX and
 RX can be joined; DMA `write_dma`/`read_dma` with `TDMAE`/`RDMAE` drop guards;
 and `into_ring_rx()` → `RingBufferedUartRx` for continuous circular DMA receive
@@ -232,7 +235,11 @@ overrun, noise, framing, parity, ring overrun, DMA.
   being present.
 - No 7-bit or 9-bit data configuration (parity currently forces the 9-bit `M`
   bit), no idle-line detection API, no break generation, no LIN / IrDA /
-  ISO7816 modes, no runtime baud change.
+  ISO7816 modes.
+- `set_baudrate` stops the transmitter and receiver for the update, as RM
+  66.5.2.1 requires, so a byte arriving mid-call is lost and a live
+  `RingBufferedUartRx` still holds bytes framed at the old rate. It does not
+  touch `LOOPS`/`RSRC`, so loopback and single-wire modes have no API.
 - **Only the UART personality of LP_FLEXCOMM exists.** LPSPI and LPI2C are
   unimplemented, and the mutual exclusion between the three is enforced only by
   the driver holding `Peri<'d, T>`.
@@ -1265,6 +1272,10 @@ Once `dap_probe.rs` is running, the board presents a *second* CMSIS-DAP probe to
 the host and `cargo run` stops being able to pick one. Flash with an explicit
 `--probe 1fc9:0143` (MCU-LINK's VID:PID) from then on.
 
+A host process claims the probe's USB interface exclusively, so SWD and SWO
+cannot be driven by two separate `probe-rs` invocations — the second reports
+`interface is busy (errno 16)`. Both together needs one session that does both.
+
 | Example | Exercises |
 | --- | --- |
 | `hello.rs` | minimal `init` + defmt |
@@ -1291,7 +1302,7 @@ the host and `cargo run` stops being able to pick one. Flash with an explicit
 | `flexspi_soak.rs` | long-run blocking + AHB torture over a rotating sector window, with a never-erased canary |
 | `flexspi_cancel_soak.rs` | drops async/DMA futures mid-flight at a sweep of delays to prove cancel-safety |
 | `swd_dpidr.rs` | bit-banged SWD host: reads a target's `DPIDR` and sweeps the achievable SWCLK. Debug-probe groundwork, not a HAL driver |
-| `dap_probe.rs` | a working CMSIS-DAP v2 debug probe: bit-banged SWD over USB HS, driven by probe-rs. Shares `src/swd.rs` (wire engine behind a `SwdBus` trait) and `src/dap.rs` (command dispatcher). Not a HAL driver |
+| `dap_probe.rs` | a working CMSIS-DAP v2 debug probe: bit-banged SWD plus SWO capture over USB HS, driven by probe-rs. Shares `src/swd.rs` (wire engine behind a `SwdBus` trait), `src/dap.rs` (command dispatcher) and `src/swo.rs` (SWO state and the polled-transport queue). Not a HAL driver |
 | `spc_probe.rs` | diagnostic: `set_active_mode` unrolled with a flushed log per register write, to find what wedges the 144/150 MHz paths |
 | `clk150_probe.rs` | diagnostic: calls `clocks::init(Pll0At150m)` from a bare `cortex_m_rt::entry` so the error `hal::init` unwraps is visible |
 | `clk150_steps.rs` | diagnostic: the 150 MHz bring-up replicated inline, one flushed log per register write. Pins the failure to the SPC rail raise |

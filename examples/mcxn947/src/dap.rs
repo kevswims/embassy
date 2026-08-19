@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 use crate::swd::{A2, A3, ACK_OK, APNDP, MATCH_MASK, MATCH_VALUE, PROTOCOL_ERROR, RDBUFF_READ, RNW, SwdBus, TIMESTAMP};
+use crate::swo::{SwoControl, TRANSPORT_ENDPOINT};
 
 /// `DAP_Info`.
 const ID_INFO: u8 = 0x00;
@@ -47,6 +48,20 @@ const ID_SWJ_CLOCK: u8 = 0x11;
 const ID_SWJ_SEQUENCE: u8 = 0x12;
 /// `DAP_SWD_Configure`.
 const ID_SWD_CONFIGURE: u8 = 0x13;
+/// `DAP_SWO_Transport`.
+const ID_SWO_TRANSPORT: u8 = 0x17;
+/// `DAP_SWO_Mode`.
+const ID_SWO_MODE: u8 = 0x18;
+/// `DAP_SWO_Baudrate`.
+const ID_SWO_BAUDRATE: u8 = 0x19;
+/// `DAP_SWO_Control`.
+const ID_SWO_CONTROL: u8 = 0x1A;
+/// `DAP_SWO_Status`.
+const ID_SWO_STATUS: u8 = 0x1B;
+/// `DAP_SWO_Data`.
+const ID_SWO_DATA: u8 = 0x1C;
+/// `DAP_SWO_ExtendedStatus`.
+const ID_SWO_EXTENDED_STATUS: u8 = 0x1E;
 /// The response ID for a command this firmware does not implement.
 const ID_INVALID: u8 = 0xFF;
 
@@ -59,12 +74,15 @@ const DAP_ERROR: u8 = 0xFF;
 const PORT_DEFAULT: u8 = 0;
 const PORT_SWD: u8 = 1;
 
-/// Capabilities reported by `DAP_Info(0xF0)`: SWD only.
+/// `DAP_Info(0xF0)` bit 0. Must be set or probe-rs refuses to select SWD.
+const CAP_SWD: u8 = 1 << 0;
+/// Bit 2: SWO in UART mode.
+const CAP_SWO_UART: u8 = 1 << 2;
+/// Bit 6: trace streamed on the dedicated endpoint rather than polled in-band.
 ///
-/// Bit 0 must be set or probe-rs refuses to select SWD. JTAG (bit 1), SWO UART
-/// (bit 2) and streaming trace (bit 6) are later phases, and advertising one
-/// before it works makes probe-rs issue commands that cannot be answered.
-const CAPABILITIES: u8 = 0x01;
+/// This and the endpoint have to agree. Setting it without the endpoint, or the
+/// endpoint without it, silently falls back to polled `DAP_SWO_Data`.
+const CAP_SWO_STREAMING: u8 = 1 << 6;
 
 /// Responses in flight at once. One, because this dispatcher is synchronous.
 const PACKET_COUNT: u8 = 1;
@@ -74,8 +92,12 @@ const INFO_PRODUCT: &str = "MCXN947 CMSIS-DAP";
 const INFO_PROTOCOL_VERSION: &str = "2.1.0";
 
 /// CMSIS-DAP command dispatcher.
-pub struct Dap<B: SwdBus> {
+pub struct Dap<'d, B: SwdBus> {
     bus: B,
+    /// `None` leaves the SWO capability bits clear, so probe-rs never asks.
+    swo: Option<&'d dyn SwoControl>,
+    /// Whether the trace endpoint exists. Only meaningful with `swo` set.
+    swo_streaming: bool,
     /// Advertised and actual bulk endpoint size; must match the descriptor.
     packet_size: u16,
     serial: &'static str,
@@ -86,11 +108,23 @@ pub struct Dap<B: SwdBus> {
     clock_hz: u32,
 }
 
-impl<B: SwdBus> Dap<B> {
+impl<'d, B: SwdBus> Dap<'d, B> {
     /// Wrap a bus. `packet_size` must equal the bulk endpoint's size.
-    pub fn new(bus: B, packet_size: u16, serial: &'static str) -> Self {
+    ///
+    /// `swo` enables the SWO capability bits and command set; `swo_streaming`
+    /// says whether the trace endpoint was actually built, which decides whether
+    /// the streaming bit is advertised alongside them.
+    pub fn new(
+        bus: B,
+        packet_size: u16,
+        serial: &'static str,
+        swo: Option<&'d dyn SwoControl>,
+        swo_streaming: bool,
+    ) -> Self {
         Self {
             bus,
+            swo,
+            swo_streaming,
             packet_size,
             serial,
             connected: false,
@@ -129,6 +163,13 @@ impl<B: SwdBus> Dap<B> {
             ID_SWJ_CLOCK => self.swj_clock(payload, out),
             ID_SWJ_SEQUENCE => self.swj_sequence(payload, out),
             ID_SWD_CONFIGURE => self.swd_configure(payload, out),
+            ID_SWO_TRANSPORT => self.swo_transport(payload, out),
+            ID_SWO_MODE => self.swo_mode(payload, out),
+            ID_SWO_BAUDRATE => self.swo_baudrate(payload, out),
+            ID_SWO_CONTROL => self.swo_control(payload, out),
+            ID_SWO_STATUS => self.swo_status(out),
+            ID_SWO_DATA => self.swo_data(payload, out),
+            ID_SWO_EXTENDED_STATUS => self.swo_extended_status(out),
             _ => {
                 resp[0] = ID_INVALID;
                 return 1;
@@ -160,10 +201,31 @@ impl<B: SwdBus> Dap<B> {
             0x03 => Self::info_string(out, self.serial),
             0x04 => Self::info_string(out, INFO_PROTOCOL_VERSION),
             0xF0 => {
+                let mut caps = CAP_SWD;
+                if self.swo.is_some() {
+                    caps |= CAP_SWO_UART;
+                    if self.swo_streaming {
+                        caps |= CAP_SWO_STREAMING;
+                    }
+                }
                 out[0] = 1;
-                out[1] = CAPABILITIES;
+                out[1] = caps;
                 2
             }
+            // SWO trace buffer size. probe-rs asks for this while *opening* the
+            // probe, as soon as either SWO capability bit is set, and parses it
+            // strictly as a u32 - so a wrong length byte here breaks SWD too.
+            0xFD => match self.swo {
+                Some(swo) => {
+                    out[0] = 4;
+                    out[1..5].copy_from_slice(&swo.trace_buffer_size().to_le_bytes());
+                    5
+                }
+                None => {
+                    out[0] = 0;
+                    1
+                }
+            },
             0xFE => {
                 out[0] = 1;
                 out[1] = PACKET_COUNT;
@@ -508,6 +570,100 @@ impl<B: SwdBus> Dap<B> {
         out[0..2].copy_from_slice(&(done as u16).to_le_bytes());
         out[2] = last;
         w
+    }
+
+    fn swo_transport(&mut self, req: &[u8], out: &mut [u8]) -> usize {
+        let transport = req.first().copied().unwrap_or(0);
+        let ok = match self.swo {
+            // Refusing the endpoint transport when there is no endpoint makes
+            // probe-rs fall back to polling rather than wait on a dead pipe.
+            Some(_) if transport == TRANSPORT_ENDPOINT && !self.swo_streaming => false,
+            Some(swo) => swo.set_transport(transport),
+            None => false,
+        };
+        out[0] = if ok { DAP_OK } else { DAP_ERROR };
+        1
+    }
+
+    fn swo_mode(&mut self, req: &[u8], out: &mut [u8]) -> usize {
+        let mode = req.first().copied().unwrap_or(0);
+        let ok = matches!(self.swo, Some(swo) if swo.set_mode(mode));
+        out[0] = if ok { DAP_OK } else { DAP_ERROR };
+        1
+    }
+
+    /// Returns the rate achieved. Zero is a hard error to probe-rs rather than a
+    /// warning, so it is only reported when nothing was reachable at all.
+    fn swo_baudrate(&mut self, req: &[u8], out: &mut [u8]) -> usize {
+        let requested = if req.len() >= 4 {
+            u32::from_le_bytes([req[0], req[1], req[2], req[3]])
+        } else {
+            0
+        };
+        let actual = match self.swo {
+            Some(swo) => swo.set_baudrate(requested),
+            None => 0,
+        };
+        out[0..4].copy_from_slice(&actual.to_le_bytes());
+        4
+    }
+
+    fn swo_control(&mut self, req: &[u8], out: &mut [u8]) -> usize {
+        let start = req.first().copied().unwrap_or(0) == 1;
+        let ok = match self.swo {
+            Some(swo) => {
+                if start {
+                    swo.start()
+                } else {
+                    swo.stop()
+                }
+            }
+            None => false,
+        };
+        out[0] = if ok { DAP_OK } else { DAP_ERROR };
+        1
+    }
+
+    fn swo_status(&mut self, out: &mut [u8]) -> usize {
+        let (status, count) = self.swo.map_or((0, 0), |swo| swo.status());
+        out[0] = status;
+        out[1..5].copy_from_slice(&count.to_le_bytes());
+        5
+    }
+
+    /// Never issued by probe-rs, which defines the request but has no call site.
+    /// Implemented anyway, because an unanswered command desynchronises a host for
+    /// good; the index and timestamp fields are reported as zero.
+    fn swo_extended_status(&mut self, out: &mut [u8]) -> usize {
+        let (status, count) = self.swo.map_or((0, 0), |swo| swo.status());
+        out[0] = status;
+        out[1..5].copy_from_slice(&count.to_le_bytes());
+        out[5..9].copy_from_slice(&0u32.to_le_bytes());
+        out[9..13].copy_from_slice(&0u32.to_le_bytes());
+        13
+    }
+
+    /// The polled transport: status, a 16-bit count, then the bytes.
+    fn swo_data(&mut self, req: &[u8], out: &mut [u8]) -> usize {
+        let max = if req.len() >= 2 {
+            u16::from_le_bytes([req[0], req[1]]) as usize
+        } else {
+            0
+        };
+
+        let (status, _) = self.swo.map_or((0, 0), |swo| swo.status());
+        // Three bytes of header, and never more than the response buffer holds.
+        let room = out.len().saturating_sub(3);
+        let want = max.min(room);
+
+        let n = match self.swo {
+            Some(swo) => swo.read(&mut out[3..3 + want]),
+            None => 0,
+        };
+
+        out[0] = status;
+        out[1..3].copy_from_slice(&(n as u16).to_le_bytes());
+        3 + n
     }
 }
 
