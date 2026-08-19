@@ -2,8 +2,7 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `f829f3ed` (*mcxn: drop the level walk and detector muting from
-set_active_mode*).
+As of commit `9ba5a5ed` (*mcxn: add SWO capture to the CMSIS-DAP probe*).
 This document describes committed code only; work in progress in the working
 copy is not covered.
 
