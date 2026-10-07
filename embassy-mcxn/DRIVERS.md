@@ -2,7 +2,7 @@
 
 What is implemented today, and exactly where each driver stops.
 
-As of commit `9ba5a5ed` (*mcxn: add SWO capture to the CMSIS-DAP probe*).
+As of commit `95e371cb` (*mcxn: port ENET to xarxa*).
 This document describes committed code only; work in progress in the working
 copy is not covered.
 
