@@ -49,7 +49,7 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join4;
 use embassy_mcxn as hal;
 use embassy_time::Timer;
-use embassy_usb::class::cmsis_dap_v2::{CmsisDapV2Class, State};
+use embassy_usb::class::cmsis_dap_v2::device::{CmsisDapV2Class, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::msos::windows_version;
 use embassy_usb::{Builder, Config, UsbDeviceSpeed};
