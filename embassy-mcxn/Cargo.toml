@@ -34,7 +34,8 @@ defmt = { version = "1.0", optional = true }
 embassy-embedded-hal = { version = "0.6.0", path = "../embassy-embedded-hal" }
 embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
 embassy-hal-internal = { version = "0.5.0", path = "../embassy-hal-internal", features = ["cortex-m", "prio-bits-3"] }
-embassy-net-driver = { version = "0.2.0", path = "../embassy-net-driver" }
+xarxa-driver = { git = "https://github.com/embassy-rs/xarxa", rev = "93228f1ec64720122016be52be4671e413fa92a9", features = ["async"] }
+heapless = "0.9.3"
 embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
 embassy-usb-chipidea = { version = "0.1.0", path = "../embassy-usb-chipidea" }
 embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
@@ -72,12 +73,12 @@ default = ["rt"]
 
 # Base defmt feature enables core + panic handler
 # Use with one logger feature: defmt-rtt (preferred) or defmt-uart (fallback)
-defmt = ["dep:defmt", "nxp-pac/defmt", "embassy-net-driver/defmt", "embassy-usb-chipidea/defmt"]
+defmt = ["dep:defmt", "nxp-pac/defmt", "xarxa-driver/defmt", "embassy-usb-chipidea/defmt"]
 
 unstable-pac = []
 
 ## Enable Ethernet PTP (IEEE 1588) hardware timestamping.
-ptp = ["embassy-net-driver/packetmeta-id"]
+ptp = ["xarxa-driver/packetmeta-timestamp"]
 
 # dummy feature to silence embassy-hal-internal lint
 rt = []

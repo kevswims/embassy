@@ -25,9 +25,10 @@
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_mcxn::enet::{self, Enet, PacketQueue, Phy, PtpClockConfig, PtpTimestampStore};
+use embassy_mcxn::enet::{self, Enet, PacketQueue, Phy, PtpClockConfig, PtpTimestamp};
 use embassy_mcxn::peripherals::ENET0;
-use embassy_net_driver::{Driver, PacketMeta, RxToken};
+use embassy_net::driver::Driver;
+use embassy_net::{Pool, StaticPool};
 use embassy_time::Timer;
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -94,12 +95,9 @@ async fn main(_spawner: Spawner) -> ! {
     let p = embassy_mcxn::init(Default::default());
     info!("ENET0 PTP master-traffic test");
 
-    static TIMESTAMPS: StaticCell<PtpTimestampStore<16, 16>> = StaticCell::new();
-    let timestamps: &'static PtpTimestampStore<16, 16> = TIMESTAMPS.init(PtpTimestampStore::new());
-
     static PACKETS: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
     let mut device = unwrap!(Enet::new(
-        PACKETS.init(PacketQueue::<4, 4>::new_with_ptp(timestamps)),
+        PACKETS.init(PacketQueue::<4, 4>::new()),
         p.ENET0,
         Irqs,
         p.P1_4,
@@ -132,12 +130,9 @@ async fn main(_spawner: Spawner) -> ! {
         // frame at all" and the inner one "was it PTP", so a non-PTP frame
         // does not stop the drain and let the ring fill.
         while let Some(parsed) = recv_ptp(&mut device, &mut frames) {
-            let Some((port, msg_type, seq, id)) = parsed else {
+            let Some((port, msg_type, seq, ts)) = parsed else {
                 continue;
             };
-            let mut meta = PacketMeta::default();
-            meta.id = id;
-            let ts = timestamps.rx_timestamp(meta);
 
             match (port, ts) {
                 (PTP_EVENT_PORT, Some(t)) => {
@@ -189,20 +184,29 @@ async fn main(_spawner: Spawner) -> ! {
     }
 }
 
-/// Receive one frame.
+/// Packet buffers for driving the device without a network stack. The ENET DMA
+/// needs 8-byte aligned buffers, sized in multiples of 8.
+static POOL: StaticPool<1520, 8, 8> = StaticPool::new();
+
+/// Receive one frame, with its ingress timestamp if the MAC captured one.
 ///
 /// `None` means the ring was empty; `Some(None)` means a frame arrived but was
 /// not PTP.
 #[allow(clippy::type_complexity)]
-fn recv_ptp<P: Phy>(device: &mut Enet<'static, ENET0, P>, frames: &mut u32) -> Option<Option<(u16, u8, u16, u32)>> {
-    use core::task::{Context, Waker};
+fn recv_ptp<P: Phy>(
+    device: &mut Enet<'static, ENET0, P>,
+    frames: &mut u32,
+) -> Option<Option<(u16, u8, u16, Option<PtpTimestamp>)>> {
+    // Keep the receive ring stocked, as a network stack would.
+    for _ in 0..device.rx_wanted() {
+        match POOL.alloc() {
+            Some(buf) => device.rx_give(buf),
+            None => break,
+        }
+    }
 
-    let mut cx = Context::from_waker(Waker::noop());
-    let (rx, _tx) = device.receive(&mut cx)?;
-    let id = rx.meta().id;
-    let parsed = rx.consume(|buf| {
-        *frames += 1;
-        parse_ptp(buf)
-    });
-    Some(parsed.map(|(port, msg, seq)| (port, msg, seq, id)))
+    let buf = device.receive()?;
+    *frames += 1;
+    let ts = buf.meta().timestamp.map(PtpTimestamp::from);
+    Some(parse_ptp(&buf).map(|(port, msg, seq)| (port, msg, seq, ts)))
 }

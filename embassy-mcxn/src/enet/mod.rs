@@ -38,18 +38,22 @@ mod sma;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{Ordering, fence};
-use core::task::Context;
+use core::task::{Context, Waker};
 
 use embassy_hal_internal::{Peri, PeripheralType};
-use embassy_net_driver::{Capabilities, Checksum, HardwareAddress, LinkState};
 use embassy_sync::waitqueue::AtomicWaker;
+#[cfg(feature = "ptp")]
+use heapless::Deque;
+#[cfg(feature = "ptp")]
+use xarxa_driver::TxTimestamp;
+use xarxa_driver::{
+    Capabilities, ChecksumOffload, Driver, HardwareAddress, LinkState, Medium, NotSupported, PacketBuf,
+};
 
 use self::descriptors::{RDes, RDesRing, TDes, TDesRing};
 pub use self::generic_phy::GenericPhy;
 #[cfg(feature = "ptp")]
-use self::ptp::{PacketState, PtpTimestampSink};
-#[cfg(feature = "ptp")]
-pub use self::ptp::{PtpTimestamp, PtpTimestampStore};
+pub use self::ptp::PtpTimestamp;
 #[cfg(feature = "ptp")]
 pub use self::ptp_clock::{PTP_REF_CLOCK_HZ, PtpClock, PtpClockConfig, PtpSubsecondIncrement, PtpTimeProvider};
 pub use self::sma::{Sma, StationManagement};
@@ -62,71 +66,46 @@ use crate::pac::enet as vals;
 
 /// Largest Ethernet frame the driver hands to, or accepts from, the stack.
 const MTU: usize = 1514;
-const TX_BUFFER_SIZE: usize = 1514;
-/// Must be a multiple of 4: `DMA_CH0_RX_CONTROL.RBSZ`'s low two bits are not
-/// programmable, so the size is written as `RX_BUFFER_SIZE >> 2`.
-const RX_BUFFER_SIZE: usize = 1536;
 
-const _: () = assert!(RX_BUFFER_SIZE % 4 == 0);
-
-/// A single packet buffer.
+/// Ethernet descriptor rings.
 ///
-/// 8-byte aligned: the DMA requires at least 4-byte alignment for buffer
-/// addresses, and over-aligning costs nothing.
-#[repr(C, align(8))]
-#[derive(Copy, Clone)]
-pub(crate) struct Packet<const N: usize>([u8; N]);
-
-/// Ethernet descriptor rings and packet buffers.
+/// This owns the DMA descriptors of the transmit and receive rings. The frames
+/// themselves live in `embassy-net`'s packet buffer pool: the receive ring
+/// holds one buffer per descriptor, filled by DMA in place, and the transmit
+/// ring holds each frame's buffer until the hardware is done with it.
 ///
-/// This owns all the memory the MAC's DMA reads and writes. `TX` and `RX` are
-/// the number of packets in each ring; larger rings let the hardware absorb
-/// more traffic while the CPU is busy, at the cost of RAM.
+/// `TX` and `RX` are the number of descriptors in each ring; larger rings let
+/// the hardware absorb more traffic while the CPU is busy, at the cost of
+/// pinning more packet buffers. Size the pool well above `TX + RX`, with room
+/// for the stack and sockets. Pool buffers must be 8-byte aligned, and the DMA
+/// uses their size rounded down to a multiple of 8, so to receive full
+/// 1514-byte frames use `StaticPool<1520, N, 8>`.
+///
+/// One descriptor in each ring is reserved as the DMA's tail guard, so each
+/// ring needs at least two descriptors, and the receive ring three with the
+/// `ptp` feature.
+///
+/// With the `ptp` feature, egress timestamps are held here until the stack
+/// collects them, up to `TX` of them.
 pub struct PacketQueue<const TX: usize, const RX: usize> {
     tx_desc: [TDes; TX],
     rx_desc: [RDes; RX],
-    tx_buf: [Packet<TX_BUFFER_SIZE>; TX],
-    rx_buf: [Packet<RX_BUFFER_SIZE>; RX],
     #[cfg(feature = "ptp")]
-    packet_state: PacketState<TX, RX>,
+    tx_timestamps: Deque<TxTimestamp, TX>,
+    tx_buf: [Option<PacketBuf>; TX],
+    rx_buf: [Option<PacketBuf>; RX],
 }
 
 impl<const TX: usize, const RX: usize> PacketQueue<TX, RX> {
     /// Create a new packet queue.
-    ///
-    /// With the `ptp` feature enabled this queue discards timestamps; use
-    /// [`PacketQueue::new_with_ptp`] to keep them.
     pub const fn new() -> Self {
-        Self::new_inner(
-            #[cfg(feature = "ptp")]
-            PtpTimestampSink::new(),
-        )
-    }
-
-    /// Create a packet queue that records hardware PTP timestamps into
-    /// `timestamps`.
-    ///
-    /// Look a timestamp up by the [`embassy_net_driver::PacketMeta`] id of the
-    /// packet it belongs to. The store's depth is independent of the ring
-    /// depth, so timestamp history can outlive the descriptors.
-    ///
-    /// The MAC PTP clock must be started separately with [`Enet::start_ptp`]
-    /// before the hardware produces any timestamps.
-    #[cfg(feature = "ptp")]
-    pub const fn new_with_ptp<const PTP_TX: usize, const PTP_RX: usize>(
-        timestamps: &'static PtpTimestampStore<PTP_TX, PTP_RX>,
-    ) -> Self {
-        Self::new_inner(PtpTimestampSink::from_store(timestamps))
-    }
-
-    const fn new_inner(#[cfg(feature = "ptp")] ptp: PtpTimestampSink) -> Self {
         Self {
             tx_desc: [const { TDes::new() }; TX],
             rx_desc: [const { RDes::new() }; RX],
-            tx_buf: [Packet([0; TX_BUFFER_SIZE]); TX],
-            rx_buf: [Packet([0; RX_BUFFER_SIZE]); RX],
             #[cfg(feature = "ptp")]
-            packet_state: PacketState::new(ptp),
+            tx_timestamps: Deque::new(),
+            tx_buf: [const { None }; TX],
+            rx_buf: [const { None }; RX],
         }
     }
 
@@ -138,28 +117,22 @@ impl<const TX: usize, const RX: usize> PacketQueue<TX, RX> {
     /// `MaybeUninit` static avoids that entirely. After this returns, calling
     /// `assume_init` on the `MaybeUninit` is sound.
     pub fn init(this: &mut MaybeUninit<Self>) {
+        // Descriptors are valid when zeroed. The buffers and the deque are
+        // written as values rather than relying on their representation.
         unsafe {
-            this.as_mut_ptr().write_bytes(0u8, 1);
-            // All-zeros is not a valid `PacketState` by contract, so write it
-            // properly rather than relying on the memset.
+            let ptr = this.as_mut_ptr();
+            (&raw mut (*ptr).tx_desc).write_bytes(0, 1);
+            (&raw mut (*ptr).rx_desc).write_bytes(0, 1);
+            // Copy from a constant rather than constructing the deque by value,
+            // which could put its backing array on the stack.
             #[cfg(feature = "ptp")]
-            (&raw mut (*this.as_mut_ptr()).packet_state).write(PacketState::new(PtpTimestampSink::new()));
-        }
-    }
-
-    /// Initialise a packet queue in place, recording PTP timestamps.
-    ///
-    /// The in-place counterpart of [`PacketQueue::new_with_ptp`]; see
-    /// [`PacketQueue::init`] for why this exists.
-    #[cfg(feature = "ptp")]
-    pub fn init_with_ptp<const PTP_TX: usize, const PTP_RX: usize>(
-        this: &mut MaybeUninit<Self>,
-        timestamps: &'static PtpTimestampStore<PTP_TX, PTP_RX>,
-    ) {
-        unsafe {
-            this.as_mut_ptr().write_bytes(0u8, 1);
-            (&raw mut (*this.as_mut_ptr()).packet_state)
-                .write(PacketState::new(PtpTimestampSink::from_store(timestamps)));
+            (&raw mut (*ptr).tx_timestamps).copy_from_nonoverlapping(const { &Deque::new() }, 1);
+            for i in 0..TX {
+                (&raw mut (*ptr).tx_buf[i]).write(None);
+            }
+            for i in 0..RX {
+                (&raw mut (*ptr).rx_buf[i]).write(None);
+            }
         }
     }
 }
@@ -621,14 +594,8 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         });
 
         regs.dma_ch0_tx_control().modify(|w| w.set_tx_pbl(32));
-        regs.dma_ch0_rx_control().modify(|w| {
-            w.set_rx_pbl(32);
-            // RBSZ is split: bits [2:1] hold RBSZ[1:0] and must stay zero, and
-            // bits [14:3] hold RBSZ[13:2]. So the field takes the size shifted
-            // right by two, which is why RX_BUFFER_SIZE must be a multiple of 4.
-            w.set_rbsz_x_0(0);
-            w.set_rbsz_13_y((RX_BUFFER_SIZE >> 2) as u16);
-        });
+        // RBSZ is programmed by the RX ring once it knows the pool's buffer size.
+        regs.dma_ch0_rx_control().modify(|w| w.set_rx_pbl(32));
 
         Ok(())
     }
@@ -656,9 +623,6 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
             )
         });
 
-        #[cfg(feature = "ptp")]
-        let (tx_state, rx_state) = queue.packet_state.split();
-
         let mut this = Self {
             _peri: peri,
             _pins: PhantomData,
@@ -667,15 +631,9 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
                 &mut queue.tx_desc,
                 &mut queue.tx_buf,
                 #[cfg(feature = "ptp")]
-                tx_state,
+                &mut queue.tx_timestamps,
             ),
-            rx: RDesRing::new(
-                regs,
-                &mut queue.rx_desc,
-                &mut queue.rx_buf,
-                #[cfg(feature = "ptp")]
-                rx_state,
-            ),
+            rx: RDesRing::new(regs, &mut queue.rx_desc, &mut queue.rx_buf),
             phy,
             mac_addr,
             link_state: LinkState::Down,
@@ -745,121 +703,75 @@ impl<'d, T: Instance, P: Phy> Drop for Enet<'d, T, P> {
     }
 }
 
-impl<'d, T: Instance, P: Phy> embassy_net_driver::Driver for Enet<'d, T, P> {
-    type RxToken<'a>
-        = RxToken<'a, 'd>
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = TxToken<'a, 'd>
-    where
-        Self: 'a;
-
-    fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        WAKER.register(cx.waker());
-
-        // Reap egress timestamps for anything the DMA has finished with. This
-        // is the only place that happens, so it must run before the early
-        // return below.
-        #[cfg(feature = "ptp")]
-        self.tx.collect_completed();
-
-        // Only hand out an RX token together with a TX token, so the stack can
-        // always answer the packet it just received.
-        // The token holds a raw pointer rather than a slice so the ring can be
-        // borrowed mutably alongside it; both point into the same `self`, and
-        // the token's lifetime keeps that borrow alive.
-        let rx: *mut [u8] = self.rx.available()?;
-        let tx: *mut [u8] = self.tx.available()?;
-
-        Some((
-            RxToken {
-                pkt: rx,
-                rx: &mut self.rx,
-            },
-            TxToken {
-                pkt: tx,
-                tx: &mut self.tx,
-            },
-        ))
-    }
-
-    fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
-        WAKER.register(cx.waker());
-        let pkt: *mut [u8] = self.tx.available()?;
-        Some(TxToken { pkt, tx: &mut self.tx })
-    }
-
+impl<'d, T: Instance, P: Phy> Driver for Enet<'d, T, P> {
     fn capabilities(&self) -> Capabilities {
         let mut caps = Capabilities::default();
+        caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
-        caps.max_burst_size = Some(self.tx.len());
         // The MAC computes and verifies these in hardware, so the stack can
         // skip them: MAC_CONFIGURATION.IPC on receive, TDES3.CIC on transmit.
         // Frames that fail verification never reach the stack - the descriptor
-        // ring drops them.
-        caps.checksum.ipv4 = Checksum::None;
-        caps.checksum.tcp = Checksum::None;
-        caps.checksum.udp = Checksum::None;
+        // ring drops them. ICMP stays in software: the ring only checks the
+        // payload checksum result for TCP and UDP.
+        caps.checksum.ipv4 = ChecksumOffload::BOTH;
+        caps.checksum.tcp = ChecksumOffload::BOTH;
+        caps.checksum.udp = ChecksumOffload::BOTH;
         caps
-    }
-
-    fn link_state(&mut self, cx: &mut Context) -> LinkState {
-        if let Some(up) = self.phy.poll_link(cx) {
-            self.link_state = if up { LinkState::Up } else { LinkState::Down };
-        }
-        self.link_state
     }
 
     fn hardware_address(&self) -> HardwareAddress {
         HardwareAddress::Ethernet(self.mac_addr)
     }
-}
 
-/// `embassy-net` receive token.
-pub struct RxToken<'a, 'd> {
-    pkt: *mut [u8],
-    rx: &'a mut RDesRing<'d>,
-}
+    fn link_state(&mut self) -> LinkState {
+        self.link_state
+    }
 
-impl<'a, 'd> embassy_net_driver::RxToken for RxToken<'a, 'd> {
+    fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
+        WAKER.register(waker);
+
+        // The stack calls this once per poll, so it is where the PHY's periodic
+        // link poll runs: `Phy::poll_link` re-arms its timer against this
+        // waker, and `link_state` reports what it last found.
+        let mut cx = Context::from_waker(waker);
+        if let Some(up) = self.phy.poll_link(&mut cx) {
+            self.link_state = if up { LinkState::Up } else { LinkState::Down };
+        }
+
+        Ok(())
+    }
+
+    fn rx_wanted(&mut self) -> usize {
+        self.rx.wanted()
+    }
+
+    fn rx_give(&mut self, buf: PacketBuf) {
+        self.rx.give(buf);
+    }
+
+    fn receive(&mut self) -> Option<PacketBuf> {
+        self.tx.reclaim();
+        self.rx.receive()
+    }
+
+    fn can_transmit(&mut self) -> bool {
+        self.tx.reclaim();
+        self.tx.can_transmit()
+    }
+
+    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+        self.tx.reclaim();
+        if !self.tx.can_transmit() {
+            return Err(buf);
+        }
+        self.tx.transmit(buf);
+        Ok(())
+    }
+
     #[cfg(feature = "ptp")]
-    fn meta(&self) -> embassy_net_driver::PacketMeta {
-        self.rx.meta()
-    }
-
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        // SAFETY: `pkt` points into the RX ring this token exclusively borrows.
-        let r = f(unsafe { &mut *self.pkt });
-        self.rx.pop_packet();
-        r
-    }
-}
-
-/// `embassy-net` transmit token.
-pub struct TxToken<'a, 'd> {
-    pkt: *mut [u8],
-    tx: &'a mut TDesRing<'d>,
-}
-
-impl<'a, 'd> embassy_net_driver::TxToken for TxToken<'a, 'd> {
-    #[cfg(feature = "ptp")]
-    fn set_meta(&mut self, meta: embassy_net_driver::PacketMeta) {
-        self.tx.set_meta(meta);
-    }
-
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        // SAFETY: `pkt` points into the TX ring this token exclusively borrows.
-        let pkt = unsafe { &mut *self.pkt };
-        let r = f(&mut pkt[..len]);
-        self.tx.transmit(len);
-        r
+    fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+        self.tx.reclaim();
+        self.tx.poll_timestamp()
     }
 }
 

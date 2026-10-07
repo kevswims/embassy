@@ -85,14 +85,24 @@ async fn main(_spawner: Spawner) -> ! {
 
 /// Pull one frame off the RX ring and discard it, keeping the ring from filling.
 fn drain_one<P: Phy>(device: &mut Enet<'static, ENET0, P>, frames: &mut u32) -> Option<()> {
-    use core::task::{Context, Waker};
+    use embassy_net::driver::Driver;
+    use embassy_net::{Pool, StaticPool};
 
-    use embassy_net_driver::{Driver, RxToken};
+    /// Packet buffers for driving the device without a network stack. The
+    /// ENET DMA needs 8-byte aligned buffers, sized in multiples of 8.
+    static POOL: StaticPool<1520, 8, 8> = StaticPool::new();
 
-    // A no-op waker is fine: this polls in a loop rather than relying on being
-    // woken, and `receive` only uses the waker to schedule a re-poll.
-    let mut cx = Context::from_waker(Waker::noop());
-    let (rx, _tx) = device.receive(&mut cx)?;
-    rx.consume(|_| *frames += 1);
+    // Keep the receive ring stocked, as a network stack would. This polls in a
+    // loop rather than waiting to be woken, so no waker is registered.
+    for _ in 0..device.rx_wanted() {
+        match POOL.alloc() {
+            Some(buf) => device.rx_give(buf),
+            None => break,
+        }
+    }
+
+    // Dropping the frame returns its buffer to the pool.
+    device.receive()?;
+    *frames += 1;
     Some(())
 }

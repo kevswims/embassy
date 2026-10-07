@@ -18,10 +18,11 @@ use core::task::Poll;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_mcxn::enet::{self, Enet, PacketQueue, PtpClockConfig, PtpTimestamp, PtpTimestampStore};
+use embassy_mcxn::enet::{self, Enet, PacketQueue, PtpClockConfig, PtpTimestamp};
 use embassy_mcxn::pac;
 use embassy_mcxn::peripherals::ENET0;
-use embassy_net_driver::{Driver, PacketMeta, RxToken, TxToken};
+use embassy_net::driver::{Driver, PacketBuf, PacketMeta};
+use embassy_net::{Pool, StaticPool};
 use embassy_time::{Duration, Timer, with_timeout};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -31,6 +32,66 @@ embassy_mcxn::bind_interrupts!(struct Irqs {
 });
 
 const MAC_ADDR: [u8; 6] = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+
+/// Packet buffers for driving the device without a network stack. The ENET DMA
+/// needs 8-byte aligned buffers, sized in multiples of 8.
+static POOL: StaticPool<1520, 8, 8> = StaticPool::new();
+
+/// Keep the receive ring stocked with empty buffers, as a network stack would.
+fn refill_rx(device: &mut impl Driver) {
+    for _ in 0..device.rx_wanted() {
+        match POOL.alloc() {
+            Some(buf) => device.rx_give(buf),
+            None => break,
+        }
+    }
+}
+
+/// Wait for a received frame.
+async fn receive(device: &mut impl Driver) -> PacketBuf {
+    poll_fn(|cx| {
+        // Register before checking, so a frame that lands in between still wakes us.
+        unwrap!(device.register_waker(cx.waker()));
+        refill_rx(device);
+        match device.receive() {
+            Some(buf) => Poll::Ready(buf),
+            None => Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Wait for room in the transmit ring, then queue `frame` with `meta` attached.
+async fn transmit(device: &mut impl Driver, frame: &[u8], meta: PacketMeta) {
+    let mut buf = unwrap!(POOL.alloc());
+    buf.set_len(frame.len());
+    buf.copy_from_slice(frame);
+    buf.set_meta(meta);
+
+    poll_fn(|cx| {
+        unwrap!(device.register_waker(cx.waker()));
+        if device.can_transmit() { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    unwrap!(device.transmit(buf));
+}
+
+/// Wait for the egress timestamp of the frame sent with packet id `id`.
+///
+/// Timestamps are reported out of band, possibly after the frame has already
+/// been received, so this polls until the one for `id` turns up.
+async fn tx_timestamp(device: &mut impl Driver, id: u32) -> PtpTimestamp {
+    poll_fn(|cx| {
+        unwrap!(device.register_waker(cx.waker()));
+        while let Some(ts) = device.poll_tx_timestamp() {
+            if ts.id == id {
+                return Poll::Ready(ts.timestamp.into());
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 /// A PTPv2 Sync message inside UDP/IPv4, addressed to the PTP primary
 /// multicast address 224.0.1.129 and UDP port 319.
@@ -100,12 +161,9 @@ async fn main(_spawner: Spawner) -> ! {
     let p = embassy_mcxn::init(Default::default());
     info!("ENET0 PTP loopback timestamping test");
 
-    static TIMESTAMPS: StaticCell<PtpTimestampStore<8, 8>> = StaticCell::new();
-    let timestamps: &'static PtpTimestampStore<8, 8> = TIMESTAMPS.init(PtpTimestampStore::new());
-
     static PACKETS: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
     let mut device = unwrap!(Enet::new(
-        PACKETS.init(PacketQueue::<4, 4>::new_with_ptp(timestamps)),
+        PACKETS.init(PacketQueue::<4, 4>::new()),
         p.ENET0,
         Irqs,
         p.P1_4,
@@ -134,74 +192,33 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut passes = 0u32;
     for round in 0..4u32 {
-        // Packet ids are the key into the timestamp store; 0 means "no
-        // timestamp", so start at 1.
+        // The packet id is what an egress timestamp is reported against.
         let id = round + 1;
         let frame = build_sync_frame(round as u16);
 
-        poll_fn(|cx| match device.transmit(cx) {
-            Some(mut tok) => {
-                let mut meta = PacketMeta::default();
-                meta.id = id;
-                tok.set_meta(meta);
-                tok.consume(frame.len(), |buf| buf.copy_from_slice(&frame));
-                Poll::Ready(())
-            }
-            None => Poll::Pending,
-        })
-        .await;
+        let mut meta = PacketMeta::default();
+        meta.id = id;
+        meta.request_timestamp = true;
+        transmit(&mut device, &frame, meta).await;
 
-        // Receive the looped-back copy. `receive` is also what reaps egress
-        // timestamps, so it must be polled either way.
-        let mut rx_id = 0u32;
-        let got = with_timeout(
-            Duration::from_secs(2),
-            poll_fn(|cx| match device.receive(cx) {
-                Some((rx, _tx)) => {
-                    rx_id = rx.meta().id;
-                    Poll::Ready(rx.consume(|buf| buf.len()))
-                }
-                None => Poll::Pending,
-            }),
-        )
-        .await;
-
-        let rx_len = match got {
-            Ok(len) => len,
+        let rx = match with_timeout(Duration::from_secs(2), receive(&mut device)).await {
+            Ok(buf) => buf,
             Err(_) => {
                 error!("round {}: timed out waiting for the looped-back frame", round);
                 continue;
             }
         };
+        let rx_len = rx.len();
+        let rx_ts = rx.meta().timestamp.map(PtpTimestamp::from);
+        drop(rx);
 
-        // The egress timestamp lands when the DMA writes the descriptor back,
-        // which may be after the frame has already been received.
-        let tx_ts = match with_timeout(
-            Duration::from_secs(1),
-            poll_fn(|cx| {
-                // Keep polling receive so collect_completed runs.
-                let _ = device.receive(cx);
-                let mut meta = PacketMeta::default();
-                meta.id = id;
-                match timestamps.tx_timestamp(meta) {
-                    Some(ts) => Poll::Ready(ts),
-                    None => Poll::Pending,
-                }
-            }),
-        )
-        .await
-        {
-            Ok(ts) => Some(ts),
-            Err(_) => None,
-        };
-
-        let mut rx_meta = PacketMeta::default();
-        rx_meta.id = rx_id;
-        let rx_ts = timestamps.rx_timestamp(rx_meta);
+        let tx_ts = with_timeout(Duration::from_secs(1), tx_timestamp(&mut device, id))
+            .await
+            .ok();
 
         info!(
-            "round {}: rx {} bytes, rx_id={} tx_ts={:?} rx_ts={:?}",
-            round, rx_len, rx_id, tx_ts, rx_ts
+            "round {}: rx {} bytes, id={} tx_ts={:?} rx_ts={:?}",
+            round, rx_len, id, tx_ts, rx_ts
         );
 
         match (tx_ts, rx_ts) {

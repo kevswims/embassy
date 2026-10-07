@@ -33,7 +33,7 @@ copy is not covered.
 | LPUART (LP_FLEXCOMM) | LPUART0–9 | async | yes (TX, RX, ring RX) | `uart_loopback.rs`, `uart_dma_loopback.rs`, `uart_ring_rx.rs` |
 | FlexCAN | CAN0, CAN1 | async | no | `can_loopback.rs` |
 | FlexSPI (serial NOR) | FLEXSPI0 | async + blocking | yes (mem-to-mem to the IP FIFOs) | `flexspi_quad_*.rs`, `flexspi_soak.rs`, `flexspi_stress.rs`, `flexspi_cancel_soak.rs` |
-| ENET (Ethernet MAC) | ENET0 | `embassy-net-driver` | own descriptor DMA | `eth.rs`, `eth_loopback.rs`, `eth_ptp_clock.rs` |
+| ENET (Ethernet MAC) | ENET0 | `xarxa-driver` (`embassy-net`) | own descriptor DMA | `eth.rs`, `eth_loopback.rs`, `eth_ptp_clock.rs`, `eth_ptp_loopback.rs` |
 | USB HS (device) | USBHS1 | `embassy-usb-driver` | own descriptor DMA | `usb_bulk_loopback.rs` |
 | LPADC | ADC0, ADC1 | async | no | `adc.rs`, `adc_vref_buffered.rs` |
 | VREF | VREF0 | blocking | — | `adc_vref_buffered.rs` |
@@ -429,14 +429,24 @@ from `fro_hf` on device slot A1.
 ENET0, a Synopsys DesignWare Ethernet QoS (DWMAC) core: MAC, multi-queue MTL and
 a descriptor DMA with its **own bus master** — unrelated to the eDMA in
 `src/dma.rs`. 100 Mbit full duplex over RMII, exposed to `embassy-net` as a
-zero-copy `embassy_net_driver::Driver`, so no runner task is needed and the RX
-and TX tokens point straight into the descriptor buffers.
+`xarxa_driver::Driver`. It is zero-copy: the receive ring holds buffers from the
+stack's packet pool, which the DMA fills in place, and each transmitted frame's
+buffer is held until the DMA has read it.
 
 `Enet::new` gates and resets ENET0, selects RMII in
 `SYSCON0.ENET_PHY_INTF_SEL`, soft-resets the DMA, configures the MAC/MTL/DMA,
 builds the rings, starts the engines and brings up the PHY. `PacketQueue<TX, RX>`
-owns all descriptor and buffer memory, with a `const fn new()` and an in-place
-`init(&mut MaybeUninit<_>)` for large rings. `GenericPhy` is a clause-22 PHY
+owns the descriptor memory, with a `const fn new()` and an in-place
+`init(&mut MaybeUninit<_>)` for large rings. Packet buffers come from
+`embassy-net`'s pool, which must hand out 8-byte aligned buffers; the DMA uses
+their size rounded down to a multiple of 8, so full 1514-byte frames need
+`StaticPool<1520, N, 8>`. The pool should be well above `TX + RX`.
+
+The DMA stops fetching at the tail pointer and prefetches descriptors, so the
+tail never lands on a descriptor it may be waiting on: the receive ring keeps
+its most recently rearmed descriptor as the tail, and the transmit ring keeps
+one descriptor free. Each ring therefore needs at least two descriptors, and
+the receive ring three with `ptp` (frame, timestamp context, guard). `GenericPhy` is a clause-22 PHY
 that probes SMI addresses 0..32; `enet::sma()` builds just the MDIO interface
 for board bring-up, without starting the MAC.
 
@@ -444,9 +454,11 @@ Verified on FRDM-MCXN947 hardware, end to end on a live network: the PHY
 identifies as a LAN8741A at SMI address 0 (`ID1=0x0007`, `ID2=0xC121`);
 `eth_loopback.rs` round-trips 5/5 60-byte frames through `MAC_CONFIGURATION.LM`
 byte-exact with no DMA errors; and `eth.rs` negotiates a 100 Mbit link, takes a
-DHCP lease, answers ICMP echo (5/5, ~1.9 ms RTT) and sustains an outbound TCP
+DHCP lease, answers ICMP echo (5/5, ~0.2 ms RTT) and sustains an outbound TCP
 connection. The DHCP exchange completing is also what confirms hardware TX
-checksum insertion produces valid packets - the server accepts them.
+checksum insertion produces valid packets - the server accepts them. Answering
+pings needs `embassy-net`'s `icmp-ping-reply` feature, which is off by
+default.
 
 **Chip-specific behaviour** that generic DWMAC knowledge gets wrong here, and
 that the driver depends on:
@@ -470,6 +482,8 @@ that the driver depends on:
 - **`RBSZ` is split across two PAC fields**, `rbsz_x_0` at register bits [2:1]
   (`RBSZ[1:0]`, must stay zero) and `rbsz_13_y` at [14:3] (`RBSZ[13:2]`), so the
   RX buffer size is written shifted right by two and must be a multiple of 4.
+  The receive ring programs it from the pool's buffer size on the first buffer
+  it is given.
 - **`CST` as well as `ACS`.** `ACS` only strips pad/FCS from *length* frames;
   IP traffic is all *type* frames, so without `CST` every received packet
   arrives with four trailing CRC bytes.
@@ -514,31 +528,33 @@ Note the databook's nanosecond-rollover subtlety *is* required on this part: a
 negative `offset_time` must be programmed as `1e9 - nanos` with `ADDSUB` set,
 which the driver does and the hardware test confirms.
 
-**PTP per-packet timestamping** (feature `ptp`): `PacketQueue::new_with_ptp`
-(or `init_with_ptp`) attaches a `'static PtpTimestampStore`, after which the
-MAC captures egress and ingress timestamps for PTP *event* messages and the
-application looks them up by the `PacketMeta::id` of the packet concerned.
-Timestamps are delivered through this side table rather than through
-`PacketMeta::timestamp`, because `embassy-net`'s `driver_util` conversion
-copies only `id` between its own `PacketMeta` and xarxa's - a `timestamp` set
-by a driver is dropped at that boundary, so the native field would never reach
-an application.
+**PTP per-packet timestamping** (feature `ptp`): the MAC captures egress and
+ingress timestamps for PTP *event* messages, and they travel through
+`embassy-net` natively. An ingress timestamp is set on the received packet's
+`PacketMeta::timestamp`. An egress timestamp is requested per packet with
+`PacketMeta::request_timestamp`, and reported afterwards by
+`Driver::poll_tx_timestamp` (`Stack::tx_timestamp` through `embassy-net`),
+tagged with the packet's `PacketMeta::id`. `PacketQueue` holds up to `TX`
+egress timestamps until they are collected; past that they are dropped with a
+warning. Both use xarxa's `Timestamp`, which converts to and from
+`PtpTimestamp`.
 
-Transmit timestamping is opt-in per packet: the MAC has only a few timestamp
-slots, so `TDES2.TTSE` is set only when a store is attached *and* the stack
-gave the packet a non-zero id. On receive, the timestamp arrives in a **context
-descriptor following** the packet's own, and `RDES1` is only trusted when
-`RDES3.RS1V` says the status word was written back - descriptors returned to
-the DMA do not clear `RDES1`. If the context descriptor has not landed yet the
-packet is deliberately left queued for one more poll rather than delivered
-without its timestamp.
+Transmit timestamping is opt-in per packet because the MAC has only a few
+timestamp slots: `TDES2.TTSE` is set only for packets that ask. On receive, the
+timestamp arrives in a **context descriptor following** the packet's own, and
+`RDES1` is only trusted when `RDES3.RS1V` says the status word was written
+back - descriptors returned to the DMA do not clear `RDES1`. If the context
+descriptor has not landed yet the packet is deliberately left queued for one
+more poll rather than delivered without its timestamp.
 
-Verified on hardware, two ways. Through MAC loopback, four PTPv2 Sync messages
-each produced both an egress and an ingress timestamp, with packet ids matching
-and `rx - tx` a consistent 256 ns (8 x the 32 ns clock increment). Against live
-PTP traffic on a real network, every Sync (UDP 319, an *event* message) was
-timestamped and no Follow_Up or Announce (UDP 320, *general* messages) was -
-4/4 and 0/8 amid ~190 frames of unrelated traffic, which is the evidence that
+Verified on hardware through MAC loopback (`eth_ptp_loopback.rs`): four PTPv2
+Sync messages each produced both an egress timestamp, matched back by packet
+id, and an ingress timestamp, with `rx - tx` a consistent 288 ns (9 x the 32 ns
+clock increment). Which messages get stamped is MAC configuration, independent
+of how timestamps are delivered, and was verified against live PTP traffic on a
+real network: every Sync (UDP 319, an *event* message) was timestamped and no
+Follow_Up or Announce (UDP 320, *general* messages) was - 4/4 and 0/8 amid ~190
+frames of unrelated traffic, which is the evidence that
 `TSEVNTENA`/`SNAPTYPSEL` classification works rather than the MAC stamping
 indiscriminately.
 

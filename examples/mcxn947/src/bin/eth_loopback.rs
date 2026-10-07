@@ -1,8 +1,7 @@
 //! ENET0 datapath self-test using the MAC's internal loopback.
 //!
 //! Puts the MAC in loopback (`MAC_CONFIGURATION.LM`), transmits a frame through
-//! the driver's `embassy-net` TX token, and waits for it to come back on the RX
-//! token. This exercises the whole datapath - descriptor rings, tail-pointer
+//! the driver directly, and waits for it to come back. This exercises the whole datapath - descriptor rings, tail-pointer
 //! doorbells, the DMA and the interrupt - with **no cable and no link partner**.
 //!
 //! Loopback is internal to the MAC but still runs on the RMII clock domain, so
@@ -19,7 +18,8 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_mcxn::enet::{self, Enet, PacketQueue};
 use embassy_mcxn::pac;
-use embassy_net_driver::{Driver, RxToken, TxToken};
+use embassy_net::driver::{Driver, PacketBuf};
+use embassy_net::{Pool, StaticPool};
 use embassy_time::{Duration, Timer, with_timeout};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -31,6 +31,48 @@ embassy_mcxn::bind_interrupts!(struct Irqs {
 const MAC_ADDR: [u8; 6] = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
 /// Minimum Ethernet payload, so the MAC does not have to pad.
 const FRAME_LEN: usize = 60;
+
+/// Packet buffers for driving the device without a network stack. The ENET DMA
+/// needs 8-byte aligned buffers, sized in multiples of 8.
+static POOL: StaticPool<1520, 8, 8> = StaticPool::new();
+
+/// Keep the receive ring stocked with empty buffers, as a network stack would.
+fn refill_rx(device: &mut impl Driver) {
+    for _ in 0..device.rx_wanted() {
+        match POOL.alloc() {
+            Some(buf) => device.rx_give(buf),
+            None => break,
+        }
+    }
+}
+
+/// Wait for a received frame.
+async fn receive(device: &mut impl Driver) -> PacketBuf {
+    poll_fn(|cx| {
+        // Register before checking, so a frame that lands in between still wakes us.
+        unwrap!(device.register_waker(cx.waker()));
+        refill_rx(device);
+        match device.receive() {
+            Some(buf) => Poll::Ready(buf),
+            None => Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Wait for room in the transmit ring, then queue `frame`.
+async fn transmit(device: &mut impl Driver, frame: &[u8]) {
+    let mut buf = unwrap!(POOL.alloc());
+    buf.set_len(frame.len());
+    buf.copy_from_slice(frame);
+
+    poll_fn(|cx| {
+        unwrap!(device.register_waker(cx.waker()));
+        if device.can_transmit() { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    unwrap!(device.transmit(buf));
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
@@ -74,14 +116,7 @@ async fn main(_spawner: Spawner) -> ! {
     for round in 0..5u32 {
         frame[14] = round as u8;
 
-        poll_fn(|cx| match device.transmit(cx) {
-            Some(tok) => {
-                tok.consume(FRAME_LEN, |buf| buf.copy_from_slice(&frame));
-                Poll::Ready(())
-            }
-            None => Poll::Pending,
-        })
-        .await;
+        transmit(&mut device, &frame).await;
         info!("round {}: frame queued for transmit", round);
 
         Timer::after_millis(200).await;
@@ -116,18 +151,13 @@ async fn main(_spawner: Spawner) -> ! {
 
         let mut rx = [0u8; FRAME_LEN];
         let mut rx_len = 0usize;
-        let got = with_timeout(
-            Duration::from_secs(2),
-            poll_fn(|cx| match device.receive(cx) {
-                Some((rx_tok, _tx_tok)) => Poll::Ready(rx_tok.consume(|buf| {
-                    rx_len = buf.len();
-                    let n = buf.len().min(FRAME_LEN);
-                    rx[..n].copy_from_slice(&buf[..n]);
-                })),
-                None => Poll::Pending,
-            }),
-        )
-        .await;
+        let got = with_timeout(Duration::from_secs(2), receive(&mut device))
+            .await
+            .map(|buf| {
+                rx_len = buf.len();
+                let n = buf.len().min(FRAME_LEN);
+                rx[..n].copy_from_slice(&buf[..n]);
+            });
 
         match got {
             Err(_) => error!("round {}: TIMEOUT - nothing received", round),

@@ -18,7 +18,8 @@ use embassy_mcxn::enet::{Enet, GenericPhy, PacketQueue, Sma};
 use embassy_mcxn::peripherals::ENET0;
 use embassy_mcxn::{bind_interrupts, enet};
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Ipv4Address, StackResources};
+use embassy_net::wire::Ipv4Addr;
+use embassy_net::{StackStorage, StaticPool};
 use embassy_time::Timer;
 use embedded_io_async::Write;
 use panic_probe as _;
@@ -32,10 +33,10 @@ type Device = Enet<'static, ENET0, GenericPhy<Sma<ENET0>>>;
 
 /// Where the TCP client half connects. Change this to the machine running the
 /// listener - the example has no way to discover it.
-const REMOTE_ENDPOINT: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 100), 8000);
+const REMOTE_ENDPOINT: (Ipv4Addr, u16) = (Ipv4Addr::new(192, 168, 1, 100), 8000);
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
     runner.run().await
 }
 
@@ -70,25 +71,26 @@ async fn main(spawner: Spawner) -> ! {
         enet::Config::default(),
     ));
 
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(
-        device,
-        embassy_net::Config::dhcpv4(Default::default()),
-        RESOURCES.init(StackResources::new()),
-        seed,
-    );
+    static STACK: StaticCell<StackStorage> = StaticCell::new();
+    // The ENET DMA needs 8-byte aligned buffers, sized in multiples of 8.
+    static POOL: StaticPool<1520, 16, 8> = StaticPool::new();
+    let (stack, runner) = embassy_net::Stack::new(STACK.init(StackStorage::new()), &POOL, seed);
+
+    static DEVICE: StaticCell<Device> = StaticCell::new();
+    let iface = unwrap!(stack.add_iface_borrowed(DEVICE.init(device)));
+    unwrap!(iface.set_dhcpv4(Some(Default::default())));
 
     spawner.spawn(unwrap!(net_task(runner)));
 
     info!("waiting for link and DHCP...");
-    stack.wait_config_up().await;
-    info!("network up: {:?}", stack.config_v4());
+    iface.wait_config_up().await;
+    info!("network up: {:?}", iface.dhcpv4_lease());
 
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 1024];
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut socket = unwrap!(TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer));
         socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
         info!("connecting...");
