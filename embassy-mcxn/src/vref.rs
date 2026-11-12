@@ -72,11 +72,11 @@ impl<'d, T: Instance> Vref<'d, T> {
 
         let regs = T::info().regs();
         regs.csr().modify(|w| {
-            w.set_hcbgen(Hcbgen::Ena);
-            w.set_regen(Regen::Ena);
-            w.set_chopen(Chopen::Ena);
-            w.set_icompen(Icompen::Ena);
-            w.set_buf21en(Buf21en::Ena);
+            w.set_hcbgen(Hcbgen::Enabled);
+            w.set_regen(Regen::Enabled);
+            w.set_chopen(Chopen::Enabled);
+            w.set_icompen(Icompen::Enabled);
+            w.set_buf21en(Buf21en::Enabled);
             w.set_hi_pwr_lv(match power {
                 BufferPower::Low => HiPwrLv::Low,
                 BufferPower::High => HiPwrLv::High,
@@ -106,7 +106,7 @@ impl<'d, T: Instance> Vref<'d, T> {
     pub fn set_trim_2v1(&mut self, trim: u8) {
         let regs = T::info().regs();
         regs.utrim().modify(|w| w.set_trim2v1(trim & 0x0F));
-        if regs.csr().read().chopen() == Chopen::Ena {
+        if regs.csr().read().chopen() == Chopen::Enabled {
             delay_us(1600);
         }
     }
@@ -121,11 +121,11 @@ impl<'d, T: Instance> Vref<'d, T> {
         unsafe { enable_and_reset::<T>() };
 
         let regs = T::info().regs();
-        regs.csr().modify(|w| w.set_lpbgen(Lpbgen::Ena));
+        regs.csr().modify(|w| w.set_lpbgen(Lpbgen::Enabled));
         // The bandgap needs ~20us to settle before its buffer is enabled, and
         // is given the same 4x margin as the buffered path above.
         delay_us(80);
-        regs.csr().modify(|w| w.set_lpbg_buf_en(LpbgBufEn::Ena));
+        regs.csr().modify(|w| w.set_lpbg_buf_en(LpbgBufEn::Enabled));
 
         Self { _peri: peri }
     }
@@ -135,14 +135,14 @@ impl<'d, T: Instance> Drop for Vref<'d, T> {
     fn drop(&mut self) {
         let regs = T::info().regs();
         regs.csr().modify(|w| {
-            w.set_buf21en(Buf21en::Dis);
+            w.set_buf21en(Buf21en::Disabled);
             w.set_hi_pwr_lv(HiPwrLv::Low);
-            w.set_icompen(Icompen::Dis);
-            w.set_chopen(Chopen::Dis);
-            w.set_regen(Regen::Dis);
-            w.set_hcbgen(Hcbgen::Dis);
-            w.set_lpbg_buf_en(LpbgBufEn::Dis);
-            w.set_lpbgen(Lpbgen::Dis);
+            w.set_icompen(Icompen::Disabled);
+            w.set_chopen(Chopen::Disabled);
+            w.set_regen(Regen::Disabled);
+            w.set_hcbgen(Hcbgen::Disabled);
+            w.set_lpbg_buf_en(LpbgBufEn::Disabled);
+            w.set_lpbgen(Lpbgen::Disabled);
         });
         pac::SPC0.active_cfg1().modify(|w| w.0 &= !SPC_CONTROL_VREF);
     }

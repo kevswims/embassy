@@ -420,10 +420,10 @@ impl DmaChannel<'_> {
 
     /// This channel's TCD register page.
     #[inline]
-    pub(crate) fn tcd(&self) -> pac::edma_tcd::Tcd {
+    pub(crate) fn tcd(&self) -> pac::edma_tcd::ChannelDma0 {
         match self.dma() {
-            0 => pac::EDMA_0_TCD.tcd(self.channel()),
-            1 => pac::EDMA_1_TCD.tcd(self.channel()),
+            0 => unsafe { pac::edma_tcd::ChannelDma0::from_ptr(pac::TCD0.tcd(self.channel()).as_ptr()) },
+            1 => unsafe { pac::edma_tcd::ChannelDma0::from_ptr(pac::TCD1.tcd(self.channel()).as_ptr()) },
             _ => unreachable!(),
         }
     }
@@ -435,7 +435,7 @@ impl DmaChannel<'_> {
 
     /// Zero every TCD register, so no field carries over from a previous
     /// transfer on this channel.
-    fn clear_tcd(t: &pac::edma_tcd::Tcd) {
+    fn clear_tcd(t: &pac::edma_tcd::ChannelDma0) {
         t.tcd_saddr().write(|w| w.set_saddr(0));
         t.tcd_soff().write(|w| w.set_soff(0));
         t.tcd_attr().write(|w| *w = TcdAttr(0));
@@ -449,13 +449,13 @@ impl DmaChannel<'_> {
     }
 
     #[inline]
-    fn set_major_loop_ct_elinkno(t: &pac::edma_tcd::Tcd, count: u16) {
+    fn set_major_loop_ct_elinkno(t: &pac::edma_tcd::ChannelDma0, count: u16) {
         t.tcd_biter_elinkno().write(|w| w.set_biter(count));
         t.tcd_citer_elinkno().write(|w| w.set_citer(count));
     }
 
     #[inline]
-    fn set_major_loop_nbytes_without_minor(t: &pac::edma_tcd::Tcd, count: u32) {
+    fn set_major_loop_nbytes_without_minor(t: &pac::edma_tcd::ChannelDma0, count: u32) {
         t.tcd_nbytes_mloffno().write(|w| {
             w.set_smloe(TcdNbytesMloffnoSmloe::OffsetNotApplied);
             w.set_dmloe(TcdNbytesMloffnoDmloe::OffsetNotApplied);
@@ -464,43 +464,43 @@ impl DmaChannel<'_> {
     }
 
     #[inline]
-    fn set_no_final_adjustments(t: &pac::edma_tcd::Tcd) {
+    fn set_no_final_adjustments(t: &pac::edma_tcd::ChannelDma0) {
         t.tcd_slast_sda().write(|w| w.set_slast_sda(0));
         t.tcd_dlast_sga().write(|w| w.set_dlast_sga(0));
     }
 
     #[inline]
-    fn set_source_ptr<T>(t: &pac::edma_tcd::Tcd, p: *const T) {
+    fn set_source_ptr<T>(t: &pac::edma_tcd::ChannelDma0, p: *const T) {
         t.tcd_saddr().write(|w| w.set_saddr(p as u32));
     }
 
     #[inline]
-    fn set_source_increment(t: &pac::edma_tcd::Tcd, sz: WordSize) {
+    fn set_source_increment(t: &pac::edma_tcd::ChannelDma0, sz: WordSize) {
         t.tcd_soff().write(|w| w.set_soff(sz.bytes() as u16));
     }
 
     #[inline]
-    fn set_source_fixed(t: &pac::edma_tcd::Tcd) {
+    fn set_source_fixed(t: &pac::edma_tcd::ChannelDma0) {
         t.tcd_soff().write(|w| w.set_soff(0));
     }
 
     #[inline]
-    fn set_dest_ptr<T>(t: &pac::edma_tcd::Tcd, p: *mut T) {
+    fn set_dest_ptr<T>(t: &pac::edma_tcd::ChannelDma0, p: *mut T) {
         t.tcd_daddr().write(|w| w.set_daddr(p as u32));
     }
 
     #[inline]
-    fn set_dest_increment(t: &pac::edma_tcd::Tcd, sz: WordSize) {
+    fn set_dest_increment(t: &pac::edma_tcd::ChannelDma0, sz: WordSize) {
         t.tcd_doff().write(|w| w.set_doff(sz.bytes() as u16));
     }
 
     #[inline]
-    fn set_dest_fixed(t: &pac::edma_tcd::Tcd) {
+    fn set_dest_fixed(t: &pac::edma_tcd::ChannelDma0) {
         t.tcd_doff().write(|w| w.set_doff(0));
     }
 
     #[inline]
-    fn set_fixed_priority(t: &pac::edma_tcd::Tcd, p: Priority) {
+    fn set_fixed_priority(t: &pac::edma_tcd::ChannelDma0, p: Priority) {
         t.ch_pri().write(|w| {
             w.set_dpa(Dpa::Suspend);
             w.set_ecp(Ecp::Suspend);
@@ -510,7 +510,7 @@ impl DmaChannel<'_> {
 
     /// Clear the three sticky per-channel status flags. All are write-1-to-clear.
     #[inline]
-    fn reset_channel_state(t: &pac::edma_tcd::Tcd) {
+    fn reset_channel_state(t: &pac::edma_tcd::ChannelDma0) {
         t.ch_csr().write(|w| w.set_done(true));
         t.ch_es().write(|w| w.set_err(true));
         t.ch_int().write(|w| w.set_int(true));
@@ -1392,7 +1392,8 @@ impl<'channel, 'buf, W: Word> RingBuffer<'channel, 'buf, W> {
             dst[first..to_read].copy_from_slice(&buf[..to_read - first]);
         }
 
-        self.read_pos.store((read_pos + to_read) % self.buf_len, Ordering::Release);
+        self.read_pos
+            .store((read_pos + to_read) % self.buf_len, Ordering::Release);
         to_read
     }
 
@@ -1419,11 +1420,7 @@ impl<'channel, 'buf, W: Word> RingBuffer<'channel, 'buf, W> {
             self.channel.waker().register(cx.waker());
 
             let n = self.read_immediate(dst);
-            if n > 0 {
-                Poll::Ready(Ok(n))
-            } else {
-                Poll::Pending
-            }
+            if n > 0 { Poll::Ready(Ok(n)) } else { Poll::Pending }
         })
         .await
     }
@@ -1522,8 +1519,8 @@ impl<'a> DmaChannel<'a> {
 /// Must only be called from the vector belonging to `(dma, channel)`.
 pub(crate) unsafe fn on_interrupt(dma: usize, channel: usize) {
     let t = match dma {
-        0 => pac::EDMA_0_TCD.tcd(channel),
-        1 => pac::EDMA_1_TCD.tcd(channel),
+        0 => unsafe { pac::edma_tcd::ChannelDma0::from_ptr(pac::TCD0.tcd(channel).as_ptr()) },
+        1 => unsafe { pac::edma_tcd::ChannelDma0::from_ptr(pac::TCD1.tcd(channel).as_ptr()) },
         _ => unreachable!(),
     };
 

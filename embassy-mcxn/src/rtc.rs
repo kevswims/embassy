@@ -165,17 +165,24 @@ fn is_valid(dt: &DateTime) -> bool {
 /// A no-op walk-through when write protection is already disengaged: replaying
 /// the unlock sequence from an unlocked state re-arms protection instead of
 /// leaving it alone, so every entry checks `write_prot_en` first.
-fn with_write_unlocked<R>(regs: pac::rtc5xx::Rtc, f: impl FnOnce() -> R) -> R {
-    if regs.status().read().write_prot_en() {
-        regs.status8().write_value(0x00);
-        regs.status8().write_value(0x40);
-        regs.status8().write_value(0xC0);
-        regs.status8().write_value(0x80);
+/// Write the byte-wide alias of `STATUS`, which the unlock sequence needs.
+fn status8(regs: &pac::rtc::RtcAlpha, value: u8) {
+    // SAFETY: `STATUS` is a memory-mapped register, and its low byte is
+    // byte-addressable.
+    unsafe { (regs.status().as_ptr() as *mut u8).write_volatile(value) }
+}
+
+fn with_write_unlocked<R>(regs: pac::rtc::RtcAlpha, f: impl FnOnce() -> R) -> R {
+    if crate::bits::is_set(regs.status().read().write_prot_en()) {
+        status8(&regs, 0x00);
+        status8(&regs, 0x40);
+        status8(&regs, 0xC0);
+        status8(&regs, 0x80);
     }
 
     let result = f();
 
-    regs.status8().write_value(0x80);
+    status8(&regs, 0x80);
 
     result
 }
@@ -197,7 +204,10 @@ impl<'d, T: Instance> Rtc<'d, T> {
         let regs = T::info().regs();
         with_write_unlocked(regs, || {
             regs.ctrl().modify(|w| {
-                w.set_clk_sel(matches!(config.clock.source, RtcClockSource::Xtal32k));
+                w.set_clk_sel(crate::bits::from_bool(matches!(
+                    config.clock.source,
+                    RtcClockSource::Xtal32k
+                )));
             });
         });
 
@@ -218,9 +228,9 @@ impl<'d, T: Instance> Rtc<'d, T> {
 
         DateTime {
             year: BASE_YEAR + ym.yrofst() as u16,
-            month: ym.mon_cnt(),
+            month: crate::bits::raw(ym.mon_cnt()),
             day: d.day_cnt(),
-            dow: Weekday::from_pac(d.dow()),
+            dow: Weekday::from_pac(crate::bits::raw(d.dow())),
             hour: hm.hour_cnt(),
             minute: hm.min_cnt(),
             second: s.sec_cnt(),
@@ -238,11 +248,11 @@ impl<'d, T: Instance> Rtc<'d, T> {
         with_write_unlocked(regs, || {
             regs.yearmon().modify(|w| {
                 w.set_yrofst((dt.year - BASE_YEAR) as u8);
-                w.set_mon_cnt(dt.month);
+                w.set_mon_cnt(crate::bits::flag(dt.month));
             });
             regs.days().modify(|w| {
                 w.set_day_cnt(dt.day);
-                w.set_dow(dt.dow.to_pac());
+                w.set_dow(crate::bits::flag(dt.dow.to_pac()));
             });
             regs.hourmin().modify(|w| {
                 w.set_hour_cnt(dt.hour);
@@ -282,11 +292,11 @@ impl<'d, T: Instance> Rtc<'d, T> {
             regs.alm_seconds().modify(|w| w.set_alm_sec(dt.second));
             // `alm_match`: 0 = seconds/minutes/hours, 1 = +days, 2 = +months,
             // 3 = +year (narrowest - all six fields).
-            regs.ctrl().modify(|w| w.set_alm_match(0b11));
+            regs.ctrl().modify(|w| w.set_alm_match(crate::bits::flag(0b11)));
             // Clear any stale ALM_IS left set from a previous alarm or reset,
             // so wait_for_alarm's first poll can't return immediately on a
             // flag this call didn't actually just cause.
-            regs.isr().write(|w| w.set_alm_is(true));
+            regs.isr().write(|w| w.set_alm_is(crate::bits::from_bool(true)));
         });
 
         Ok(())
@@ -307,10 +317,14 @@ fn wait_for_alarm<T: Instance>() -> impl Future<Output = ()> {
         // elapse during the wait between arming the alarm and it firing -
         // every write here must go through `with_write_unlocked` rather than
         // assuming `set_alarm`'s unlock is still in effect.
-        with_write_unlocked(regs, || regs.ier().modify(|w| w.set_alm_ie(true)));
+        with_write_unlocked(regs, || {
+            regs.ier().modify(|w| w.set_alm_ie(crate::bits::from_bool(true)))
+        });
 
-        if regs.isr().read().alm_is() {
-            with_write_unlocked(regs, || regs.isr().write(|w| w.set_alm_is(true)));
+        if crate::bits::is_set(regs.isr().read().alm_is()) {
+            with_write_unlocked(regs, || {
+                regs.isr().write(|w| w.set_alm_is(crate::bits::from_bool(true)))
+            });
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -333,8 +347,10 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         // but `ALM_IS` stays asserted until explicitly cleared, so leaving
         // `ALM_IE` set would re-fire this interrupt forever until something
         // polls and clears it.
-        if regs.ier().read().alm_ie() && regs.isr().read().alm_is() {
-            with_write_unlocked(regs, || regs.ier().modify(|w| w.set_alm_ie(false)));
+        if crate::bits::is_set(regs.ier().read().alm_ie()) && crate::bits::is_set(regs.isr().read().alm_is()) {
+            with_write_unlocked(regs, || {
+                regs.ier().modify(|w| w.set_alm_ie(crate::bits::from_bool(false)))
+            });
             WAKER.wake();
         }
     }
@@ -352,12 +368,12 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 }
 
 pub(crate) struct Info {
-    pub(crate) regs: pac::rtc5xx::Rtc,
+    pub(crate) regs: pac::rtc::RtcAlpha,
 }
 
 impl Info {
     #[inline(always)]
-    fn regs(&self) -> pac::rtc5xx::Rtc {
+    fn regs(&self) -> pac::rtc::RtcAlpha {
         self.regs
     }
 }

@@ -196,13 +196,8 @@ pub struct PwmInput<'d, T: Instance, ChR: PeripheralType, ChF: PeripheralType, P
     hz: u32,
 }
 
-impl<
-    'd,
-    T: Instance + Gate + FunctionalClock,
-    ChR: PeripheralType,
-    ChF: PeripheralType,
-    P: PeripheralType,
-> PwmInput<'d, T, ChR, ChF, P>
+impl<'d, T: Instance + Gate + FunctionalClock, ChR: PeripheralType, ChF: PeripheralType, P: PeripheralType>
+    PwmInput<'d, T, ChR, ChF, P>
 {
     /// Measure the signal on `pin` using `rising_channel` and `falling_channel`.
     ///
@@ -428,21 +423,27 @@ fn waker(timer: usize) -> &'static AtomicWaker {
 ///
 /// INPUTMUX0's clock must be enabled.
 unsafe fn write_inp_select(timer: u8, channel: Channel, inp: u8) {
-    use pac::inputmux0::*;
-
     let n = channel.index();
     macro_rules! write {
-        ($reg:ident, $enum_ty:ident) => {
-            pac::INPUTMUX0.$reg(n).modify(|w| w.set_inp($enum_ty::from_bits(inp)))
+        ($t:literal) => {
+            ::paste::paste! {
+                match n {
+                    0 => pac::INPUTMUX0.[<ctimer $t cap0>]().modify(|w| w.set_inp(crate::bits::flag(inp))),
+                    1 => pac::INPUTMUX0.[<ctimer $t cap1>]().modify(|w| w.set_inp(crate::bits::flag(inp))),
+                    2 => pac::INPUTMUX0.[<ctimer $t cap2>]().modify(|w| w.set_inp(crate::bits::flag(inp))),
+                    3 => pac::INPUTMUX0.[<ctimer $t cap3>]().modify(|w| w.set_inp(crate::bits::flag(inp))),
+                    _ => unreachable!(),
+                }
+            }
         };
     }
 
     match timer {
-        0 => write!(ctimer0cap, Ctimer0CapInp),
-        1 => write!(ctimer1cap, Ctimer1CapInp),
-        2 => write!(ctimer2cap, Ctimer2CapInp),
-        3 => write!(ctimer3cap, Ctimer3CapInp),
-        4 => write!(ctimer4cap, Ctimer4CapInp),
+        0 => write!(0),
+        1 => write!(1),
+        2 => write!(2),
+        3 => write!(3),
+        4 => write!(4),
         _ => unreachable!(),
     }
 }

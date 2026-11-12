@@ -21,12 +21,12 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
 
     // Bring up both eDMA controllers. Must follow `clocks::init`, which the
     // clock gates depend on, and leaves every channel ready to be claimed.
-    #[cfg(mcxn_dma)]
+    #[cfg(mcx_n_dma)]
     crate::dma::init();
 
     // Start the `embassy-time` driver. Must follow `clocks::init`, which enables
     // the `clk_1m` this runs from.
-    #[cfg(mcxn_ostimer)]
+    #[cfg(mcx_n_ostimer)]
     crate::ostimer::init(cfg.time_interrupt_priority);
 
     // Enable PORT/GPIO clocks. GPIO5/PORT5 are always-on (see `clocks::gate`)

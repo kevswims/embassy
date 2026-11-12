@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,7 +43,6 @@ fn main() {
     let mut generated = vec![
         generate_peripherals_call(),
         generate_interrupt_mod_call(),
-        generate_cc_gates(),
         generate_dma_channel_impls(),
         generate_instance_calls(),
         generate_gpio_pin_impls(),
@@ -175,36 +173,6 @@ fn generate_interrupt_mod_call() -> TokenStream {
             )*
         );
     }
-}
-
-fn generate_cc_gates() -> TokenStream {
-    let mut generated = TokenStream::new();
-
-    for peripheral in METADATA.peripherals {
-        let Some(gate) = peripheral.gate.as_ref() else {
-            continue;
-        };
-
-        let peripheral_name = format_ident!("{}", peripheral.name);
-        let enable = format_ident!("{}", gate.enable);
-        let reset = gate.reset.map(|reset| format_ident!("{reset}"));
-        let config = gate
-            .config
-            .map(|config| format_ident!("{config}"))
-            .unwrap_or_else(|| format_ident!("NoConfig"));
-        let bit = format_ident!("{}", gate.bit);
-
-        match reset {
-            Some(reset) => generated.extend(quote! {
-                crate::impl_cc_gate!(#peripheral_name, #enable, #reset, #bit, #config);
-            }),
-            None => generated.extend(quote! {
-                crate::impl_cc_gate!(#peripheral_name, #enable, #bit, #config);
-            }),
-        }
-    }
-
-    generated
 }
 
 fn pin_feature_gate(pin_name: &str) -> TokenStream {
@@ -507,29 +475,35 @@ fn generate_ctimer_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
     let ctimer_regex = Regex::new(r"^CTIMER\d+").unwrap();
-    let input_regex = Regex::new(r"(?:^INP)(\d+)").unwrap();
+    let input_regex = Regex::new(r"(?:^CT_INP)(\d+)").unwrap();
     let match_channel_regex = Regex::new(r"(?:^MAT)(\d+)").unwrap();
+
+    // The capture inputs are shared by all five CTIMERs through INPUTMUX, so
+    // the pin-mux metadata lists them once, on INPUTMUX0, as `CT_INPn`. A
+    // pin's input index is a property of the pin, not of the timer.
+    let mut inp_pins = IndexMap::new();
+    for inputmux in METADATA.peripherals.iter().filter(|p| p.name == "INPUTMUX0") {
+        for signal in inputmux.signals {
+            let Some(inp_index) = get_regex_num(signal.name, &input_regex) else {
+                continue;
+            };
+            for pin in signal.pins {
+                let pin_name = format_ident!("{}", pin.pin);
+                let mux = format_ident!("Mux{}", pin.alt);
+                inp_pins.insert(pin_name, (mux, inp_index as u8));
+            }
+        }
+    }
 
     for ctimer in METADATA.peripherals.iter().filter(|p| ctimer_regex.is_match(p.name)) {
         let ctimer_name = format_ident!("{}", ctimer.name);
 
-        let mut inp_pins = IndexMap::new();
         let mut mat_pins = IndexMap::new();
 
-        // There are multiple INPn and MATn signals
-        // And they share pins. We don't use that, so we need to filter out duplicates to prevent duplicate trait impls
+        // There are multiple MATn signals, and they share pins. We don't use
+        // that, so duplicates are filtered out to prevent duplicate trait impls.
         for signal in ctimer.signals {
-            if let Some(inp_index) = get_regex_num(signal.name, &input_regex) {
-                for pin in signal.pins {
-                    let pin_name = format_ident!("{}", pin.pin);
-                    let mux = format_ident!("Mux{}", pin.alt);
-                    // Every INPn signal on this timer lists the same pins (RM:
-                    // the 20 capture inputs are shared across all five CTIMERs
-                    // through INPUTMUX), so a pin's INP index is a property of
-                    // the pin, not of which timer we happen to be iterating.
-                    inp_pins.insert(pin_name, (mux, inp_index as u8));
-                }
-            } else if let Some(match_index) = get_regex_num(signal.name, &match_channel_regex) {
+            if let Some(match_index) = get_regex_num(signal.name, &match_channel_regex) {
                 for pin in signal.pins {
                     let pin_name = format_ident!("{}", pin.pin);
                     let mux = format_ident!("Mux{}", pin.alt);
@@ -543,12 +517,10 @@ fn generate_ctimer_pin_impls() -> TokenStream {
                         crate::impl_ctimer_match!(#ctimer_name, #ctimer_channel, #pin_name);
                     });
                 }
-            } else {
-                unreachable!()
             }
         }
 
-        for (pin_name, (mux, inp_index)) in inp_pins {
+        for (pin_name, (mux, inp_index)) in &inp_pins {
             let feature_gate = pin_feature_gate(&pin_name.to_string());
             generated.extend(quote! {
                 #feature_gate
@@ -635,7 +607,7 @@ fn generate_dma_channel_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
     let dma_regex = Regex::new(r"(?:^DMA)(\d+)").unwrap();
-    let dma_driver_regex = Regex::new(r"(?:DMA)(\d+)").unwrap();
+    let dma_driver_regex = Regex::new(r"(?i)(?:DMA)(\d+)").unwrap();
 
     for (dma, dma_num) in METADATA
         .peripherals
@@ -670,9 +642,20 @@ fn generate_dma_channel_impls() -> TokenStream {
 }
 
 fn generate_dma_impls() -> TokenStream {
-    let mut dma_requests = HashMap::new();
-    for dma_mux in METADATA.peripherals.iter().flat_map(|p| p.dma_muxing) {
-        dma_requests.insert(dma_mux.signal, dma_mux.request);
+    // Signal names are only unique within a peripheral (`RX`, `TX`), so each
+    // request is named `<peripheral>_<signal>`. Both DMA instances list the
+    // same request numbers, and so do the serial peripherals sharing one
+    // LP_FLEXCOMM (LPUART, LPSPI, LPI2C); the first name seen wins, with
+    // LP_FLEXCOMM first so those requests are named after the flexcomm.
+    let mut dma_requests = std::collections::BTreeMap::new();
+    let mut peripherals_by_priority: Vec<_> = METADATA.peripherals.iter().collect();
+    peripherals_by_priority.sort_by_key(|p| !p.name.starts_with("LP_FLEXCOMM"));
+    for peripheral in peripherals_by_priority {
+        for dma_mux in peripheral.dma_muxing {
+            dma_requests
+                .entry(dma_mux.request)
+                .or_insert_with(|| format!("{}_{}", peripheral.name, dma_mux.signal));
+        }
     }
     // The empty case is unreachable for mcxn947, which carries all 117 DMAMUX
     // request sources, but is kept for a chip whose metadata has none. Two
@@ -686,12 +669,10 @@ fn generate_dma_impls() -> TokenStream {
     // With no variants there is no way to obtain a `DmaRequest` to pass, so
     // that path is unreachable rather than broken.
     //
-    // Note this map is keyed on the signal name alone: two entries sharing a
-    // signal collapse silently, keeping whichever peripheral appears later in
-    // the metadata. Duplicate *request* numbers are caught, but only as an
-    // E0081 in the generated code rather than here.
-    let mut sorted_dma_requests = dma_requests.into_iter().collect::<Vec<_>>();
-    sorted_dma_requests.sort_unstable_by_key(|(_, request)| *request);
+    let sorted_dma_requests = dma_requests
+        .into_iter()
+        .map(|(request, name)| (name, request))
+        .collect::<Vec<_>>();
     if sorted_dma_requests.is_empty() {
         return quote! {
             /// DMA request sources

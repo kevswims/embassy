@@ -214,8 +214,8 @@ impl<T: Instance, PeriodCh: PeripheralType, DutyCh: PeripheralType, P: Periphera
     type Error = core::convert::Infallible;
 }
 
-impl<T: Instance, PeriodCh: PeripheralType, DutyCh: PeripheralType, P: PeripheralType>
-    embedded_hal_1::pwm::SetDutyCycle for SinglePwm<'_, T, PeriodCh, DutyCh, P>
+impl<T: Instance, PeriodCh: PeripheralType, DutyCh: PeripheralType, P: PeripheralType> embedded_hal_1::pwm::SetDutyCycle
+    for SinglePwm<'_, T, PeriodCh, DutyCh, P>
 {
     /// Truncated to `u16` by the trait; a `period` beyond 65535 ticks loses
     /// range here even though [`SinglePwm::set_duty`] itself does not.

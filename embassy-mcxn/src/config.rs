@@ -9,7 +9,7 @@ use crate::interrupt::Priority;
 pub struct Config {
     pub gpio_interrupt_priority: Priority,
     /// Priority of `OS_EVENT`, the interrupt behind the `embassy-time` driver.
-    #[cfg(mcxn_ostimer)]
+    #[cfg(mcx_n_ostimer)]
     pub time_interrupt_priority: Priority,
     pub clock_cfg: ClocksConfig,
 }
@@ -18,7 +18,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             gpio_interrupt_priority: Priority::from(0),
-            #[cfg(mcxn_ostimer)]
+            #[cfg(mcx_n_ostimer)]
             time_interrupt_priority: Priority::from(0),
             clock_cfg: ClocksConfig::default(),
         }

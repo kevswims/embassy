@@ -68,31 +68,31 @@ mod pll;
 mod source;
 mod types;
 
-pub use functional::{FunctionalClock, enable_and_reset_with_clock};
-#[cfg(mcx_ctimer)]
-pub use functional::{Ctimer0ClockConfig, Ctimer0ClockSource, Ctimer1ClockConfig, Ctimer1ClockSource};
-#[cfg(mcx_wwdt)]
+pub use config::{MainClock, PllDivConfig, PllDivSource, SoscConfig, SoscMode};
+#[cfg(mcx_n_wwdt)]
 pub use functional::WwdtClockConfig;
-#[cfg(mcxn_ostimer)]
-pub use functional::{OstimerClockConfig, OstimerClockSource};
-#[cfg(mcxn_lpuart)]
+#[cfg(mcx_n_adc)]
+pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
+#[cfg(mcx_n_can)]
+pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
+#[cfg(mcx_n_ctimer)]
+pub use functional::{Ctimer0ClockConfig, Ctimer0ClockSource, Ctimer1ClockConfig, Ctimer1ClockSource};
+#[cfg(mcx_n_flexio)]
+pub use functional::{Flexio0ClockConfig, Flexio0ClockSource};
+#[cfg(mcx_n_flexspi)]
+pub use functional::{FlexspiClockConfig, FlexspiClockSource};
+pub use functional::{FunctionalClock, enable_and_reset_with_clock};
+#[cfg(mcx_n_lpuart)]
 pub use functional::{
     Lpuart0ClockConfig, Lpuart0ClockSource, Lpuart1ClockConfig, Lpuart1ClockSource, Lpuart2ClockConfig,
     Lpuart2ClockSource, Lpuart3ClockConfig, Lpuart3ClockSource, Lpuart4ClockConfig, Lpuart4ClockSource,
     Lpuart5ClockConfig, Lpuart5ClockSource, Lpuart6ClockConfig, Lpuart6ClockSource, Lpuart7ClockConfig,
     Lpuart7ClockSource, Lpuart8ClockConfig, Lpuart8ClockSource, Lpuart9ClockConfig, Lpuart9ClockSource,
 };
-#[cfg(mcxn_adc)]
-pub use functional::{Adc0ClockConfig, Adc0ClockSource, Adc1ClockConfig, Adc1ClockSource};
-#[cfg(mcxn_can)]
-pub use functional::{Can0ClockConfig, Can0ClockSource, Can1ClockConfig, Can1ClockSource};
-#[cfg(mcxn_flexspi)]
-pub use functional::{FlexspiClockConfig, FlexspiClockSource};
-#[cfg(mcxn_flexio)]
-pub use functional::{Flexio0ClockConfig, Flexio0ClockSource};
-pub use config::{MainClock, PllDivConfig, PllDivSource, SoscConfig, SoscMode};
+#[cfg(mcx_n_ostimer)]
+pub use functional::{OstimerClockConfig, OstimerClockSource};
 pub use gate::{Gate, assert_reset, disable, enable, enable_and_reset, is_reset_released, release_reset};
-pub use types::{Clocks, ClockError};
+pub use types::{ClockError, Clocks};
 
 /// The state of system core clocks.
 ///

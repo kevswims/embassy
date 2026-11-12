@@ -13,7 +13,7 @@ use super::Error;
 use crate::clocks::enable;
 use crate::delay::delay_us;
 use crate::pac;
-use crate::peripherals::{USBHS1__USBC, USBPHY};
+use crate::peripherals::{USB1, USB1_HS_PHY};
 
 /// Bounded spin, matching the convention in `adc.rs`. This runs once at
 /// construction, long before the executor exists.
@@ -23,17 +23,15 @@ const SPIN_CAP: u32 = 5_000_000;
 ///
 /// The PHY PLL always produces 480 MHz; this divider is how it is told what it
 /// is dividing down from.
-fn pll_div_sel(clk_in_hz: u32) -> Result<pac::usbphy::PllDivSel, Error> {
-    use pac::usbphy::PllDivSel;
-
+fn pll_div_sel(clk_in_hz: u32) -> Result<u8, Error> {
     Ok(match clk_in_hz {
-        12_000_000 => PllDivSel::PllDiv32,
-        16_000_000 => PllDivSel::PllDiv30,
-        19_200_000 => PllDivSel::PllDiv25,
-        20_000_000 => PllDivSel::PllDiv24,
-        24_000_000 => PllDivSel::PllDiv20,
-        30_000_000 => PllDivSel::PllDiv16,
-        32_000_000 => PllDivSel::PllDiv15,
+        12_000_000 => 7,
+        16_000_000 => 6,
+        19_200_000 => 5,
+        20_000_000 => 4,
+        24_000_000 => 2,
+        30_000_000 => 1,
+        32_000_000 => 0,
         _ => return Err(Error::UnsupportedRefClock(clk_in_hz)),
     })
 }
@@ -76,8 +74,8 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // from IFR at boot, and pulsing its reset discards it, after which the PLL
     // will not lock. Controller before PHY, matching the SDK's order.
     unsafe {
-        enable::<USBHS1__USBC>();
-        enable::<USBPHY>();
+        enable::<USB1>();
+        enable::<USB1_HS_PHY>();
     }
 
     // Route clk_in to the HS PHY. `modify`, never `write`: CLOCK_CTRL resets
@@ -92,8 +90,8 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // branch behind it. With just the latter the PHY PLL gets no reference and
     // silently never locks.
     pac::SYSCON0.clock_ctrl().modify(|w| {
-        w.set_clkin_ena(true);
-        w.set_clkin_ena_fm_usbh_lpt(true);
+        w.set_clkin_ena(crate::bits::from_bool(true));
+        w.set_clkin_ena_fm_usbh_lpt(crate::bits::from_bool(true));
     });
 
     #[cfg(feature = "defmt")]
@@ -106,15 +104,15 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // the distribution gate is sampled at oscillator start, the PHY PLL is
     // left with no reference despite every register reading correct.
     let csr = pac::SCG0.sosccsr();
-    if csr.read().soscen() {
-        csr.modify(|w| w.set_soscen(false));
+    if crate::bits::is_set(csr.read().soscen()) {
+        csr.modify(|w| w.set_soscen(crate::bits::from_bool(false)));
         // Let the oscillator actually stop before restarting it; `soscvld`
         // below is the real guard on it having come back.
         delay_us(21);
-        csr.modify(|w| w.set_soscen(true));
+        csr.modify(|w| w.set_soscen(crate::bits::from_bool(true)));
 
         let mut spins = 0u32;
-        while !csr.read().soscvld() {
+        while !crate::bits::is_set(csr.read().soscvld()) {
             spins += 1;
             if spins > SPIN_CAP {
                 #[cfg(feature = "defmt")]
@@ -126,7 +124,7 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
         defmt::debug!("usb: SOSC restarted after {} spins", spins);
     }
 
-    let phy = pac::USBPHY;
+    let phy = pac::USB1_HS_PHY;
 
     // Release the PHY software reset. The clock stays gated until the PLL is
     // configured - see below.
@@ -156,7 +154,7 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // The divider goes in first, through the base register. Doing this
     // read-modify-write *after* PLL_POWER is set would clobber it: that bit
     // only takes through the SET alias.
-    phy.pll_sic().modify(|w| w.set_pll_div_sel(div));
+    phy.pll_sic().modify(|w| w.set_pll_div_sel(crate::bits::flag(div)));
 
     // Then NXP's order: power, drop bypass, enable the USB clocks.
     phy.pll_sic_set().write(|w| w.set_pll_power(true));
@@ -167,10 +165,10 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     // lock: the PLL will not lock while they are down. Writing the whole PWD
     // register clears all seven txpwd*/rxpwd* bits at once.
     phy.ctrl_clr().write(|w| w.set_clkgate(true));
-    phy.pwd().write_value(pac::usbphy::Pwd(0));
+    phy.pwd().write_value(crate::bits::from_raw(0));
 
     let mut spins = 0u32;
-    while phy.pll_sic().read().pll_lock() != pac::usbphy::PllLock::PllLocked {
+    while !crate::bits::is_set(phy.pll_sic().read().pll_lock()) {
         spins += 1;
         if spins > SPIN_CAP {
             #[cfg(feature = "defmt")]
@@ -192,8 +190,7 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
     //
     // Strictly after the PLL has locked: NXP do this in `USB_EhciPhyInit`,
     // which runs once `CLOCK_EnableUsbhsPhyPllClock` has returned.
-    phy.trim_override_en()
-        .write_value(pac::usbphy::TrimOverrideEn(0x0000_001f));
+    phy.trim_override_en().write_value(crate::bits::from_raw(0x0000_001f));
 
     phy.ctrl_set().write(|w| {
         // Both UTMI level bits are required for the high-speed chirp
@@ -209,12 +206,16 @@ pub(super) fn init(clk_in_hz: u32) -> Result<(), Error> {
 
     // No VBUS is sourced in device mode, so overcurrent detection on an
     // unconnected pin can only produce spurious faults.
-    pac::USBHS1__USBNC
+    pac::USB1_NC
         .ctrl1()
-        .modify(|w| w.set_over_cur_dis(pac::usbhs1__usbnc::OverCurDis::OvrcrntDetctDis));
+        .modify(|w| w.set_over_cur_dis(crate::bits::flag(1)));
 
     #[cfg(feature = "defmt")]
-    defmt::debug!("usb: PWD {:#010x}, PHY CTRL {:?}", phy.pwd().read().0, phy.ctrl().read());
+    defmt::debug!(
+        "usb: PWD {:#010x}, PHY CTRL {:?}",
+        phy.pwd().read().0,
+        phy.ctrl().read()
+    );
 
     // Read-only diagnostic. If the USB HS bus master is not secure-privileged
     // it cannot reach RAM linked at the secure alias, and no amount of address

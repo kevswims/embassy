@@ -22,12 +22,27 @@
 /// position tied to the PAC: if a regeneration moves the field, the mask moves
 /// with it instead of silently pointing somewhere else.
 macro_rules! syscon_mask {
-    ($fieldset:ident, $($setter:tt)*) => {
+    ($reg:ident, $($setter:tt)*) => {
         const {
-            let mut r = crate::pac::syscon::$fieldset(0);
+            let reg = crate::pac::SYSCON0.$reg();
+            let mut r = crate::bits::zeroed_like(&reg);
             r.$($setter)*;
             r.0
         }
+    };
+}
+
+/// A set bit for a flag field, whether the PAC models it as `bool` or as a
+/// one-bit enum. Usable in `const` contexts.
+macro_rules! one {
+    () => {
+        crate::bits::flag(1)
+    };
+}
+
+macro_rules! fieldset {
+    ($raw:expr) => {
+        crate::bits::from_raw($raw)
     };
 }
 
@@ -56,7 +71,7 @@ pub trait Gate {
         if Self::CLK_MASK != 0 {
             crate::pac::SYSCON0
                 .ahbclkctrlset(Self::REG_IDX)
-                .write_value(crate::pac::syscon::Ahbclkctrlset(Self::CLK_MASK));
+                .write_value(fieldset!(Self::CLK_MASK));
         }
     }
 
@@ -70,7 +85,7 @@ pub trait Gate {
         if Self::CLK_MASK != 0 {
             crate::pac::SYSCON0
                 .ahbclkctrlclr(Self::REG_IDX)
-                .write_value(crate::pac::syscon::Ahbclkctrlclr(Self::CLK_MASK));
+                .write_value(fieldset!(Self::CLK_MASK));
         }
     }
 
@@ -84,7 +99,7 @@ pub trait Gate {
         if Self::RST_MASK != 0 {
             crate::pac::SYSCON0
                 .presetctrlset(Self::REG_IDX)
-                .write_value(crate::pac::syscon::Presetctrlset(Self::RST_MASK));
+                .write_value(fieldset!(Self::RST_MASK));
         }
     }
 
@@ -98,7 +113,7 @@ pub trait Gate {
         if Self::RST_MASK != 0 {
             crate::pac::SYSCON0
                 .presetctrlclr(Self::REG_IDX)
-                .write_value(crate::pac::syscon::Presetctrlclr(Self::RST_MASK));
+                .write_value(fieldset!(Self::RST_MASK));
         }
     }
 
@@ -257,9 +272,8 @@ pub unsafe fn pulse_reset<G: Gate>() {
 /// such a bit exists.
 ///
 /// `clk:` and `rst:` are given as *setter calls* on the corresponding fieldset,
-/// evaluated in a `const` block to derive the bitmask. That spelling works
-/// unchanged for array-indexed field families (`set_port(0, true)`) and for
-/// scalar fields (`set_crc(true)`), which is why one macro covers both.
+/// evaluated in a `const` block to derive the bitmask. The flag value is
+/// supplied by `one!()` so the same macro covers `bool` and one-bit enum fields.
 ///
 /// `rst: none` is for peripherals with a clock-enable bit but no reset bit at
 /// all - WWDT0 and WWDT1 are the ones this crate gates.
@@ -274,17 +288,9 @@ macro_rules! impl_syscon_gate {
             const CLK_MASK: u32 = syscon_mask!($clk_fs, $clk_setter($($clk_args),*));
             const RST_MASK: u32 = syscon_mask!(
                 $rst_fs,
-                $rst_setter($($rst_args,)* crate::pac::syscon::$rst_ty::Asserted)
+                $rst_setter($($rst_args,)* one!())
             );
         }
-
-        // Driving reset through the SET/CLR aliases assumes a set bit means
-        // "asserted". Every SYSCON reset field enum is shaped that way; check
-        // it rather than trust it.
-        const _: () = {
-            assert!(crate::pac::syscon::$rst_ty::Released.to_bits() == 0);
-            assert!(crate::pac::syscon::$rst_ty::Asserted.to_bits() == 1);
-        };
     };
 
     (
@@ -321,45 +327,45 @@ macro_rules! impl_syscon_gate {
 // Clocking" (Table 319, `slow_clk`) documents them as always clocked (they
 // live in the always-on VBAT domain, for wake-up support), with no AHB clock
 // gate or reset bit exposed for them at all.
-impl_syscon_gate!(PORT0, 0, clk: Ahbclkctrl0.set_port(0, true); rst: Presetctrl0.set_port_rst(0), PortRst);
-impl_syscon_gate!(PORT1, 0, clk: Ahbclkctrl0.set_port(1, true); rst: Presetctrl0.set_port_rst(1), PortRst);
-impl_syscon_gate!(PORT2, 0, clk: Ahbclkctrl0.set_port(2, true); rst: Presetctrl0.set_port_rst(2), PortRst);
-impl_syscon_gate!(PORT3, 0, clk: Ahbclkctrl0.set_port(3, true); rst: Presetctrl0.set_port_rst(3), PortRst);
-impl_syscon_gate!(PORT4, 0, clk: Ahbclkctrl0.set_port(4, true); rst: Presetctrl0.set_port_rst(4), PortRst);
-impl_syscon_gate!(GPIO0, 0, clk: Ahbclkctrl0.set_gpio(0, true); rst: Presetctrl0.set_gpio_rst(0), GpioRst);
-impl_syscon_gate!(GPIO1, 0, clk: Ahbclkctrl0.set_gpio(1, true); rst: Presetctrl0.set_gpio_rst(1), GpioRst);
-impl_syscon_gate!(GPIO2, 0, clk: Ahbclkctrl0.set_gpio(2, true); rst: Presetctrl0.set_gpio_rst(2), GpioRst);
-impl_syscon_gate!(GPIO3, 0, clk: Ahbclkctrl0.set_gpio(3, true); rst: Presetctrl0.set_gpio_rst(3), GpioRst);
-impl_syscon_gate!(GPIO4, 0, clk: Ahbclkctrl0.set_gpio(4, true); rst: Presetctrl0.set_gpio_rst(4), GpioRst);
+impl_syscon_gate!(PORT0, 0, clk: ahbclkctrl0.set_port0(one!()); rst: presetctrl0.set_port0_rst(), PortRst);
+impl_syscon_gate!(PORT1, 0, clk: ahbclkctrl0.set_port1(one!()); rst: presetctrl0.set_port1_rst(), PortRst);
+impl_syscon_gate!(PORT2, 0, clk: ahbclkctrl0.set_port2(one!()); rst: presetctrl0.set_port2_rst(), PortRst);
+impl_syscon_gate!(PORT3, 0, clk: ahbclkctrl0.set_port3(one!()); rst: presetctrl0.set_port3_rst(), PortRst);
+impl_syscon_gate!(PORT4, 0, clk: ahbclkctrl0.set_port4(one!()); rst: presetctrl0.set_port4_rst(), PortRst);
+impl_syscon_gate!(GPIO0, 0, clk: ahbclkctrl0.set_gpio0(one!()); rst: presetctrl0.set_gpio0_rst(), GpioRst);
+impl_syscon_gate!(GPIO1, 0, clk: ahbclkctrl0.set_gpio1(one!()); rst: presetctrl0.set_gpio1_rst(), GpioRst);
+impl_syscon_gate!(GPIO2, 0, clk: ahbclkctrl0.set_gpio2(one!()); rst: presetctrl0.set_gpio2_rst(), GpioRst);
+impl_syscon_gate!(GPIO3, 0, clk: ahbclkctrl0.set_gpio3(one!()); rst: presetctrl0.set_gpio3_rst(), GpioRst);
+impl_syscon_gate!(GPIO4, 0, clk: ahbclkctrl0.set_gpio4(one!()); rst: presetctrl0.set_gpio4_rst(), GpioRst);
 
 // The two eDMA controllers sit in different register pairs: DMA0 in
 // AHBCLKCTRL0/PRESETCTRL0 bit 26, DMA1 in AHBCLKCTRL2/PRESETCTRL2 bit 1.
-#[cfg(mcxn_dma)]
-impl_syscon_gate!(DMA0, 0, clk: Ahbclkctrl0.set_dma0(true); rst: Presetctrl0.set_dma0_rst(), Dma0Rst);
-#[cfg(mcxn_dma)]
-impl_syscon_gate!(DMA1, 2, clk: Ahbclkctrl2.set_dma1(true); rst: Presetctrl2.set_dma1_rst(), Dma1Rst);
+#[cfg(mcx_n_dma)]
+impl_syscon_gate!(DMA0, 0, clk: ahbclkctrl0.set_dma0(one!()); rst: presetctrl0.set_dma0_rst(), Dma0Rst);
+#[cfg(mcx_n_dma)]
+impl_syscon_gate!(DMA1, 2, clk: ahbclkctrl2.set_dma1(one!()); rst: presetctrl2.set_dma1_rst(), Dma1Rst);
 
 // OSTIMER0, the source of the embassy-time driver.
-#[cfg(mcxn_ostimer)]
-impl_syscon_gate!(OSTIMER0, 1, clk: Ahbclkctrl1.set_ostimer(true); rst: Presetctrl1.set_ostimer_rst(), OstimerRst);
+#[cfg(mcx_n_ostimer)]
+impl_syscon_gate!(OSTIMER0, 1, clk: ahbclkctrl1.set_ostimer(one!()); rst: presetctrl1.set_ostimer_rst(), OstimerRst);
 
 // CRC0 is bus-clocked: it has no functional-clock mux or divider of its own.
-#[cfg(mcxn_crc)]
-impl_syscon_gate!(CRC0, 0, clk: Ahbclkctrl0.set_crc(true); rst: Presetctrl0.set_crc_rst(), CrcRst);
+#[cfg(mcx_n_crc)]
+impl_syscon_gate!(CRC0, 0, clk: ahbclkctrl0.set_crc(one!()); rst: presetctrl0.set_crc_rst(), CrcRst);
 
 // WWDT0/WWDT1 have an AHBCLKCTRL0 clock-enable bit but no PRESETCTRL bit at
 // all, so reset is a no-op for them and `is_reset_released()` is trivially
 // true. Without that, `pulse_reset` would spin forever waiting on a reset line
 // that does not exist.
-#[cfg(mcx_wwdt)]
-impl_syscon_gate!(WWDT0, 0, clk: Ahbclkctrl0.set_wwdt0(true); rst: none);
-#[cfg(mcx_wwdt)]
-impl_syscon_gate!(WWDT1, 0, clk: Ahbclkctrl0.set_wwdt1(true); rst: none);
+#[cfg(mcx_n_wwdt)]
+impl_syscon_gate!(WWDT0, 0, clk: ahbclkctrl0.set_wwdt0(one!()); rst: none);
+#[cfg(mcx_n_wwdt)]
+impl_syscon_gate!(WWDT1, 0, clk: ahbclkctrl0.set_wwdt1(one!()); rst: none);
 
 // RTC0's bus interface only - the tick clock feeding its counters comes from
 // the VBAT domain (`Ctrl.clk_sel`), not this gate. See `crate::rtc`.
-#[cfg(mcx_rtc5xx)]
-impl_syscon_gate!(RTC0, 1, clk: Ahbclkctrl1.set_rtc(true); rst: Presetctrl1.set_rtc_rst(), RtcRst);
+#[cfg(mcx_n_rtc)]
+impl_syscon_gate!(RTC0, 1, clk: ahbclkctrl1.set_rtc(one!()); rst: presetctrl1.set_rtc_rst(), RtcRst);
 
 // LPTMR0/1: no AHBCLKCTRL/PRESETCTRL bit exists for either instance anywhere
 // in SYSCON - confirmed by exhaustive grep across all four AHBCLKCTRL/
@@ -368,63 +374,63 @@ impl_syscon_gate!(RTC0, 1, clk: Ahbclkctrl1.set_rtc(true); rst: Presetctrl1.set_
 // `CLKIN_ENA_FM_USBH_LPT` gate whether a *source* reaches LPTMR at all - see
 // `ClocksConfig::enable_fro_12m_periph`, already implemented for other
 // consumers of that same fan-out.
-#[cfg(mcxn_lptmr)]
+#[cfg(mcx_n_lptmr)]
 impl_syscon_gate!(LPTMR0, clk: none; rst: none);
-#[cfg(mcxn_lptmr)]
+#[cfg(mcx_n_lptmr)]
 impl_syscon_gate!(LPTMR1, clk: none; rst: none);
 
-#[cfg(mcxn_adc)]
-impl_syscon_gate!(ADC0, 1, clk: Ahbclkctrl1.set_adc0(true); rst: Presetctrl1.set_adc0_rst(), Adc0Rst);
-#[cfg(mcxn_adc)]
-impl_syscon_gate!(ADC1, 1, clk: Ahbclkctrl1.set_adc1(true); rst: Presetctrl1.set_adc1_rst(), Adc1Rst);
+#[cfg(mcx_n_adc)]
+impl_syscon_gate!(ADC0, 1, clk: ahbclkctrl1.set_adc0(one!()); rst: presetctrl1.set_adc0_rst(), Adc0Rst);
+#[cfg(mcx_n_adc)]
+impl_syscon_gate!(ADC1, 1, clk: ahbclkctrl1.set_adc1(one!()); rst: presetctrl1.set_adc1_rst(), Adc1Rst);
 
 // VREF0 supplies the bias current the ADC needs, so it is a prerequisite for
 // `crate::adc` even when `Cfg.refsel` selects a supply other than VREFO.
-#[cfg(mcxn_vref)]
-impl_syscon_gate!(VREF0, 3, clk: Ahbclkctrl3.set_vref(true); rst: Presetctrl3.set_vref_rst(), VrefRst);
+#[cfg(mcx_n_vref)]
+impl_syscon_gate!(VREF0, 3, clk: ahbclkctrl3.set_vref(one!()); rst: presetctrl3.set_vref_rst(), VrefRst);
 
 // FlexCAN. The SYSCON bit names are `flexcan{n}`, not `can{n}`.
-#[cfg(mcxn_can)]
-impl_syscon_gate!(CAN0, 2, clk: Ahbclkctrl2.set_flexcan0(true); rst: Presetctrl2.set_flexcan0_rst(), Flexcan0Rst);
-#[cfg(mcxn_can)]
-impl_syscon_gate!(CAN1, 2, clk: Ahbclkctrl2.set_flexcan1(true); rst: Presetctrl2.set_flexcan1_rst(), Flexcan1Rst);
+#[cfg(mcx_n_can)]
+impl_syscon_gate!(CAN0, 2, clk: ahbclkctrl2.set_flexcan0(one!()); rst: presetctrl2.set_flexcan0_rst(), Flexcan0Rst);
+#[cfg(mcx_n_can)]
+impl_syscon_gate!(CAN1, 2, clk: ahbclkctrl2.set_flexcan1(one!()); rst: presetctrl2.set_flexcan1_rst(), Flexcan1Rst);
 
 // FlexSPI. The gate covers the AHB and IP bus interfaces; the serial root clock
 // comes from the `FlexSPICLKSEL`/`FlexSPICLKDIV` pair - see
 // `impl_functional_clock!` for `FLEXSPI0` in `super::functional`.
-#[cfg(mcxn_flexspi)]
-impl_syscon_gate!(FLEXSPI0, 0, clk: Ahbclkctrl0.set_flexspi(true); rst: Presetctrl0.set_flexspi_rst(), FlexspiRst);
+#[cfg(mcx_n_flexspi)]
+impl_syscon_gate!(FLEXSPI0, 0, clk: ahbclkctrl0.set_flexspi(one!()); rst: presetctrl0.set_flexspi_rst(), FlexspiRst);
 
 // FlexIO. The gate covers the register interface; the shifter/timer clock comes
 // from the `FLEXIOCLKSEL`/`FLEXIOCLKDIV` pair - see `impl_functional_clock!` for
 // `FLEXIO0` in `super::functional`.
-#[cfg(mcxn_flexio)]
-impl_syscon_gate!(FLEXIO0, 2, clk: Ahbclkctrl2.set_flexio(true); rst: Presetctrl2.set_flexio_rst(), FlexioRst);
+#[cfg(mcx_n_flexio)]
+impl_syscon_gate!(FLEXIO0, 2, clk: ahbclkctrl2.set_flexio(one!()); rst: presetctrl2.set_flexio_rst(), FlexioRst);
 
 // ENET0's AHB bus interface only. The RMII reference clock reaches the block
 // from outside SYSCON's gating - see `crate::enet` for how it is sourced.
-#[cfg(mcxn_enet)]
-impl_syscon_gate!(ENET0, 2, clk: Ahbclkctrl2.set_enet(true); rst: Presetctrl2.set_enet_rst(), EnetRst);
+#[cfg(mcx_n_enet)]
+impl_syscon_gate!(ENET0, 2, clk: ahbclkctrl2.set_enet(one!()); rst: presetctrl2.set_enet_rst(), EnetRst);
 
 // CTIMER0/CTIMER1 share AHBCLKCTRL1/PRESETCTRL1. CTIMER2 lives there too;
 // CTIMER3/4 are in AHBCLKCTRL2. Add the rest the same way when they are needed.
-#[cfg(mcx_ctimer)]
-impl_syscon_gate!(CTIMER0, 1, clk: Ahbclkctrl1.set_timer0(true); rst: Presetctrl1.set_timer0_rst(), Timer0Rst);
-#[cfg(mcx_ctimer)]
-impl_syscon_gate!(CTIMER1, 1, clk: Ahbclkctrl1.set_timer1(true); rst: Presetctrl1.set_timer1_rst(), Timer1Rst);
+#[cfg(mcx_n_ctimer)]
+impl_syscon_gate!(CTIMER0, 1, clk: ahbclkctrl1.set_timer0(one!()); rst: presetctrl1.set_timer0_rst(), Timer0Rst);
+#[cfg(mcx_n_ctimer)]
+impl_syscon_gate!(CTIMER1, 1, clk: ahbclkctrl1.set_timer1(one!()); rst: presetctrl1.set_timer1_rst(), Timer1Rst);
 
 // INPUTMUX0 is bus-clocked like CRC0: no functional-clock mux or divider.
 // CTIMER capture routes a pad's INP signal through it, so it is only ungated
 // for the duration of that register write - see `ctimer::capture`.
-#[cfg(mcxn_inputmux0)]
-// USB HS. `USBHS1__USBNC` has no gate or reset bit of its own - it sits behind
+#[cfg(mcx_n_inputmux)]
+// USB HS. `USB1_NC` has no gate or reset bit of its own - it sits behind
 // the `usb_hs` gate - so it deliberately gets no `Gate` impl.
-#[cfg(mcxn_usbhs1__usbc)]
-impl_syscon_gate!(USBHS1__USBC, 2, clk: Ahbclkctrl2.set_usb_hs(true); rst: Presetctrl2.set_usb_hs_rst(), UsbHsRst);
-#[cfg(mcxn_usbphy)]
-impl_syscon_gate!(USBPHY, 2, clk: Ahbclkctrl2.set_usb_hs_phy(true); rst: Presetctrl2.set_usb_hs_phy_rst(), UsbHsPhyRst);
+#[cfg(mcx_n_usbhs)]
+impl_syscon_gate!(USB1, 2, clk: ahbclkctrl2.set_usb_hs(one!()); rst: presetctrl2.set_usb_hs_rst(), UsbHsRst);
+#[cfg(mcx_n_usbphy)]
+impl_syscon_gate!(USB1_HS_PHY, 2, clk: ahbclkctrl2.set_usb_hs_phy(one!()); rst: presetctrl2.set_usb_hs_phy_rst(), UsbHsPhyRst);
 
-impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0.set_mux_rst(), MuxRst);
+impl_syscon_gate!(INPUTMUX0, 0, clk: ahbclkctrl0.set_mux(one!()); rst: presetctrl0.set_mux_rst(), MuxRst);
 
 // LP_FLEXCOMM0-9's bus interface clock and reset, gated through each
 // LPUARTn's own type - see the comment on `impl_lpuart_functional_clock!` for
@@ -435,11 +441,11 @@ impl_syscon_gate!(INPUTMUX0, 0, clk: Ahbclkctrl0.set_mux(true); rst: Presetctrl0
 macro_rules! impl_lpuart_gate {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcxn_lpuart)]
+            #[cfg(mcx_n_lpuart)]
             impl_syscon_gate!(
                 [<LPUART $n>], 1,
-                clk: Ahbclkctrl1.set_fc($n, true);
-                rst: Presetctrl1.set_fc_rst($n), FcRst
+                clk: ahbclkctrl1.[<set_fc $n>](one!());
+                rst: presetctrl1.[<set_fc $n _rst>](), FcRst
             );
         }
     };

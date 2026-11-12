@@ -20,7 +20,6 @@
 
 use super::types::ClockError;
 use crate::pac;
-use crate::pac::scg::{ApllLock, ApllctrlSource, TrimUnlock};
 
 /// Bounded spin, matching the rest of the clock bring-up.
 const SPIN_CAP: u32 = 5_000_000;
@@ -52,29 +51,29 @@ pub(super) const PLL0_HZ: u32 = 150_000_000;
 ///
 /// The caller must already have FIRC running at 48 MHz with
 /// `FIRCCSR[FIRC_SCLK_PERIPH_EN]` set - that tap is the reference, and
-/// `ApllctrlSource::Firc`'s own documentation requires it. `main_clk` must not
+/// the PLL source select requires it. `main_clk` must not
 /// be sourced from PLL0 while this runs.
 pub(super) fn configure_pll0_150m() -> Result<u32, ClockError> {
     let scg = pac::SCG0;
 
     // The PLL's analog supply. Nothing locks without it.
-    scg.ldocsr().modify(|w| w.set_ldoen(true));
+    scg.ldocsr().modify(|w| w.set_ldoen(crate::bits::from_bool(true)));
 
     // Configure only while powered down.
     scg.apllcsr().modify(|w| {
-        w.set_apllpwren(false);
-        w.set_apllclken(false);
+        w.set_apllpwren(crate::bits::from_bool(false));
+        w.set_apllclken(crate::bits::from_bool(false));
     });
 
     scg.apllctrl().modify(|w| {
-        w.set_source(ApllctrlSource::Firc);
+        w.set_source(crate::bits::flag(1));
         w.set_seli(SELI);
         w.set_selp(SELP);
         w.set_selr(0);
         // The divider maths above assumes none of the bypasses are taken.
-        w.set_bypassprediv(false);
-        w.set_bypasspostdiv(false);
-        w.set_bypasspostdiv2(false);
+        w.set_bypassprediv(crate::bits::from_bool(false));
+        w.set_bypasspostdiv(crate::bits::from_bool(false));
+        w.set_bypasspostdiv2(crate::bits::from_bool(false));
     });
 
     // Value first, then the request bit in a second write - the hardware
@@ -82,19 +81,19 @@ pub(super) fn configure_pll0_150m() -> Result<u32, ClockError> {
     scg.apllndiv().write(|w| w.set_ndiv(NDIV));
     scg.apllndiv().write(|w| {
         w.set_ndiv(NDIV);
-        w.set_nreq(true);
+        w.set_nreq(crate::bits::from_bool(true));
     });
 
     scg.apllpdiv().write(|w| w.set_pdiv(PDIV));
     scg.apllpdiv().write(|w| {
         w.set_pdiv(PDIV);
-        w.set_preq(true);
+        w.set_preq(crate::bits::from_bool(true));
     });
 
     scg.apllmdiv().write(|w| w.set_mdiv(MDIV));
     scg.apllmdiv().write(|w| {
         w.set_mdiv(MDIV);
-        w.set_mreq(true);
+        w.set_mreq(crate::bits::from_bool(true));
     });
 
     // Spread-spectrum modulation off, so `MDIV` alone sets the multiplier.
@@ -108,21 +107,22 @@ pub(super) fn configure_pll0_150m() -> Result<u32, ClockError> {
     // document it beyond the SDK's use.
     scg.trim_lock().write(|w| {
         w.set_trim_lock_key(0x5a5a);
-        w.set_trim_unlock(TrimUnlock::NotLocked);
+        w.set_trim_unlock(crate::bits::flag(1));
     });
 
     // RM/SDK: 500us expressed in reference-clock periods, plus 300. The
     // reference here is the *post-predivider* rate, not the input.
     let ref_after_prediv = REF_HZ / NDIV as u32;
-    scg.aplllock_cnfg().write(|w| w.set_lock_time(ref_after_prediv / 2000 + 300));
+    scg.aplllock_cnfg()
+        .write(|w| w.set_lock_time(ref_after_prediv / 2000 + 300));
 
     scg.apllcsr().modify(|w| {
-        w.set_apllpwren(true);
-        w.set_apllclken(true);
+        w.set_apllpwren(crate::bits::from_bool(true));
+        w.set_apllclken(crate::bits::from_bool(true));
     });
 
     let mut spins = 0u32;
-    while scg.apllcsr().read().apll_lock() != ApllLock::EnabledAndValid {
+    while crate::bits::raw(scg.apllcsr().read().apll_lock()) != 1 {
         spins += 1;
         if spins > SPIN_CAP {
             return Err(ClockError::Pll0NotLocked);
@@ -149,7 +149,7 @@ pub(super) fn configure_pll0_150m() -> Result<u32, ClockError> {
 fn pll0_out_hz() -> u32 {
     let ctrl = pac::SCG0.apllctrl().read();
 
-    let prediv = if ctrl.bypassprediv() {
+    let prediv = if crate::bits::is_set(ctrl.bypassprediv()) {
         1
     } else {
         match pac::SCG0.apllndiv().read().ndiv() {
@@ -158,11 +158,15 @@ fn pll0_out_hz() -> u32 {
         }
     };
 
-    let postdiv = if ctrl.bypasspostdiv() {
+    let postdiv = if crate::bits::is_set(ctrl.bypasspostdiv()) {
         1
     } else {
         let pdiv = pac::SCG0.apllpdiv().read().pdiv() as u32;
-        let scaled = if ctrl.bypasspostdiv2() { pdiv } else { 2 * pdiv };
+        let scaled = if crate::bits::is_set(ctrl.bypasspostdiv2()) {
+            pdiv
+        } else {
+            2 * pdiv
+        };
         if scaled == 0 { 2 } else { scaled }
     };
 

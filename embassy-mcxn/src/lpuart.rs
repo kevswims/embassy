@@ -205,7 +205,7 @@ macro_rules! impl_lpuart_pin {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast);
                 self.set_drive_strength(crate::gpio::DriveStrength::Normal);
-                self.set_function(crate::pac::port::Mux::$mux);
+                self.set_function(crate::gpio::Mux::$mux);
                 self.set_enable_input_buffer(true);
             }
         }
@@ -220,7 +220,7 @@ macro_rules! impl_lpuart_pin {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast);
                 self.set_drive_strength(crate::gpio::DriveStrength::Normal);
-                self.set_function(crate::pac::port::Mux::$mux);
+                self.set_function(crate::gpio::Mux::$mux);
                 self.set_enable_input_buffer(false);
             }
         }
@@ -424,7 +424,12 @@ impl<T: Instance + Gate, TxP: PeripheralType, RxP: PeripheralType> Uart<'_, T, T
         // as long as `T::regs()` is (the whole program); `buf` outlives the
         // transfer since it is borrowed for this whole async fn.
         let transfer = unsafe {
-            dma.write_to_peripheral(buf, peri_addr, T::TX_DMA_REQUEST, crate::dma::TransferOptions::COMPLETE_INTERRUPT)
+            dma.write_to_peripheral(
+                buf,
+                peri_addr,
+                T::TX_DMA_REQUEST,
+                crate::dma::TransferOptions::COMPLETE_INTERRUPT,
+            )
         }?;
 
         // Only after the TCD is armed: the DMA channel is ready to service a
@@ -446,7 +451,12 @@ impl<T: Instance + Gate, TxP: PeripheralType, RxP: PeripheralType> Uart<'_, T, T
 
         // SAFETY: as `write_dma`, mirrored for the read direction.
         let transfer = unsafe {
-            dma.read_from_peripheral(peri_addr, buf, T::RX_DMA_REQUEST, crate::dma::TransferOptions::COMPLETE_INTERRUPT)
+            dma.read_from_peripheral(
+                peri_addr,
+                buf,
+                T::RX_DMA_REQUEST,
+                crate::dma::TransferOptions::COMPLETE_INTERRUPT,
+            )
         }?;
 
         T::regs().baud().modify(|w| w.set_rdmae(true));

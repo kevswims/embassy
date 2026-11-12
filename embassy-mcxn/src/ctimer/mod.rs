@@ -16,7 +16,7 @@ use embassy_hal_internal::{Peri, PeripheralType};
 use crate::clocks::{ClockError, FunctionalClock, Gate, enable_and_reset_with_clock};
 use crate::gpio::GpioPin;
 
-#[cfg(mcxn_inputmux0)]
+#[cfg(mcx_n_inputmux)]
 pub mod capture;
 pub mod pwm;
 
@@ -149,7 +149,7 @@ macro_rules! impl_ctimer_input_pin {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast);
                 self.set_drive_strength(crate::gpio::DriveStrength::Double);
-                self.set_function(crate::pac::port::Mux::$fn);
+                self.set_function(crate::gpio::Mux::$fn);
                 self.set_enable_input_buffer(true);
             }
         }
@@ -169,7 +169,7 @@ macro_rules! impl_ctimer_output_pin {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast);
                 self.set_drive_strength(crate::gpio::DriveStrength::Normal);
-                self.set_function(crate::pac::port::Mux::$fn);
+                self.set_function(crate::gpio::Mux::$fn);
                 self.set_enable_input_buffer(false);
             }
         }

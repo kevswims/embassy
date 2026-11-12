@@ -19,9 +19,9 @@
 //! [`super::enable_and_reset`] and read [`Clocks::system_clk_hz`] if they need
 //! a rate.
 
+use super::CLOCKS;
 use super::gate::Gate;
 use super::types::{ClockError, Clocks};
-use super::CLOCKS;
 
 /// A peripheral's functional-clock configuration: which source, and how far
 /// divided.
@@ -74,96 +74,31 @@ where
     }
 }
 
-/// Program a divider whose register has the full `div`/`reset`/`halt`/`unstab`
-/// field set. That is 55 of SYSCON's 58 dividers, including every
-/// per-peripheral one.
+/// Program a SYSCON divider whose register has `div`/`reset`/`halt` fields.
 ///
 /// The divisor is written while the divider is halted and held in reset, then
-/// both are released, then we wait for the output to report stable.
+/// both are released.
 ///
-/// Note the field polarity here reads the way it is named - `Halt::Run` is 0,
-/// `Reset::Released` is 0, `Unstab::Stable` is 0. embassy-mcxa's equivalent
-/// macro works against inverted `On`/`Off` naming, so do not pattern-match the
-/// two against each other.
-// Currently unused: of the per-peripheral dividers wired up so far, WWDT's need
-// `apply_div_no_poll!` and CTIMER's has a different field shape entirely. Kept
-// as the correct sequence for a divider whose `UNSTAB` does clear.
-#[allow(unused_macros)]
-macro_rules! apply_div_full {
-    ($reg:expr, $divty:ident, $div:expr) => {{
-        ::paste::paste! {
-            use crate::pac::syscon::{[<$divty Halt>], [<$divty Reset>], [<$divty Unstab>]};
-
-            let r = $reg;
-            r.modify(|w| {
-                w.set_div($div.into_bits());
-                w.set_halt([<$divty Halt>]::Halt);
-                w.set_reset([<$divty Reset>]::Asserted);
-            });
-            r.modify(|w| {
-                w.set_halt([<$divty Halt>]::Run);
-                w.set_reset([<$divty Reset>]::Released);
-            });
-            while r.read().unstab() == [<$divty Unstab>]::Ongoing {}
-        }
-    }};
-}
-
-/// Program a full-shape divider without waiting for `UNSTAB` to clear.
-///
-/// `WDT0CLKDIV` and `WDT1CLKDIV` latch `UNSTAB` high the moment `HALT` is
-/// released and never clear it, even though the divider output is correct -
-/// measured against `embassy-time`, `wdt0_clk` comes out at 249,993 Hz for the
-/// expected 250,000 (`clk_1m` / 1 / 4). `FROHFDIV` and `AHBCLKDIV` do clear it,
-/// so the flag is not usable uniformly and polling it here would hang forever.
+/// This does not wait on `UNSTAB`. `WDT0CLKDIV` and `WDT1CLKDIV` latch `UNSTAB`
+/// high the moment `HALT` is released and never clear it, even though the
+/// divider output is correct - measured against `embassy-time`, `wdt0_clk`
+/// comes out at 249,993 Hz for the expected 250,000 (`clk_1m` / 1 / 4).
+/// `FROHFDIV` and `AHBCLKDIV` do clear it, so the flag is not usable uniformly
+/// and polling it would hang forever.
 macro_rules! apply_div_no_poll {
-    ($reg:expr, $divty:ident, $div:expr) => {{
-        ::paste::paste! {
-            use crate::pac::syscon::{[<$divty Halt>], [<$divty Reset>]};
+    ($reg:expr, $div:expr) => {{
+        use crate::bits::flag;
 
-            let r = $reg;
-            r.modify(|w| {
-                w.set_div($div.into_bits());
-                w.set_halt([<$divty Halt>]::Halt);
-                w.set_reset([<$divty Reset>]::Asserted);
-            });
-            r.modify(|w| {
-                w.set_halt([<$divty Halt>]::Run);
-                w.set_reset([<$divty Reset>]::Released);
-            });
-        }
-    }};
-}
-
-/// Program `CTIMERCLKDIV`, the one SYSCON divider whose fieldset does not match
-/// the others.
-///
-/// Two differences, both cosmetic rather than semantic - the bit polarities are
-/// the same as everywhere else (0 is running / released / stable):
-///
-/// - `reset` is a bare `bool`, not a `*Reset` enum. `CTIMERCLKDIV` is the only
-///   divider on this chip like that; all 28 others have the typed field.
-/// - `halt` and `unstab` are spelled `Enable`/`Disable` rather than `Run`/`Halt`
-///   and `Stable`/`Ongoing`, with `Enable` meaning running and stable.
-///
-/// Like [`apply_div_no_poll!`] this does not wait on `UNSTAB`, matching what the
-/// hand-written CTIMER impl this replaced did.
-macro_rules! apply_div_ctimer {
-    ($reg:expr, $divty:ident, $div:expr) => {{
-        ::paste::paste! {
-            use crate::pac::syscon::[<$divty Halt>];
-
-            let r = $reg;
-            r.modify(|w| {
-                w.set_div($div.into_bits());
-                w.set_halt([<$divty Halt>]::Disable);
-                w.set_reset(true);
-            });
-            r.modify(|w| {
-                w.set_halt([<$divty Halt>]::Enable);
-                w.set_reset(false);
-            });
-        }
+        let r = $reg;
+        r.modify(|w| {
+            w.set_div($div.into_bits());
+            w.set_halt(flag(1));
+            w.set_reset(flag(1));
+        });
+        r.modify(|w| {
+            w.set_halt(flag(0));
+            w.set_reset(flag(0));
+        });
     }};
 }
 
@@ -188,13 +123,13 @@ macro_rules! impl_functional_clock {
     (
         $periph:ident,
         name: $src_enum:ident / $cfg_struct:ident,
-        sel: $sel:expr, $sel_ty:ident,
+        sel: $sel:expr,
         div: none,
         sources: {
-            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+            $( $variant:ident => $raw:literal : $accessor:ident ),+ $(,)?
         }
     ) => {
-        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+        impl_functional_clock!(@sources $periph, $src_enum, { $($variant => $raw : $accessor),+ });
 
         #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -211,7 +146,7 @@ macro_rules! impl_functional_clock {
                 cfg: &Self::Config,
                 clocks: &crate::clocks::Clocks,
             ) -> Result<u32, crate::clocks::ClockError> {
-                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
+                let src_hz = impl_functional_clock!(@select $sel, cfg, clocks, $src_enum, { $($variant => $raw : $accessor),+ })?;
                 Ok(src_hz)
             }
         }
@@ -226,13 +161,13 @@ macro_rules! impl_functional_clock {
     (
         $periph:ident,
         name: $src_enum:ident / $cfg_struct:ident,
-        sel: $sel:expr, $sel_ty:ident,
-        div: full($div_reg:expr, $divty:ident, $bits:expr),
+        sel: $sel:expr,
+        div: full($div_reg:expr, $bits:expr),
         sources: {
-            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+            $( $variant:ident => $raw:literal : $accessor:ident ),+ $(,)?
         }
     ) => {
-        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+        impl_functional_clock!(@sources $periph, $src_enum, { $($variant => $raw : $accessor),+ });
 
         #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -251,25 +186,24 @@ macro_rules! impl_functional_clock {
                 cfg: &Self::Config,
                 clocks: &crate::clocks::Clocks,
             ) -> Result<u32, crate::clocks::ClockError> {
-                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
-                apply_div_no_poll!($div_reg, $divty, cfg.div);
+                let src_hz = impl_functional_clock!(@select $sel, cfg, clocks, $src_enum, { $($variant => $raw : $accessor),+ })?;
+                apply_div_no_poll!($div_reg, cfg.div);
                 Ok(src_hz / cfg.div.into_divisor())
             }
         }
     };
 
-    // As `full`, but for `CTIMERCLKDIV`'s odd fieldset - see
-    // `apply_div_ctimer!`.
+    // As `full`, for the CTIMER dividers.
     (
         $periph:ident,
         name: $src_enum:ident / $cfg_struct:ident,
-        sel: $sel:expr, $sel_ty:ident,
-        div: ctimer($div_reg:expr, $divty:ident, $bits:expr),
+        sel: $sel:expr,
+        div: ctimer($div_reg:expr, $bits:expr),
         sources: {
-            $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ $(,)?
+            $( $variant:ident => $raw:literal : $accessor:ident ),+ $(,)?
         }
     ) => {
-        impl_functional_clock!(@sources $periph, $src_enum, $sel_ty, { $($variant => $pac_variant @ $raw : $accessor),+ });
+        impl_functional_clock!(@sources $periph, $src_enum, { $($variant => $raw : $accessor),+ });
 
         #[doc = concat!("Functional clock configuration for `", stringify!($periph), "`.")]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -288,8 +222,8 @@ macro_rules! impl_functional_clock {
                 cfg: &Self::Config,
                 clocks: &crate::clocks::Clocks,
             ) -> Result<u32, crate::clocks::ClockError> {
-                let src_hz = impl_functional_clock!(@select $sel, $sel_ty, cfg, clocks, $src_enum, { $($variant => $pac_variant : $accessor),+ })?;
-                apply_div_ctimer!($div_reg, $divty, cfg.div);
+                let src_hz = impl_functional_clock!(@select $sel, cfg, clocks, $src_enum, { $($variant => $raw : $accessor),+ })?;
+                apply_div_no_poll!($div_reg, cfg.div);
                 Ok(src_hz / cfg.div.into_divisor())
             }
         }
@@ -297,7 +231,7 @@ macro_rules! impl_functional_clock {
 
     // Shared: the source enum plus its compile-time pin against the PAC's raw
     // values (see the doc comment above).
-    (@sources $periph:ident, $src_enum:ident, $sel_ty:ident, { $( $variant:ident => $pac_variant:ident @ $raw:literal : $accessor:ident ),+ }) => {
+    (@sources $periph:ident, $src_enum:ident, { $( $variant:ident => $raw:literal : $accessor:ident ),+ }) => {
         #[doc = concat!("Functional clock sources selectable for `", stringify!($periph), "`.")]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
         #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -308,20 +242,17 @@ macro_rules! impl_functional_clock {
             )+
         }
 
-        const _: () = {
-            $( assert!(crate::pac::syscon::$sel_ty::$pac_variant.to_bits() == $raw); )+
-        };
     };
 
     // Shared: resolve the selected source's rate, then write the mux. Rate
     // resolution happens first so a failure leaves the mux untouched.
-    (@select $sel:expr, $sel_ty:ident, $cfg:ident, $clocks:ident, $src_enum:ident, { $( $variant:ident => $pac_variant:ident : $accessor:ident ),+ }) => {{
+    (@select $sel:expr, $cfg:ident, $clocks:ident, $src_enum:ident, { $( $variant:ident => $raw:literal : $accessor:ident ),+ }) => {{
         let src_hz = match $cfg.source {
             $( $src_enum::$variant => $clocks.$accessor()?, )+
         };
         $sel.modify(|w| {
             w.set_sel(match $cfg.source {
-                $( $src_enum::$variant => crate::pac::syscon::$sel_ty::$pac_variant, )+
+                $( $src_enum::$variant => crate::bits::flag($raw), )+
             })
         });
         Result::<u32, crate::clocks::ClockError>::Ok(src_hz)
@@ -339,16 +270,16 @@ macro_rules! impl_functional_clock {
 macro_rules! impl_lpuart_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcxn_lpuart)]
+            #[cfg(mcx_n_lpuart)]
             impl_functional_clock! {
                 [<LPUART $n>],
                 name: [<Lpuart $n ClockSource>] / [<Lpuart $n ClockConfig>],
-                sel: crate::pac::SYSCON0.fcclksel($n), FcclkselSel,
-                div: full(crate::pac::SYSCON0.flexcommclkdiv($n), Flexcommclkdiv, 8),
+                sel: crate::pac::SYSCON0.fcclksel($n),
+                div: full(crate::pac::SYSCON0.flexcommclkdiv($n), 8),
                 sources: {
-                    PllDiv   => Enum0x1 @ 1 : ensure_pll_div,
-                    Fro12m   => Enum0x2 @ 2 : ensure_fro_12m,
-                    FroHfDiv => Enum0x3 @ 3 : ensure_fro_hf_div,
+                    PllDiv => 1 : ensure_pll_div,
+                    Fro12m => 2 : ensure_fro_12m,
+                    FroHfDiv => 3 : ensure_fro_hf_div,
                 }
             }
         }
@@ -381,16 +312,16 @@ impl_lpuart_functional_clock!(9);
 macro_rules! impl_adc_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcxn_adc)]
+            #[cfg(mcx_n_adc)]
             impl_functional_clock! {
                 [<ADC $n>],
                 name: [<Adc $n ClockSource>] / [<Adc $n ClockConfig>],
-                sel: crate::pac::SYSCON0.[<adc $n clksel>](), [<Adc $n clkselSel>],
-                div: full(crate::pac::SYSCON0.[<adc $n clkdiv>](), [<Adc $n clkdiv>], 3),
+                sel: crate::pac::SYSCON0.[<adc $n clksel>](),
+                div: full(crate::pac::SYSCON0.[<adc $n clkdiv>](), 3),
                 sources: {
-                    Pll0   => Enum0x1 @ 1 : ensure_pll0_clk,
-                    Fro12m => Enum0x3 @ 3 : ensure_fro_12m,
-                    FroHf  => Enum0x2 @ 2 : ensure_fro_hf,
+                    Pll0 => 1 : ensure_pll0_clk,
+                    Fro12m => 3 : ensure_fro_12m,
+                    FroHf => 2 : ensure_fro_hf,
                 }
             }
         }
@@ -411,15 +342,15 @@ impl_adc_functional_clock!(1);
 macro_rules! impl_can_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcxn_can)]
+            #[cfg(mcx_n_can)]
             impl_functional_clock! {
                 [<CAN $n>],
                 name: [<Can $n ClockSource>] / [<Can $n ClockConfig>],
-                sel: crate::pac::SYSCON0.[<flexcan $n clksel>](), [<Flexcan $n clkselSel>],
-                div: full(crate::pac::SYSCON0.[<flexcan $n clkdiv>](), [<Flexcan $n clkdiv>], 8),
+                sel: crate::pac::SYSCON0.[<flexcan $n clksel>](),
+                div: full(crate::pac::SYSCON0.[<flexcan $n clkdiv>](), 8),
                 sources: {
-                    Pll0  => Enum1 @ 1 : ensure_pll0_clk,
-                    FroHf => Enum3 @ 3 : ensure_fro_hf,
+                    Pll0 => 1 : ensure_pll0_clk,
+                    FroHf => 3 : ensure_fro_hf,
                 }
             }
         }
@@ -444,15 +375,15 @@ impl_can_functional_clock!(1);
 // range is raised; the divider has to bring the result back inside RM Table
 // 320's window (300/200/100 MHz for OD/SD/MD), which `crate::flexspi` range
 // checks rather than assuming.
-#[cfg(mcxn_flexspi)]
+#[cfg(mcx_n_flexspi)]
 impl_functional_clock! {
     FLEXSPI0,
     name: FlexspiClockSource / FlexspiClockConfig,
-    sel: crate::pac::SYSCON0.flex_spiclksel(), FlexSpiclkselSel,
-    div: full(crate::pac::SYSCON0.flex_spiclkdiv(), FlexSpiclkdiv, 3),
+    sel: crate::pac::SYSCON0.flex_spiclksel(),
+    div: full(crate::pac::SYSCON0.flex_spiclkdiv(), 3),
     sources: {
-        Pll0  => Enum1 @ 1 : ensure_pll0_clk,
-        FroHf => Enum3 @ 3 : ensure_fro_hf,
+        Pll0 => 1 : ensure_pll0_clk,
+        FroHf => 3 : ensure_fro_hf,
     }
 }
 
@@ -463,33 +394,33 @@ impl_functional_clock! {
 // pins at a quarter of this rate (RM 71.6.3), so it caps how fast anything
 // bidirectional built on FlexIO can run, and PLL0 at 150 MHz is the only source
 // that gets that ceiling above 12 MHz.
-#[cfg(mcxn_flexio)]
+#[cfg(mcx_n_flexio)]
 impl_functional_clock! {
     FLEXIO0,
     name: Flexio0ClockSource / Flexio0ClockConfig,
-    sel: crate::pac::SYSCON0.flexioclksel(), FlexioclkselSel,
-    div: full(crate::pac::SYSCON0.flexioclkdiv(), Flexioclkdiv, 8),
+    sel: crate::pac::SYSCON0.flexioclksel(),
+    div: full(crate::pac::SYSCON0.flexioclkdiv(), 8),
     sources: {
-        Pll0   => Enum1 @ 1 : ensure_pll0_clk,
-        ClkIn  => Enum2 @ 2 : ensure_clk_in,
-        FroHf  => Enum3 @ 3 : ensure_fro_hf,
-        Fro12m => Enum4 @ 4 : ensure_fro_12m,
+        Pll0 => 1 : ensure_pll0_clk,
+        ClkIn => 2 : ensure_clk_in,
+        FroHf => 3 : ensure_fro_hf,
+        Fro12m => 4 : ensure_fro_12m,
     }
 }
 
 // OSTIMER0's mux has no divider. `clk_1m` is the source the time driver wants:
 // it is exactly 1 MHz, matching embassy-time's configured tick rate 1:1, and
 // unlike the other two options it needs nothing from the VBAT power domain.
-#[cfg(mcxn_ostimer)]
+#[cfg(mcx_n_ostimer)]
 impl_functional_clock! {
     OSTIMER0,
     name: OstimerClockSource / OstimerClockConfig,
-    sel: crate::pac::SYSCON0.ostimerclksel(), OstimerclkselSel,
+    sel: crate::pac::SYSCON0.ostimerclksel(),
     div: none,
     sources: {
-        Clk16k  => Enum0 @ 0 : ensure_clk_16k,
-        Xtal32k => Enum1 @ 1 : ensure_xtal32k,
-        Clk1M   => Enum2 @ 2 : ensure_clk_1m,
+        Clk16k => 0 : ensure_clk_16k,
+        Xtal32k => 1 : ensure_xtal32k,
+        Clk1M => 2 : ensure_clk_1m,
     }
 }
 
@@ -503,7 +434,7 @@ impl_functional_clock! {
 /// WWDT1's other options (`clk_16k` from the VBAT domain, `fro_hf_div`) would
 /// need this to grow a source field. Neither is useful yet: the VBAT sources are
 /// not implemented and `fro_hf_div` is halted unless asked for.
-#[cfg(mcx_wwdt)]
+#[cfg(mcx_n_wwdt)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct WwdtClockConfig {
@@ -511,7 +442,7 @@ pub struct WwdtClockConfig {
     pub div: crate::clocks::config::Div<6>,
 }
 
-#[cfg(mcx_wwdt)]
+#[cfg(mcx_n_wwdt)]
 impl crate::clocks::FunctionalClock for crate::peripherals::WWDT0 {
     type Config = WwdtClockConfig;
 
@@ -519,26 +450,22 @@ impl crate::clocks::FunctionalClock for crate::peripherals::WWDT0 {
         // No WDT0CLKSEL exists: the source is hardwired to clk_1m, so there is
         // only a divider to program.
         let src_hz = clocks.ensure_clk_1m()?;
-        apply_div_no_poll!(crate::pac::SYSCON0.wdt0clkdiv(), Wdt0clkdiv, cfg.div);
+        apply_div_no_poll!(crate::pac::SYSCON0.wdt0clkdiv(), cfg.div);
         Ok(src_hz / cfg.div.into_divisor())
     }
 }
 
-#[cfg(mcx_wwdt)]
+#[cfg(mcx_n_wwdt)]
 impl crate::clocks::FunctionalClock for crate::peripherals::WWDT1 {
     type Config = WwdtClockConfig;
 
     fn configure(cfg: &Self::Config, clocks: &Clocks) -> Result<u32, ClockError> {
-        use crate::pac::syscon::Wdt1clkselSel;
-
-        // Both Enum2 and Enum3 select clk_1m on this mux; Enum2 is canonical.
-        const _: () = assert!(Wdt1clkselSel::Enum2.to_bits() == 2);
-
+        // Both 2 and 3 select clk_1m on this mux; 2 is canonical.
         let src_hz = clocks.ensure_clk_1m()?;
         crate::pac::SYSCON0
             .wdt1clksel()
-            .modify(|w| w.set_sel(Wdt1clkselSel::Enum2));
-        apply_div_no_poll!(crate::pac::SYSCON0.wdt1clkdiv(), Wdt1clkdiv, cfg.div);
+            .modify(|w| w.set_sel(crate::bits::flag(2)));
+        apply_div_no_poll!(crate::pac::SYSCON0.wdt1clkdiv(), cfg.div);
         Ok(src_hz / cfg.div.into_divisor())
     }
 }
@@ -555,24 +482,24 @@ impl crate::clocks::FunctionalClock for crate::peripherals::WWDT1 {
 macro_rules! impl_ctimer_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcx_ctimer)]
+            #[cfg(mcx_n_ctimer)]
             impl_functional_clock! {
                 [<CTIMER $n>],
                 name: [<Ctimer $n ClockSource>] / [<Ctimer $n ClockConfig>],
-                sel: crate::pac::SYSCON0.ctimerclksel($n), CtimerclkselSel,
-                div: ctimer(crate::pac::SYSCON0.ctimerclkdiv($n), Ctimerclkdiv, 8),
+                sel: crate::pac::SYSCON0.ctimerclksel($n),
+                div: ctimer(crate::pac::SYSCON0.ctimerclkdiv($n), 8),
                 sources: {
-                    Clk1M  => Enum0x0 @ 0 : ensure_clk_1m,
-                    Pll0   => Enum0x1 @ 1 : ensure_pll0_clk,
-                    FroHf  => Enum0x3 @ 3 : ensure_fro_hf,
-                    Fro12m => Enum0x4 @ 4 : ensure_fro_12m,
+                    Clk1M => 0 : ensure_clk_1m,
+                    Pll0 => 1 : ensure_pll0_clk,
+                    FroHf => 3 : ensure_fro_hf,
+                    Fro12m => 4 : ensure_fro_12m,
                 }
             }
 
             // `clk_1m` undivided, which is what this config resolved to before
             // it grew a source field. Kept so existing callers that only care
             // about a 1 MHz tick keep working unchanged.
-            #[cfg(mcx_ctimer)]
+            #[cfg(mcx_n_ctimer)]
             impl Default for [<Ctimer $n ClockConfig>] {
                 fn default() -> Self {
                     Self {

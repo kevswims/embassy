@@ -66,11 +66,7 @@ use crate::clocks::{ClockError, FunctionalClock, Gate, enable_and_reset_with_clo
 use crate::dma::{Channel, DmaChannel, TransferOptions};
 use crate::gpio::GpioPin;
 use crate::interrupt::typelevel::{Handler, Interrupt};
-pub use crate::pac::flexspi::Flexspi as Regs;
-use crate::pac::flexspi::{
-    Ahbcr, Dllcr, Flshcr1, Flshcr2, Flshcr4, Intr, Ipcmd, Ipcr0, Ipcr1, Iprxfcr, Iptxfcr, Lut, Lutcr, Lutkey, Mcr0,
-    Tfdr,
-};
+pub use crate::pac::flexspi::FlexspiAlpha as Regs;
 use crate::{interrupt, pac};
 
 /// Largest page this driver will program in one command.
@@ -183,21 +179,21 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         let mut pending_events = 0;
         let mut clear_command_flags = false;
 
-        if status.ipcmddone() && inten.ipcmddoneen() == pac::flexspi::Ipcmddoneen::Value1 {
+        if crate::bits::is_set(status.ipcmddone()) && crate::bits::raw(inten.ipcmddoneen()) == 1 {
             pending_events |= IRQ_EVENT_COMMAND_DONE;
             clear_command_flags = true;
         }
-        if status.ipcmdge() && inten.ipcmdgeen() == pac::flexspi::Ipcmdgeen::Value1 {
+        if crate::bits::is_set(status.ipcmdge()) && crate::bits::raw(inten.ipcmdgeen()) == 1 {
             pending_events |= IRQ_EVENT_COMMAND_GRANT;
             clear_command_flags = true;
         }
-        if status.ipcmderr() && inten.ipcmderren() == pac::flexspi::Ipcmderren::Value1 {
+        if crate::bits::is_set(status.ipcmderr()) && crate::bits::raw(inten.ipcmderren()) == 1 {
             pending_events |= IRQ_EVENT_COMMAND_ERROR;
             clear_command_flags = true;
         }
         // The watermark flag is deliberately left set: the task pops the FIFO and
         // then clears it, so clearing here would lose the event.
-        if status.iptxwe() && inten.iptxween() == pac::flexspi::Iptxween::Value1 {
+        if crate::bits::is_set(status.iptxwe()) && crate::bits::raw(inten.iptxween()) == 1 {
             pending_events |= IRQ_EVENT_TX_WATERMARK;
         }
 
@@ -320,7 +316,7 @@ macro_rules! impl_flexspi_pin {
                     // on DATA2/DATA3, handled by `impl_flexspi_pin_pull!`.
                     self.set_slew_rate(crate::gpio::SlewRate::Fast);
                     self.set_drive_strength(crate::gpio::DriveStrength::Normal);
-                    self.set_function(crate::pac::port::Mux::$mux);
+                    self.set_function(crate::gpio::Mux::$mux);
                     self.set_enable_input_buffer(true);
                     crate::impl_flexspi_pin_pull!(self, $signal);
                 }
@@ -482,7 +478,7 @@ pub enum IoError {
     /// that crossed a device boundary.
     Command {
         /// The raw error code.
-        error_code: pac::flexspi::Ipcmderrcode,
+        error_code: u8,
     },
     /// The command never won arbitration against the AHB path.
     CommandGrantTimeout,
@@ -652,14 +648,14 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         // the sequence NXP actually ships is: leave stop mode, software reset,
         // then write MCR0 with MDIS set, and only drop MDIS again once the flash
         // and delay-line registers are in place. Follow that order.
-        regs.mcr0().modify(|r: &mut Mcr0| r.set_mdis(pac::flexspi::Mdis::Val0));
+        regs.mcr0().modify(|r| r.set_mdis(crate::bits::flag(0)));
         self.software_reset();
 
-        regs.mcr0().write(|r: &mut Mcr0| {
+        regs.mcr0().write(|r| {
             // Loopback from the DQS pad. This is what fixes the delay line at a
             // one-cell override and frees the driver from frequency-dependent
             // DLL configuration - see the module docs.
-            r.set_rxclksrc(pac::flexspi::Rxclksrc::Val1);
+            r.set_rxclksrc(crate::bits::flag(1));
             // IPGRANTWAIT and AHBGRANTWAIT bound how many (1024-serial-clock)
             // cycles an IP- or AHB-triggered command waits for the sequence
             // engine before a grant-timeout error. The RM documents the reset
@@ -668,29 +664,29 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             r.set_ipgrantwait(0xff);
             r.set_ahbgrantwait(0xff);
             // Let the controller halt when the SoC asserts doze.
-            r.set_dozeen(pac::flexspi::Dozeen::Val1);
+            r.set_dozeen(crate::bits::flag(1));
             // Stay in stop mode until the flash and delay-line configuration
             // below is in place. ARDFEN/ATDFEN are deliberately left zero: the
             // PAC carries them but this part does not implement them.
-            r.set_mdis(pac::flexspi::Mdis::Val1);
+            r.set_mdis(crate::bits::flag(1));
         });
 
         // MCR1's SEQWAIT and AHBBUSWAIT must never be zero, and both reset to
         // 0xFFFF, so it is left alone.
 
-        regs.ahbcr().write(|r: &mut Ahbcr| {
-            r.set_aparen(pac::flexspi::Aparen::Individual);
-            r.set_clrahbrxbuf(pac::flexspi::Clrahbrxbuf::Val0);
-            r.set_clrahbtxbuf(pac::flexspi::Clrahbtxbuf::Val0);
-            r.set_cachableen(pac::flexspi::Cachableen::Val1);
-            r.set_bufferableen(pac::flexspi::Bufferableen::Val1);
-            r.set_prefetchen(pac::flexspi::AhbcrPrefetchen::Value1);
-            r.set_readaddropt(pac::flexspi::Readaddropt::Val0);
+        regs.ahbcr().write(|r| {
+            r.set_aparen(crate::bits::flag(0));
+            r.set_clrahbrxbuf(crate::bits::flag(0));
+            r.set_clrahbtxbuf(crate::bits::flag(0));
+            r.set_cachableen(crate::bits::flag(1));
+            r.set_bufferableen(crate::bits::flag(1));
+            r.set_prefetchen(crate::bits::flag(1));
+            r.set_readaddropt(crate::bits::flag(0));
             // ERR052733: this part does not support resuming a suspended AHB
             // read. NXP's default configuration disables resume on every
             // affected part, so do the same.
-            r.set_resumedisable(pac::flexspi::Resumedisable::Val1);
-            r.set_readszalign(pac::flexspi::Readszalign::Val0);
+            r.set_resumedisable(crate::bits::flag(1));
+            r.set_readszalign(crate::bits::flag(0));
             // AFLASHBASE (AHBCR[31:28], 256 MB-granular) stays 0: the bus matrix
             // presents the controller a window-relative offset, so there is no
             // base to subtract. A non-zero value folds high bits into the flash
@@ -709,16 +705,16 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
 
         self.set_flash_size(self.flash.flash_size_kbytes);
 
-        regs.flshcr1(self.chip_index as usize).write(|r: &mut Flshcr1| {
+        regs.flshcr1(self.chip_index as usize).write(|r| {
             r.set_tcss(3);
             r.set_tcsh(3);
-            r.set_wa(pac::flexspi::Wa::Value0);
+            r.set_wa(crate::bits::flag(0));
             r.set_cas(0);
-            r.set_csintervalunit(pac::flexspi::Csintervalunit::Val0);
+            r.set_csintervalunit(crate::bits::flag(0));
             r.set_csinterval(2);
         });
 
-        regs.flshcr2(self.chip_index as usize).write(|r: &mut Flshcr2| {
+        regs.flshcr2(self.chip_index as usize).write(|r| {
             r.set_ardseqid(self.flash.read_seq);
             // ARDSEQNUM/AWRSEQNUM are encoded as (sequence count - 1): the
             // controller runs `field + 1` LUT sequences for an AHB-triggered
@@ -731,18 +727,18 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             r.set_awrseqid(lookup::AHB_WRITE_SEQUENCE_INDEX);
             r.set_awrseqnum(0);
             r.set_awrwait(0);
-            r.set_awrwaitunit(pac::flexspi::Awrwaitunit::Val0);
+            r.set_awrwaitunit(crate::bits::flag(0));
             r.set_clrinstrptr(false);
         });
 
-        regs.flshcr4().write(|r: &mut Flshcr4| {
-            r.set_wmopt1(false);
-            r.set_wmena(pac::flexspi::Wmena::Val0);
-            r.set_wmenb(pac::flexspi::Wmenb::Val0);
+        regs.flshcr4().write(|r| {
+            r.set_wmopt1(crate::bits::from_bool(false));
+            r.set_wmena(crate::bits::flag(0));
+            r.set_wmenb(crate::bits::flag(0));
         });
 
-        regs.iptxfcr().modify(|r: &mut Iptxfcr| r.set_txwmrk(0));
-        regs.iprxfcr().modify(|r: &mut Iprxfcr| r.set_rxwmrk(0));
+        regs.iptxfcr().modify(|r| r.set_txwmrk(0));
+        regs.iprxfcr().modify(|r| r.set_rxwmrk(0));
 
         // Read-strobe delay line. For every loopback RXCLKSRC - which is what
         // this driver selects - the delay is a fixed one-cell override
@@ -751,11 +747,11 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         // frequency-dependent DLL. DLLCR is per port, A = 0 and B = 1, and each
         // port owns two adjacent device slots.
         regs.dllcr((self.chip_index >> 1) as usize)
-            .write(|r: &mut Dllcr| r.set_ovrden(pac::flexspi::Ovrden::Value1));
+            .write(|r| r.set_ovrden(crate::bits::flag(1)));
 
         // Leave stop mode now that the flash and delay-line configuration is in
         // place, then load the LUT - which is inaccessible while MDIS is set.
-        regs.mcr0().modify(|r: &mut Mcr0| r.set_mdis(pac::flexspi::Mdis::Val0));
+        regs.mcr0().modify(|r| r.set_mdis(crate::bits::flag(0)));
 
         self.load_lut(self.flash.lookup_table);
         self.software_reset();
@@ -766,7 +762,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.set_lut_lock(false);
 
         for index in 0..LUT_WORD_COUNT {
-            self.info.regs.lut(index).write_value(Lut(0));
+            self.info.regs.lut(index).write_value(crate::bits::from_raw(0));
         }
 
         for seq_index in 0..LUT_SEQUENCE_COUNT {
@@ -775,7 +771,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
                 self.info
                     .regs
                     .lut(4 * seq_index as usize + word_index)
-                    .write_value(Lut(*word));
+                    .write_value(crate::bits::from_raw(*word));
             }
         }
 
@@ -917,26 +913,26 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     }
 
     fn software_reset(&mut self) {
-        self.info
-            .regs
-            .mcr0()
-            .modify(|r: &mut Mcr0| r.set_swreset(pac::flexspi::Swreset::Val1));
-        while self.info.regs.mcr0().read().swreset() == pac::flexspi::Swreset::Val1 {}
+        self.info.regs.mcr0().modify(|r| r.set_swreset(crate::bits::flag(1)));
+        while crate::bits::raw(self.info.regs.mcr0().read().swreset()) == 1 {}
     }
 
     /// The key write and the control write must be back to back - any other
     /// FlexSPI register access between them voids the unlock.
     fn set_lut_lock(&mut self, lock: bool) {
-        self.info.regs.lutkey().write_value(Lutkey(LUT_KEY_VALUE));
+        self.info
+            .regs
+            .lutkey()
+            .write_value(crate::bits::from_raw(LUT_KEY_VALUE));
         self.info
             .regs
             .lutcr()
-            .write_value(Lutcr(if lock { 0x01 } else { 0x02 }));
+            .write_value(crate::bits::from_raw(if lock { 0x01 } else { 0x02 }));
     }
 
     /// Spin until the sequence engine is idle.
     fn wait_idle(&self) {
-        while self.info.regs.sts0().read().seqidle() != pac::flexspi::Seqidle::Value1 {}
+        while crate::bits::raw(self.info.regs.sts0().read().seqidle()) != 1 {}
     }
 
     /// Spin until *both* the arbitrator and the sequence engine are idle, which is
@@ -946,7 +942,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         let regs = self.info.regs;
         loop {
             let sts0 = regs.sts0().read();
-            if sts0.seqidle() == pac::flexspi::Seqidle::Value1 && sts0.arbidle() == pac::flexspi::Arbidle::Value1 {
+            if crate::bits::raw(sts0.seqidle()) == 1 && crate::bits::raw(sts0.arbidle()) == 1 {
                 return;
             }
         }
@@ -969,7 +965,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         // (wrap the async op in `with_timeout` with an application-specific
         // budget). The driver only guarantees that a cancelled op does not wedge
         // the next one.
-        if self.info.regs.sts0().read().seqidle() != pac::flexspi::Seqidle::Value1 {
+        if crate::bits::raw(self.info.regs.sts0().read().seqidle()) != 1 {
             self.software_reset();
         }
         self.wait_idle();
@@ -981,57 +977,54 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.info
             .regs
             .flshcr2(self.chip_index as usize)
-            .modify(|r: &mut Flshcr2| r.set_clrinstrptr(true));
-        self.info.regs.intr().write(|r: &mut Intr| {
-            r.set_ahbcmderr(true);
-            r.set_ipcmderr(true);
-            r.set_ahbcmdge(true);
-            r.set_ipcmdge(true);
-            r.set_ipcmddone(true);
+            .modify(|r| r.set_clrinstrptr(true));
+        self.info.regs.intr().write(|r| {
+            r.set_ahbcmderr(crate::bits::from_bool(true));
+            r.set_ipcmderr(crate::bits::from_bool(true));
+            r.set_ahbcmdge(crate::bits::from_bool(true));
+            r.set_ipcmdge(crate::bits::from_bool(true));
+            r.set_ipcmddone(crate::bits::from_bool(true));
         });
         // Both FIFOs must be emptied between commands, or the next read returns
         // the previous command's data.
         self.info
             .regs
             .iptxfcr()
-            .modify(|r: &mut Iptxfcr| r.set_clriptxf(pac::flexspi::Clriptxf::Value1));
+            .modify(|r| r.set_clriptxf(crate::bits::flag(1)));
         self.info
             .regs
             .iprxfcr()
-            .modify(|r: &mut Iprxfcr| r.set_clriprxf(pac::flexspi::Clriprxf::Value1));
+            .modify(|r| r.set_clriprxf(crate::bits::flag(1)));
     }
 
     fn wait_ip_command_done(&self) {
-        while !self.info.regs.intr().read().ipcmddone() {}
+        while !crate::bits::is_set(self.info.regs.intr().read().ipcmddone()) {}
     }
 
     fn wait_no_ip_error(&self) -> Result<(), IoError> {
         let status = self.info.regs.sts1().read();
-        if status.ipcmderrcode() == pac::flexspi::Ipcmderrcode::Val0 {
+        if crate::bits::raw(status.ipcmderrcode()) == 0 {
             Ok(())
         } else {
             Err(IoError::Command {
-                error_code: status.ipcmderrcode(),
+                error_code: crate::bits::raw(status.ipcmderrcode()),
             })
         }
     }
 
     /// Program `IPCR0`/`IPCR1`. `IPCMD` must be written after both.
     fn set_ip_command(&mut self, address: u32, seq_index: usize, data_size: u16) {
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
-        self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
+        self.info.regs.ipcr0().write(|r| r.set_sfar(address));
+        self.info.regs.ipcr1().write(|r| {
             r.set_idatsz(data_size);
             r.set_iseqid(seq_index as u8);
             r.set_iseqnum(0);
-            r.set_iparen(false);
+            r.set_iparen(crate::bits::from_bool(false));
         });
     }
 
     fn trigger_ip_command(&mut self) {
-        self.info
-            .regs
-            .ipcmd()
-            .write(|r: &mut Ipcmd| r.set_trg(pac::flexspi::Trg::Value1));
+        self.info.regs.ipcmd().write(|r| r.set_trg(crate::bits::flag(1)));
     }
 
     fn issue_ip_command(
@@ -1045,7 +1038,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.set_ip_command(address, seq_index, data_size);
 
         if let Some(word) = data {
-            self.info.regs.tfdr(0).write_value(Tfdr(word));
+            self.info.regs.tfdr(0).write_value(crate::bits::from_raw(word));
         }
 
         self.trigger_ip_command();
@@ -1061,9 +1054,15 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             // as erased rather than as zeros.
             let mut word = [0xFFu8; 4];
             word[..chunk.len()].copy_from_slice(chunk);
-            self.info.regs.tfdr(index).write_value(Tfdr(u32::from_le_bytes(word)));
+            self.info
+                .regs
+                .tfdr(index)
+                .write_value(crate::bits::from_raw(u32::from_le_bytes(word)));
         }
-        self.info.regs.intr().write(|r: &mut Intr| r.set_iptxwe(true));
+        self.info
+            .regs
+            .intr()
+            .write(|r| r.set_iptxwe(crate::bits::from_bool(true)));
     }
 
     fn tx_watermark_bytes(&self) -> usize {
@@ -1079,7 +1078,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         let mut offset = 0;
 
         while offset < data.len() {
-            while !self.info.regs.intr().read().iptxwe() {}
+            while !crate::bits::is_set(self.info.regs.intr().read().iptxwe()) {}
 
             let chunk_len = watermark.min(data.len() - offset);
             self.push_tx_window(&data[offset..offset + chunk_len]);
@@ -1145,13 +1144,13 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     /// `MCR2.CLRAHBBUFOPT` does not cover this: it only clears the buffers on
     /// return from Stop mode.
     fn invalidate_memory_mapped(&mut self) {
-        self.info.regs.ahbcr().modify(|r: &mut Ahbcr| {
-            r.set_clrahbrxbuf(pac::flexspi::Clrahbrxbuf::Val1);
-            r.set_clrahbtxbuf(pac::flexspi::Clrahbtxbuf::Val1);
+        self.info.regs.ahbcr().modify(|r| {
+            r.set_clrahbrxbuf(crate::bits::flag(1));
+            r.set_clrahbtxbuf(crate::bits::flag(1));
         });
-        self.info.regs.ahbcr().modify(|r: &mut Ahbcr| {
-            r.set_clrahbrxbuf(pac::flexspi::Clrahbrxbuf::Val0);
-            r.set_clrahbtxbuf(pac::flexspi::Clrahbtxbuf::Val0);
+        self.info.regs.ahbcr().modify(|r| {
+            r.set_clrahbrxbuf(crate::bits::flag(0));
+            r.set_clrahbtxbuf(crate::bits::flag(0));
         });
 
         invalidate_cache64();
@@ -1262,7 +1261,7 @@ impl<'d> InnerFlexSpi<'d, Async> {
     }
 
     async fn wait_idle_async(&self) {
-        while self.info.regs.sts0().read().seqidle() != pac::flexspi::Seqidle::Value1 {
+        while crate::bits::raw(self.info.regs.sts0().read().seqidle()) != 1 {
             yield_now().await;
         }
     }
@@ -1278,7 +1277,7 @@ impl<'d> InnerFlexSpi<'d, Async> {
         self.set_ip_command(address, seq_index, data_size);
 
         if let Some(word) = data {
-            self.info.regs.tfdr(0).write_value(Tfdr(word));
+            self.info.regs.tfdr(0).write_value(crate::bits::from_raw(word));
         }
 
         self.trigger_ip_command();
@@ -1359,7 +1358,7 @@ impl<'d> InnerFlexSpi<'d, Async> {
             }
 
             offset += chunk_words;
-            regs.intr().write(|r: &mut Intr| r.set_iptxwe(true));
+            regs.intr().write(|r| r.set_iptxwe(crate::bits::from_bool(true)));
         }
 
         self.wait_for_command_completion_async().await
@@ -1402,15 +1401,15 @@ impl<'d> InnerFlexSpi<'d, Async> {
             self.info.waker().register(cx.waker());
 
             self.info.regs.inten().write(|w| {
-                w.set_ipcmddoneen(pac::flexspi::Ipcmddoneen::Value1);
-                w.set_ipcmdgeen(pac::flexspi::Ipcmdgeen::Value1);
-                w.set_ipcmderren(pac::flexspi::Ipcmderren::Value1);
+                w.set_ipcmddoneen(crate::bits::flag(1));
+                w.set_ipcmdgeen(crate::bits::flag(1));
+                w.set_ipcmderren(crate::bits::flag(1));
             });
 
             let pending_events = self.info.pending_events().load(Ordering::Acquire);
             let status = self.info.regs.intr().read();
 
-            if (pending_events & IRQ_EVENT_COMMAND_GRANT) != 0 || status.ipcmdge() {
+            if (pending_events & IRQ_EVENT_COMMAND_GRANT) != 0 || crate::bits::is_set(status.ipcmdge()) {
                 self.info
                     .pending_events()
                     .fetch_and(!IRQ_EVENT_COMMAND_GRANT, Ordering::AcqRel);
@@ -1418,8 +1417,8 @@ impl<'d> InnerFlexSpi<'d, Async> {
             }
 
             if (pending_events & (IRQ_EVENT_COMMAND_DONE | IRQ_EVENT_COMMAND_ERROR)) != 0
-                || status.ipcmddone()
-                || status.ipcmderr()
+                || crate::bits::is_set(status.ipcmddone())
+                || crate::bits::is_set(status.ipcmderr())
             {
                 self.info
                     .pending_events()
@@ -1446,35 +1445,41 @@ impl<'d> InnerFlexSpi<'d, Async> {
             self.info.waker().register(cx.waker());
 
             self.info.regs.inten().write(|w| {
-                w.set_iptxween(pac::flexspi::Iptxween::Value1);
-                w.set_ipcmdgeen(pac::flexspi::Ipcmdgeen::Value1);
-                w.set_ipcmderren(pac::flexspi::Ipcmderren::Value1);
+                w.set_iptxween(crate::bits::flag(1));
+                w.set_ipcmdgeen(crate::bits::flag(1));
+                w.set_ipcmderren(crate::bits::flag(1));
             });
 
             let pending_events = self.info.pending_events().load(Ordering::Acquire);
             let status = self.info.regs.intr().read();
 
-            if (pending_events & IRQ_EVENT_COMMAND_GRANT) != 0 || status.ipcmdge() {
+            if (pending_events & IRQ_EVENT_COMMAND_GRANT) != 0 || crate::bits::is_set(status.ipcmdge()) {
                 self.info
                     .pending_events()
                     .fetch_and(!IRQ_EVENT_COMMAND_GRANT, Ordering::AcqRel);
-                if status.ipcmdge() {
-                    self.info.regs.intr().write(|w| w.set_ipcmdge(true));
+                if crate::bits::is_set(status.ipcmdge()) {
+                    self.info
+                        .regs
+                        .intr()
+                        .write(|w| w.set_ipcmdge(crate::bits::from_bool(true)));
                 }
                 return Poll::Ready(Err(IoError::CommandGrantTimeout));
             }
 
-            if (pending_events & IRQ_EVENT_COMMAND_ERROR) != 0 || status.ipcmderr() {
+            if (pending_events & IRQ_EVENT_COMMAND_ERROR) != 0 || crate::bits::is_set(status.ipcmderr()) {
                 self.info
                     .pending_events()
                     .fetch_and(!IRQ_EVENT_COMMAND_ERROR, Ordering::AcqRel);
-                if status.ipcmderr() {
-                    self.info.regs.intr().write(|w| w.set_ipcmderr(true));
+                if crate::bits::is_set(status.ipcmderr()) {
+                    self.info
+                        .regs
+                        .intr()
+                        .write(|w| w.set_ipcmderr(crate::bits::from_bool(true)));
                 }
                 return Poll::Ready(self.wait_no_ip_error());
             }
 
-            if (pending_events & IRQ_EVENT_TX_WATERMARK) != 0 || status.iptxwe() {
+            if (pending_events & IRQ_EVENT_TX_WATERMARK) != 0 || crate::bits::is_set(status.iptxwe()) {
                 self.info
                     .pending_events()
                     .fetch_and(!IRQ_EVENT_TX_WATERMARK, Ordering::AcqRel);
@@ -1497,17 +1502,17 @@ impl<'d> InnerFlexSpi<'d, Async> {
 fn invalidate_cache64() {
     let cache = pac::CACHE64_CTRL0;
 
-    if !cache.ccr().read().encache() {
+    if !crate::bits::is_set(cache.ccr().read().encache()) {
         return;
     }
 
     cache.ccr().modify(|w| {
-        w.set_invw0(pac::cache64ctrl::Invw0::Invw0);
-        w.set_invw1(pac::cache64ctrl::Invw1::Invw1);
-        w.set_go(pac::cache64ctrl::Go::InitCmd);
+        w.set_invw0(crate::bits::flag(1));
+        w.set_invw1(crate::bits::flag(1));
+        w.set_go(crate::bits::flag(1));
     });
 
-    while cache.ccr().read().go() == pac::cache64ctrl::Go::InitCmd {}
+    while crate::bits::raw(cache.ccr().read().go()) == 1 {}
 
     cortex_m::asm::dsb();
     cortex_m::asm::isb();

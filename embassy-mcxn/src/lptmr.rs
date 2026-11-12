@@ -68,7 +68,7 @@ pub struct LptmrClockConfig {
 macro_rules! impl_lptmr_functional_clock {
     ($n:literal) => {
         ::paste::paste! {
-            #[cfg(mcxn_lptmr)]
+            #[cfg(mcx_n_lptmr)]
             impl FunctionalClock for crate::peripherals::[<LPTMR $n>] {
                 type Config = LptmrClockConfig;
 
@@ -132,7 +132,7 @@ pub struct Lptmr<'d, T: Instance> {
 fn csr_modify(regs: pac::lptmr::Lptmr, f: impl FnOnce(&mut pac::lptmr::Csr)) {
     let mut w = regs.csr().read();
     f(&mut w);
-    w.set_tcf(Tcf::Tcf0);
+    w.set_tcf(Tcf::NoMatch);
     regs.csr().write_value(w);
 }
 
@@ -186,7 +186,7 @@ fn wait_for_compare<T: Instance>() -> impl Future<Output = ()> {
         waker(index).register(cx.waker());
         csr_modify(regs, |w| w.set_tie(Tie::Tie1));
 
-        if regs.csr().read().tcf() == Tcf::Tcf1 {
+        if regs.csr().read().tcf() == Tcf::Match {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -219,7 +219,7 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         // being woken, and would never see Ready (confirmed on hardware: it
         // silently re-armed and re-fired every ~250ms forever instead of
         // completing).
-        if regs.csr().read().tie() == Tie::Tie1 && regs.csr().read().tcf() == Tcf::Tcf1 {
+        if regs.csr().read().tie() == Tie::Tie1 && regs.csr().read().tcf() == Tcf::Match {
             csr_modify(regs, |w| w.set_tie(Tie::Tie0));
             waker(index).wake();
         }

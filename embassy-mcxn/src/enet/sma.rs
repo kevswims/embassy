@@ -64,13 +64,13 @@ impl<T: Instance> StationManagement for Sma<T> {
             w.set_rda(reg);
             // GOC is modelled as two single-bit fields rather than one 2-bit
             // field: 0b11 = read, 0b01 = write.
-            w.set_goc_0(true);
-            w.set_goc_1(true);
+            w.set_goc_0(crate::bits::from_bool(true));
+            w.set_goc_1(crate::bits::from_bool(true));
             w.set_cr(self.clock_range);
-            w.set_gb(true);
+            w.set_gb(crate::bits::from_bool(true));
         });
 
-        while regs.mac_mdio_address().read().gb() {}
+        while crate::bits::is_set(regs.mac_mdio_address().read().gb()) {}
 
         regs.mac_mdio_data().read().gd()
     }
@@ -82,12 +82,12 @@ impl<T: Instance> StationManagement for Sma<T> {
         regs.mac_mdio_address().modify(|w| {
             w.set_pa(phy_addr);
             w.set_rda(reg);
-            w.set_goc_0(true);
-            w.set_goc_1(false);
+            w.set_goc_0(crate::bits::from_bool(true));
+            w.set_goc_1(crate::bits::from_bool(false));
             w.set_cr(self.clock_range);
-            w.set_gb(true);
+            w.set_gb(crate::bits::from_bool(true));
         });
 
-        while regs.mac_mdio_address().read().gb() {}
+        while crate::bits::is_set(regs.mac_mdio_address().read().gb()) {}
     }
 }

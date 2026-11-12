@@ -25,7 +25,7 @@ use xarxa_driver::PacketBuf;
 use xarxa_driver::{Timestamp, TxTimestamp};
 
 use super::dma_addr;
-use crate::pac::enet::Enet as Regs;
+use crate::pac::enet::EnetAlpha as Regs;
 
 /// Descriptor bit definitions. These come from the DWMAC IP, not from any
 /// vendor's register map, so they are identical to the STM32 `eth_v2` set.

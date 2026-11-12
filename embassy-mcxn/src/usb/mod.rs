@@ -14,7 +14,7 @@
 //! let p = embassy_mcxn::init(cfg);
 //!
 //! let driver = usb::Driver::new(
-//!     p.USBHS1__USBC, p.USBPHY, p.USBHS1__USBNC, Irqs, usb::Config::default(),
+//!     p.USB1, p.USB1_HS_PHY, p.USB1_NC, Irqs, usb::Config::default(),
 //! )
 //! .unwrap();
 //! ```
@@ -36,11 +36,11 @@ use crate::{interrupt, pac, peripherals};
 /// `DCCPARAMS.DEN` by the driver at construction.
 const MAX_EP_COUNT: usize = 8;
 
-/// Convenience alias for the awkwardly spelled `peripherals::USBHS1__USBC`.
+/// Convenience alias for the awkwardly spelled `peripherals::USB1`.
 ///
 /// The singleton name is generated from PAC metadata, so it cannot be renamed
 /// at the source; this makes `bind_interrupts!` readable.
-pub type UsbHs = peripherals::USBHS1__USBC;
+pub type UsbHs = peripherals::USB1;
 
 /// Errors that can occur bringing the USB controller up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,10 +115,10 @@ pub trait Instance: SealedInstance + Gate + PeripheralType + 'static + Send {
     type Interrupt: Interrupt;
 }
 
-impl SealedInstance for peripherals::USBHS1__USBC {
+impl SealedInstance for peripherals::USB1 {
     fn regs() -> regs::Usb {
         // SAFETY: the PAC const is the controller's base address.
-        unsafe { regs::Usb::from_ptr(pac::USBHS1__USBC.as_ptr() as *mut ()) }
+        unsafe { regs::Usb::from_ptr(pac::USB1.as_ptr() as *mut ()) }
     }
 
     fn state() -> State<'static> {
@@ -127,7 +127,7 @@ impl SealedInstance for peripherals::USBHS1__USBC {
     }
 }
 
-impl Instance for peripherals::USBHS1__USBC {
+impl Instance for peripherals::USB1 {
     type Interrupt = interrupt::typelevel::USB1_HS;
 }
 
@@ -140,7 +140,7 @@ pub struct Driver<'d, T: Instance> {
 impl<'d, T: Instance> Driver<'d, T> {
     /// Bring the PHY and controller up and create the driver.
     ///
-    /// Takes `USBPHY` and `USBHS1__USBNC` as well as the controller because it
+    /// Takes `USB1_HS_PHY` and `USB1_NC` as well as the controller because it
     /// writes all three; owning them stops a future charger-detect or VBUS
     /// driver from racing this one. `USBHS1_PHY_DCD` is deliberately left
     /// free.
@@ -149,13 +149,13 @@ impl<'d, T: Instance> Driver<'d, T> {
     /// mux.
     pub fn new(
         _peri: Peri<'d, T>,
-        _phy: Peri<'d, peripherals::USBPHY>,
-        _usbnc: Peri<'d, peripherals::USBHS1__USBNC>,
+        _phy: Peri<'d, peripherals::USB1_HS_PHY>,
+        _usbnc: Peri<'d, peripherals::USB1_NC>,
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, Error> {
-        let clk_in = crate::clocks::with_clocks(|c| c.ensure_clk_in())
-            .ok_or(Error::Clock(ClockError::NeverInitialized))??;
+        let clk_in =
+            crate::clocks::with_clocks(|c| c.ensure_clk_in()).ok_or(Error::Clock(ClockError::NeverInitialized))??;
 
         #[cfg(feature = "defmt")]
         defmt::info!("usb: clk_in {} Hz", clk_in);
@@ -193,22 +193,16 @@ impl<'d, T: Instance> embassy_usb_driver::Driver<'d> for Driver<'d, T> {
 
     fn alloc_endpoint_out(
         &mut self,
-        ep_type: embassy_usb_driver::EndpointType,
-        ep_addr: Option<embassy_usb_driver::EndpointAddress>,
-        max_packet_size: u16,
-        interval_ms: u8,
+        config: &embassy_usb_driver::EndpointConfig,
     ) -> Result<Self::EndpointOut, embassy_usb_driver::EndpointAllocError> {
-        self.inner.alloc_endpoint_out(ep_type, ep_addr, max_packet_size, interval_ms)
+        self.inner.alloc_endpoint_out(config)
     }
 
     fn alloc_endpoint_in(
         &mut self,
-        ep_type: embassy_usb_driver::EndpointType,
-        ep_addr: Option<embassy_usb_driver::EndpointAddress>,
-        max_packet_size: u16,
-        interval_ms: u8,
+        config: &embassy_usb_driver::EndpointConfig,
     ) -> Result<Self::EndpointIn, embassy_usb_driver::EndpointAllocError> {
-        self.inner.alloc_endpoint_in(ep_type, ep_addr, max_packet_size, interval_ms)
+        self.inner.alloc_endpoint_in(config)
     }
 
     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {

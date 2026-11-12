@@ -97,13 +97,16 @@ pub(crate) trait SealedPin {
     /// The GPIO data-register block for this pin's bank.
     fn gpio(&self) -> crate::pac::gpio::Gpio;
 
-    /// The PORT pad-control block for this pin's bank.
-    fn port_reg(&self) -> crate::pac::port::Port;
+    /// Base address of the PORT block for this pin's bank.
+    fn port_base(&self) -> *mut ();
 
-    /// This pin's pad control register.
+    /// This pin's pad control register (`PCRn`), accessed as raw bits because
+    /// each PORT bank has its own generated register types.
     #[inline(always)]
-    fn pcr_reg(&self) -> crate::pac::common::Reg<crate::pac::port::Pcr, crate::pac::common::RW> {
-        self.port_reg().pcr(self.pin() as usize)
+    fn pcr_reg(&self) -> crate::pac::common::Reg<u32, crate::pac::common::RW> {
+        // PCR0 is at offset 0x80 in every PORT bank; PCRn follows at 4-byte strides.
+        let addr = (self.port_base() as *mut u8).wrapping_add(PCR_OFFSET + 4 * self.pin() as usize);
+        unsafe { crate::pac::common::Reg::from_ptr(addr as *mut u32) }
     }
 
     /// Select which peripheral function drives this pin.
@@ -112,74 +115,126 @@ pub(crate) trait SealedPin {
     /// metadata (RM Table 119), which is what the per-peripheral pin traits are
     /// generated from.
     #[inline(always)]
-    fn set_function(&self, mux: crate::pac::port::Mux) {
-        self.pcr_reg().modify(|w| w.set_mux(mux));
+    fn set_function(&self, mux: Mux) {
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_MUX_SHIFT, 0xf, mux as u32));
     }
 
     /// Select GPIO, which is ALT0 on every pin of this chip.
     #[inline(always)]
     fn set_function_gpio(&self) {
-        self.set_function(crate::pac::port::Mux::Mux0);
+        self.set_function(Mux::Mux0);
     }
 
     #[inline(always)]
     fn set_pull(&self, pull: Pull) {
         let (pe, ps) = match pull {
-            Pull::Disabled => (crate::pac::port::Pe::Pe0, crate::pac::port::Ps::Ps0),
-            Pull::Up => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps1),
-            Pull::Down => (crate::pac::port::Pe::Pe1, crate::pac::port::Ps::Ps0),
+            Pull::Disabled => (0, 0),
+            Pull::Up => (1, 1),
+            Pull::Down => (1, 0),
         };
         self.pcr_reg().modify(|w| {
-            w.set_pe(pe);
-            w.set_ps(ps);
+            pcr_set(w, PCR_PE_SHIFT, 1, pe);
+            pcr_set(w, PCR_PS_SHIFT, 1, ps);
         });
     }
 
     #[inline(always)]
     fn set_drive_strength(&self, strength: DriveStrength) {
         let val = match strength {
-            DriveStrength::Normal => crate::pac::port::Dse::Dse0,
-            DriveStrength::Double => crate::pac::port::Dse::Dse1,
+            DriveStrength::Normal => 0,
+            DriveStrength::Double => 1,
         };
-        self.pcr_reg().modify(|w| w.set_dse(val));
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_DSE_SHIFT, 1, val));
     }
 
     #[inline(always)]
     fn set_slew_rate(&self, slew_rate: SlewRate) {
         let val = match slew_rate {
-            SlewRate::Fast => crate::pac::port::Sre::Sre0,
-            SlewRate::Slow => crate::pac::port::Sre::Sre1,
+            SlewRate::Fast => 0,
+            SlewRate::Slow => 1,
         };
-        self.pcr_reg().modify(|w| w.set_sre(val));
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_SRE_SHIFT, 1, val));
     }
 
     #[inline(always)]
     fn set_enable_input_buffer(&self, enabled: bool) {
-        let val = if enabled {
-            crate::pac::port::Ibe::Ibe1
-        } else {
-            crate::pac::port::Ibe::Ibe0
-        };
-        self.pcr_reg().modify(|w| w.set_ibe(val));
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_IBE_SHIFT, 1, enabled as u32));
     }
 
     #[inline(always)]
     fn set_open_drain(&self, open_drain: OpenDrain) {
         let val = match open_drain {
-            OpenDrain::No => crate::pac::port::Ode::Ode0,
-            OpenDrain::Yes => crate::pac::port::Ode::Ode1,
+            OpenDrain::No => 0,
+            OpenDrain::Yes => 1,
         };
-        self.pcr_reg().modify(|w| w.set_ode(val));
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_ODE_SHIFT, 1, val));
     }
 
     #[inline(always)]
     fn set_input_inversion(&self, invert: Inverter) {
         let val = match invert {
-            Inverter::Disabled => crate::pac::port::Inv::Inv0,
-            Inverter::Enabled => crate::pac::port::Inv::Inv1,
+            Inverter::Disabled => 0,
+            Inverter::Enabled => 1,
         };
-        self.pcr_reg().modify(|w| w.set_inv(val));
+        self.pcr_reg().modify(|w| pcr_set(w, PCR_INV_SHIFT, 1, val));
     }
+}
+
+/// Pin function (ALT) selection.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Mux {
+    Mux0 = 0,
+    Mux1 = 1,
+    Mux2 = 2,
+    Mux3 = 3,
+    Mux4 = 4,
+    Mux5 = 5,
+    Mux6 = 6,
+    Mux7 = 7,
+    Mux8 = 8,
+    Mux9 = 9,
+    Mux10 = 10,
+    Mux11 = 11,
+    Mux12 = 12,
+    Mux13 = 13,
+    Mux14 = 14,
+    Mux15 = 15,
+}
+
+/// A pad's `PCRn` register, by port and pin number, as raw bits.
+///
+/// For code that muxes pads without owning a pin singleton. The field layout is
+/// `PS` bit 0, `PE` bit 1, `SRE` bit 3, `ODE` bit 5, `DSE` bit 6, `MUX` bits
+/// 8-11, `IBE` bit 12, `INV` bit 13.
+#[cfg(feature = "unstable-pac")]
+pub fn pcr(port: usize, pin: usize) -> crate::pac::common::Reg<u32, crate::pac::common::RW> {
+    let base = match port {
+        0 => crate::pac::PORT0.as_ptr(),
+        1 => crate::pac::PORT1.as_ptr(),
+        2 => crate::pac::PORT2.as_ptr(),
+        3 => crate::pac::PORT3.as_ptr(),
+        4 => crate::pac::PORT4.as_ptr(),
+        _ => crate::pac::PORT5.as_ptr(),
+    };
+    let addr = (base as *mut u8).wrapping_add(PCR_OFFSET + 4 * pin);
+    unsafe { crate::pac::common::Reg::from_ptr(addr as *mut u32) }
+}
+
+const PCR_OFFSET: usize = 0x80;
+const PCR_PS_SHIFT: u32 = 0;
+const PCR_PE_SHIFT: u32 = 1;
+const PCR_SRE_SHIFT: u32 = 3;
+const PCR_ODE_SHIFT: u32 = 5;
+const PCR_DSE_SHIFT: u32 = 6;
+const PCR_MUX_SHIFT: u32 = 8;
+const PCR_IBE_SHIFT: u32 = 12;
+const PCR_INV_SHIFT: u32 = 13;
+
+#[inline(always)]
+fn pcr_set(reg: &mut u32, shift: u32, mask: u32, val: u32) {
+    *reg = (*reg & !(mask << shift)) | ((val & mask) << shift);
 }
 
 /// GPIO pin trait, implemented for each concrete pin singleton by [`impl_gpio_pin!`].
@@ -231,8 +286,8 @@ macro_rules! impl_gpio_pin {
                 }
 
                 #[inline(always)]
-                fn port_reg(&self) -> crate::pac::port::Port {
-                    crate::pac::[<PORT $port>]
+                fn port_base(&self) -> *mut () {
+                    crate::pac::[<PORT $port>].as_ptr()
                 }
             }
 

@@ -23,18 +23,14 @@ pub(super) const FIRC_FCLK_HZ: u32 = 144_000_000;
 /// The divisor is written while the divider is halted, then the halt is
 /// released, then we wait for the hardware to report the output stable.
 macro_rules! apply_div_no_reset {
-    ($reg:expr, $divty:ident, $div:expr) => {{
-        ::paste::paste! {
-            use crate::pac::syscon::{[<$divty Halt>], [<$divty Unstab>]};
-
-            let r = $reg;
-            r.modify(|w| {
-                w.set_div($div.into_bits());
-                w.set_halt([<$divty Halt>]::Halt);
-            });
-            r.modify(|w| w.set_halt([<$divty Halt>]::Run));
-            while r.read().unstab() == [<$divty Unstab>]::Ongoing {}
-        }
+    ($reg:expr, $div:expr) => {{
+        let r = $reg;
+        r.modify(|w| {
+            w.set_div($div.into_bits());
+            w.set_halt(crate::bits::flag(1));
+        });
+        r.modify(|w| w.set_halt(crate::bits::flag(0)));
+        while crate::bits::raw(r.read().unstab()) == 1 {}
     }};
 }
 
@@ -44,14 +40,10 @@ macro_rules! apply_div_no_reset {
 /// With nothing to halt, the divisor is written directly and we wait for the
 /// output to settle.
 macro_rules! apply_div_no_halt {
-    ($reg:expr, $divty:ident, $div:expr) => {{
-        ::paste::paste! {
-            use crate::pac::syscon::[<$divty Unstab>];
-
-            let r = $reg;
-            r.modify(|w| w.set_div($div.into_bits()));
-            while r.read().unstab() == [<$divty Unstab>]::Ongoing {}
-        }
+    ($reg:expr, $div:expr) => {{
+        let r = $reg;
+        r.modify(|w| w.set_div($div.into_bits()));
+        while crate::bits::raw(r.read().unstab()) == 1 {}
     }};
 }
 
@@ -60,7 +52,7 @@ macro_rules! apply_div_no_halt {
 /// SIRC has no enable bit - it is always running - so only the fan-out gate to
 /// peripherals decides whether `fro_12m` is selectable. It is set at reset.
 pub(super) fn record_sirc(clocks: &mut Clocks) {
-    if pac::SCG0.sirccsr().read().sirc_clk_periph_en() {
+    if crate::bits::is_set(pac::SCG0.sirccsr().read().sirc_clk_periph_en()) {
         clocks.fro_12m = Some(SIRC_HZ);
     }
 }
@@ -77,15 +69,15 @@ pub(super) fn record_firc(clocks: &mut Clocks) {
 
     // Same register `main_clk` is read from, and deliberately so: `fro_hf` and
     // `main_clk` are the same signal whenever FIRC drives the core.
-    clocks.fro_hf = match pac::SCG0.firccfg().read().range() {
-        pac::scg::FirccfgRange::Firc48mhz => FIRC_SCLK_HZ,
-        pac::scg::FirccfgRange::Firc144mhz => FIRC_FCLK_HZ,
+    clocks.fro_hf = match crate::bits::raw(pac::SCG0.firccfg().read().range()) {
+        0 => FIRC_SCLK_HZ,
+        _ => FIRC_FCLK_HZ,
     };
 
-    if csr.firc_sclk_periph_en() {
+    if crate::bits::is_set(csr.firc_sclk_periph_en()) {
         clocks.fro_hf_48m = Some(FIRC_SCLK_HZ);
     }
-    if csr.firc_fclk_periph_en() {
+    if crate::bits::is_set(csr.firc_fclk_periph_en()) {
         clocks.fro_hf_144m = Some(FIRC_FCLK_HZ);
     }
 }
@@ -96,14 +88,12 @@ pub(super) fn record_firc(clocks: &mut Clocks) {
 /// anything outside that - including the 12 MHz crystals some NXP parts use -
 /// has no representation. Range boundaries overlap by one endpoint in the RM's
 /// wording; 20/30/50 MHz are assigned to the lower of the two candidates.
-fn sosc_range(hz: u32) -> Result<pac::scg::SosccfgRange, ClockError> {
-    use pac::scg::SosccfgRange;
-
+fn sosc_range(hz: u32) -> Result<u8, ClockError> {
     Ok(match hz {
-        16_000_000..=20_000_000 => SosccfgRange::Freq16to20mhz,
-        20_000_001..=30_000_000 => SosccfgRange::LowFreq,
-        30_000_001..=50_000_000 => SosccfgRange::MediumFreq,
-        50_000_001..=66_000_000 => SosccfgRange::HighFreq,
+        16_000_000..=20_000_000 => 0,
+        20_000_001..=30_000_000 => 1,
+        30_000_001..=50_000_000 => 2,
+        50_000_001..=66_000_000 => 3,
         _ => return Err(ClockError::SoscUnsupportedFrequency(hz)),
     })
 }
@@ -118,8 +108,6 @@ fn sosc_range(hz: u32) -> Result<pac::scg::SosccfgRange, ClockError> {
 /// `SOSCCFG` is only writable while `SOSCEN` is clear, hence the
 /// disable/configure/enable order rather than a single write.
 pub(super) fn configure_sosc(cfg: &ClocksConfig, clocks: &mut Clocks) -> Result<(), ClockError> {
-    use pac::scg::{Erefs, SosccsrLk};
-
     let Some(sosc) = cfg.sosc else {
         return Ok(());
     };
@@ -131,35 +119,35 @@ pub(super) fn configure_sosc(cfg: &ClocksConfig, clocks: &mut Clocks) -> Result<
     // a bootloader can have, and the writes below would otherwise be dropped
     // silently and leave SOSCVLD never setting - which looks identical to a
     // dead crystal.
-    if csr.read().lk() == SosccsrLk::WriteDisabled {
+    if crate::bits::raw(csr.read().lk()) == 1 {
         return Err(ClockError::SoscLocked);
     }
 
     // Clear SOSCEN before touching SOSCCFG. It is clear at reset, but `init()`
     // is not guaranteed to be running from reset.
-    csr.modify(|w| w.set_soscen(false));
+    csr.modify(|w| w.set_soscen(crate::bits::from_bool(false)));
 
     pac::SCG0.sosccfg().modify(|w| {
-        w.set_range(range);
+        w.set_range(crate::bits::flag(range));
         w.set_erefs(match sosc.mode {
-            SoscMode::Crystal => Erefs::Internal,
-            SoscMode::ExternalClock => Erefs::External,
+            SoscMode::Crystal => crate::bits::flag(1),
+            SoscMode::ExternalClock => crate::bits::flag(0),
         });
     });
 
-    csr.modify(|w| w.set_soscen(true));
+    csr.modify(|w| w.set_soscen(crate::bits::from_bool(true)));
 
     // Enable the SOSC clock monitor. Nominally only loss-of-clock detection,
     // but NXP's working USB firmware sets it and the USB HS PHY PLL does not
     // lock without it.
-    csr.modify(|w| w.set_sosccm(true));
+    csr.modify(|w| w.set_sosccm(crate::bits::from_bool(true)));
 
     // A crystal takes on the order of a millisecond to start; an externally
     // driven clock is valid almost at once. The cap is deliberately generous -
     // this runs once, before the executor exists, and the failure it guards
     // against (absent or mismatched crystal) would otherwise hang the boot.
     let mut spins = 0u32;
-    while !csr.read().soscvld() {
+    while !crate::bits::is_set(csr.read().soscvld()) {
         spins += 1;
         if spins > 5_000_000 {
             return Err(ClockError::SoscNotValid);
@@ -184,13 +172,13 @@ pub(super) fn configure_clock_ctrl(cfg: &ClocksConfig, clocks: &mut Clocks) {
         // Two separate bits: one enables FRO_1MHz for RTC and UTICK, the other
         // routes it into the clock generator so that a `*CLKSEL` selecting
         // clk_1m actually receives it. Both are needed.
-        w.set_fro1mhz_ena(cfg.enable_clk_1m);
-        w.set_fro1mhz_clk_ena(cfg.enable_clk_1m);
+        w.set_fro1mhz_ena(crate::bits::from_bool(cfg.enable_clk_1m));
+        w.set_fro1mhz_clk_ena(crate::bits::from_bool(cfg.enable_clk_1m));
 
-        w.set_fro12mhz_ena(cfg.enable_fro_12m_periph);
-        w.set_fro_hf_ena(cfg.enable_fro_hf_measure);
-        w.set_clkin_ena(cfg.enable_clk_in_periph);
-        w.set_clkin_ena_fm_usbh_lpt(cfg.enable_clk_in_fm_usbh_lpt);
+        w.set_fro12mhz_ena(crate::bits::from_bool(cfg.enable_fro_12m_periph));
+        w.set_fro_hf_ena(crate::bits::from_bool(cfg.enable_fro_hf_measure));
+        w.set_clkin_ena(crate::bits::from_bool(cfg.enable_clk_in_periph));
+        w.set_clkin_ena_fm_usbh_lpt(crate::bits::from_bool(cfg.enable_clk_in_fm_usbh_lpt));
     });
 
     if cfg.enable_clk_1m {
@@ -212,7 +200,7 @@ pub(super) fn configure_fro_hf_div(cfg: &ClocksConfig, clocks: &mut Clocks) {
         return;
     };
 
-    apply_div_no_reset!(pac::SYSCON0.frohfdiv(), Frohfdiv, div);
+    apply_div_no_reset!(pac::SYSCON0.frohfdiv(), div);
 
     clocks.fro_hf_div = Some(clocks.fro_hf / div.into_divisor());
 }
@@ -224,7 +212,7 @@ pub(super) fn configure_fro_hf_div(cfg: &ClocksConfig, clocks: &mut Clocks) {
 pub(super) fn configure_ahb_div(cfg: &ClocksConfig) -> u32 {
     match cfg.ahb_div {
         Some(div) => {
-            apply_div_no_halt!(pac::SYSCON0.ahbclkdiv(), Ahbclkdiv, div);
+            apply_div_no_halt!(pac::SYSCON0.ahbclkdiv(), div);
             div.into_divisor()
         }
         // Reset value divides by 1. `AHBCLKDIV.div` divides by `div + 1`.
@@ -244,8 +232,6 @@ pub(super) fn configure_ahb_div(cfg: &ClocksConfig) -> u32 {
 ///
 /// `PLLCLKDIV` resets halted, so the node stays unavailable unless requested.
 pub(super) fn configure_pll_div(cfg: &ClocksConfig, clocks: &mut Clocks) -> Result<(), ClockError> {
-    use pac::syscon::{PllclkdivHalt, PllclkdivReset, PllclkdivUnstab, PllclkdivselSel};
-
     let Some(pll_div) = cfg.pll_div else {
         return Ok(());
     };
@@ -253,8 +239,8 @@ pub(super) fn configure_pll_div(cfg: &ClocksConfig, clocks: &mut Clocks) -> Resu
     // Resolve the source first: a divider programmed against a PLL that was
     // never brought up would record a plausible rate for a dead clock.
     let (sel, src_hz) = match pll_div.source {
-        PllDivSource::Pll0 => (PllclkdivselSel::Enum0, clocks.ensure_pll0_clk()?),
-        PllDivSource::Pll1Clk0 => (PllclkdivselSel::Enum1, clocks.ensure_pll1_clk0()?),
+        PllDivSource::Pll0 => (crate::bits::flag(0), clocks.ensure_pll0_clk()?),
+        PllDivSource::Pll1Clk0 => (crate::bits::flag(1), clocks.ensure_pll1_clk0()?),
     };
 
     pac::SYSCON0.pllclkdivsel().modify(|w| w.set_sel(sel));
@@ -264,12 +250,12 @@ pub(super) fn configure_pll_div(cfg: &ClocksConfig, clocks: &mut Clocks) -> Resu
     let d = pac::SYSCON0.pllclkdiv();
     d.modify(|w| {
         w.set_div(pll_div.div.into_bits());
-        w.set_halt(PllclkdivHalt::Halt);
-        w.set_reset(PllclkdivReset::Asserted);
+        w.set_halt(crate::bits::flag(1));
+        w.set_reset(crate::bits::flag(1));
     });
     d.modify(|w| {
-        w.set_halt(PllclkdivHalt::Run);
-        w.set_reset(PllclkdivReset::Released);
+        w.set_halt(crate::bits::flag(0));
+        w.set_reset(crate::bits::flag(0));
     });
 
     // Capped rather than unbounded: `WDT0CLKDIV`/`WDT1CLKDIV` latch `UNSTAB`
@@ -277,7 +263,7 @@ pub(super) fn configure_pll_div(cfg: &ClocksConfig, clocks: &mut Clocks) -> Resu
     // SYSCON dividers have been shown to behave. A hang here would happen at
     // boot, before a probe can attach, so a stuck flag is reported instead.
     let mut spins = 0u32;
-    while d.read().unstab() == PllclkdivUnstab::Ongoing {
+    while crate::bits::raw(d.read().unstab()) == 1 {
         spins += 1;
         if spins > 5_000_000 {
             return Err(ClockError::PllDivNotStable);
@@ -316,7 +302,9 @@ pub(super) fn configure_vbat(cfg: &ClocksConfig, clocks: &mut Clocks) {
         return;
     }
 
-    pac::VBAT0.froctla().modify(|w| w.set_fro_en(true));
+    pac::VBAT0
+        .froctla()
+        .modify(|w| w.set_fro_en(crate::bits::from_bool(true)));
     pac::VBAT0.froclke().modify(|w| w.set_clke(0b1111));
 
     clocks.clk_16k = Some(FRO_16K_HZ);

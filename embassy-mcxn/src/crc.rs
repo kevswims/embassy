@@ -349,7 +349,7 @@ fn write_u8(regs: crate::pac::crc::Crc, word: u8) {
 }
 
 fn read_u8(regs: crate::pac::crc::Crc) -> u8 {
-    regs.data8().read()
+    unsafe { regs.data8().as_ptr().read_volatile() }
 }
 
 fn write_u16(regs: crate::pac::crc::Crc, word: u16) {
@@ -363,7 +363,7 @@ fn read_u16(regs: crate::pac::crc::Crc) -> u16 {
     if matches!(ctrl.totr(), Totr::BytsTrnps | Totr::BytsBtsTrnps) {
         (regs.data32().read() >> 16) as u16
     } else {
-        regs.data16().read()
+        unsafe { regs.data16().as_ptr().read_volatile() }
     }
 }
 

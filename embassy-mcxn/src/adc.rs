@@ -74,7 +74,6 @@ use crate::clocks::{ClockError, Gate, enable_and_reset_with_clock};
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::pac;
-use crate::pac::adc::{CalAvgs, CalReq, CalRdy, Calofs, CmdlCtype, CmdlMode, GccRdy, Pwrsel, Refsel, Rst, Rstfifo0, Rstfifo1, Tcmd};
 
 /// Bit-serial gain correction encoding used by `Gcr[n].gcalr`, matching
 /// NXP's `LPADC_GetGainConvResult` - a Q1.16 fixed-point expansion, not a
@@ -144,7 +143,12 @@ pub struct Adc<'d, T: Instance> {
 
 impl<'d, T: Instance> Adc<'d, T> {
     /// Create a new ADC driver.
-    pub fn new<C>(peri: Peri<'d, T>, _irq: impl typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd, config: Config, clock: &C) -> Result<Self, Error>
+    pub fn new<C>(
+        peri: Peri<'d, T>,
+        _irq: impl typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        config: Config,
+        clock: &C,
+    ) -> Result<Self, Error>
     where
         T: crate::clocks::FunctionalClock<Config = C>,
     {
@@ -164,51 +168,54 @@ impl<'d, T: Instance> Adc<'d, T> {
         // (LPADC_DoResetConfig + LPADC_DoResetFIFO0/1). The bus-level
         // PRESETCTRL reset pulsed by `enable_and_reset_with_clock` above
         // does not reach this internal logic.
-        regs.ctrl().modify(|w| w.set_rst(Rst::HeldInReset));
-        regs.ctrl().modify(|w| w.set_rst(Rst::ReleasedFromReset));
-        regs.ctrl().modify(|w| w.set_rstfifo0(Rstfifo0::TriggerReset));
-        regs.ctrl().modify(|w| w.set_rstfifo1(Rstfifo1::TriggerReset));
+        regs.ctrl().modify(|w| w.set_rst(crate::bits::flag(1)));
+        regs.ctrl().modify(|w| w.set_rst(crate::bits::flag(0)));
+        regs.ctrl().modify(|w| w.set_rstfifo0(crate::bits::flag(1)));
+        regs.ctrl().modify(|w| w.set_rstfifo1(crate::bits::flag(1)));
 
-        regs.ctrl().modify(|w| w.set_adcen(false));
+        regs.ctrl().modify(|w| w.set_adcen(crate::bits::from_bool(false)));
         // Averages 1024 samples per calibration step, matching
         // `LPADC_GetDefaultConfig()`'s `kLPADC_ConversionAverageMax - 1`.
         // Calibration is one-time at construction, so the extra settling
         // time buys accuracy at no steady-state cost.
-        regs.ctrl().modify(|w| w.set_cal_avgs(CalAvgs::Average1024));
+        regs.ctrl().modify(|w| w.set_cal_avgs(crate::bits::flag(10)));
         // NXP's LPADC_Init() builds this register from scratch
         // (`base->CFG = tmp32`), not a read-modify-write - reset defaults
         // for fields it doesn't explicitly set (observed: `tprictrl =
         // AbortCurrentOnPriority`, `hpt_exdi = Enabled`) are meant to be
         // forced to 0, not preserved.
-        let mut cfg = pac::adc::Cfg::default();
+        let mut cfg = crate::bits::zeroed_like(&regs.cfg());
         {
             let w = &mut cfg;
             w.set_pudly(config.power_up_delay);
-            w.set_pwren(true);
+            w.set_pwren(crate::bits::from_bool(true));
             // Matches the FRDM-MCXN947 board's own reference configuration
             // (examples/_boards/frdmmcxn947 in the MCUXpresso SDK) for its
             // ADC1 instance - VDD_ANA supply, confirmed powered at ~3.3V on
             // this board via multimeter, same as VREFH.
-            w.set_refsel(Refsel::Option3);
+            w.set_refsel(crate::bits::flag(2));
             // The PAC only names bits 0b00/0b10 ("Lowest"/"Highest") - the
             // RM's true highest level (`kLPADC_PowerLevelAlt4`, used by the
             // SDK's own `lpadc_polling` example) is raw value 0b11, mislabeled
             // `_RESERVED_3` in the generated enum.
-            w.set_pwrsel(Pwrsel::from_bits(0b11));
+            w.set_pwrsel(crate::bits::flag(0b11));
         }
         regs.cfg().write_value(cfg);
-        regs.ctrl().modify(|w| w.set_adcen(true));
+        regs.ctrl().modify(|w| w.set_adcen(crate::bits::from_bool(true)));
 
         // Request offset calibration - every NXP lpadc example (including
         // the FRDM-MCXN947 board's own reference code) runs this before any
         // conversion; it auto-writes OFSTRIM on completion.
-        regs.ctrl().modify(|w| w.set_calofs(Calofs::OffsetCalibrationRequestPending));
+        regs.ctrl().modify(|w| w.set_calofs(crate::bits::flag(1)));
         let mut spins = 0u32;
-        while regs.stat().read().cal_rdy() != CalRdy::HardwareCalStepCompleted {
+        while crate::bits::raw(regs.stat().read().cal_rdy()) != 1 {
             spins += 1;
             if spins > 5_000_000 {
                 #[cfg(feature = "defmt")]
-                defmt::warn!("ADC offset calibration never completed, STAT = {:?}", regs.stat().read());
+                defmt::warn!(
+                    "ADC offset calibration never completed, STAT = {:?}",
+                    regs.stat().read()
+                );
                 break;
             }
         }
@@ -219,11 +226,9 @@ impl<'d, T: Instance> Adc<'d, T> {
         // it; completion is signalled by `Gcc[0]`/`Gcc[1].rdy`, not
         // `Stat.cal_rdy` (that only turns true once software writes the
         // computed gain back into `Gcr[0]`/`Gcr[1]` with `rdy` set below).
-        regs.ctrl().modify(|w| w.set_cal_req(CalReq::CalibrationRequestPending));
+        regs.ctrl().modify(|w| w.set_cal_req(crate::bits::flag(1)));
         spins = 0;
-        while regs.gcc(0).read().rdy() != GccRdy::HardwareCalRoutineCompleted
-            || regs.gcc(1).read().rdy() != GccRdy::HardwareCalRoutineCompleted
-        {
+        while crate::bits::raw(regs.gcc(0).read().rdy()) != 1 || crate::bits::raw(regs.gcc(1).read().rdy()) != 1 {
             spins += 1;
             if spins > 5_000_000 {
                 #[cfg(feature = "defmt")]
@@ -237,14 +242,14 @@ impl<'d, T: Instance> Adc<'d, T> {
         let gcr_b = (131072.0 / (131072.0 - gcc_b)) as f32;
         regs.gcr(0).modify(|w| {
             w.set_gcalr(gain_conv_result(gcr_a) as u16);
-            w.set_rdy(true);
+            w.set_rdy(crate::bits::from_bool(true));
         });
         regs.gcr(1).modify(|w| {
             w.set_gcalr(gain_conv_result(gcr_b) as u16);
-            w.set_rdy(true);
+            w.set_rdy(crate::bits::from_bool(true));
         });
         spins = 0;
-        while regs.stat().read().cal_rdy() != CalRdy::HardwareCalStepCompleted {
+        while crate::bits::raw(regs.stat().read().cal_rdy()) != 1 {
             spins += 1;
             if spins > 5_000_000 {
                 #[cfg(feature = "defmt")]
@@ -264,28 +269,28 @@ impl<'d, T: Instance> Adc<'d, T> {
     pub async fn read_channel(&self, channel: u8) -> u16 {
         let regs = T::info().regs();
 
-        regs.cmdl(0).modify(|w| {
+        regs.cmdl1().modify(|w| {
             w.set_adch(channel.into());
-            w.set_ctype(CmdlCtype::SingleEndedASideChannel);
-            w.set_mode(CmdlMode::Data16Bits);
+            w.set_ctype(crate::bits::flag(0));
+            w.set_mode(crate::bits::flag(1));
         });
-        regs.cmdh(0).modify(|w| {
+        regs.cmdh1().modify(|w| {
             w.set_next(0.into());
             w.set_loop_(0.into());
             w.set_avgs(0.into());
             w.set_sts(0.into());
-            w.set_lwi(false);
-            w.set_wait_trig(false);
+            w.set_lwi(crate::bits::from_bool(false));
+            w.set_wait_trig(crate::bits::from_bool(false));
             w.set_cmpen(0.into());
         });
         regs.tctrl(0).modify(|w| {
-            w.set_tcmd(Tcmd::ExecuteCmd1);
-            w.set_hten(false);
+            w.set_tcmd(crate::bits::flag(1));
+            w.set_hten(crate::bits::from_bool(false));
             w.set_fifo_sel_a(0.into());
             w.set_tpri(0.into());
         });
 
-        regs.ie().modify(|w| w.set_fwmie0(true));
+        regs.ie().modify(|w| w.set_fwmie0(crate::bits::from_bool(true)));
         regs.swtrig().modify(|w| w.set_swt0(1.into()));
 
         wait_for_ready::<T>().await;
@@ -300,7 +305,7 @@ fn wait_for_ready<T: Instance>() -> impl Future<Output = ()> {
         let index = T::INDEX as usize;
 
         waker(index).register(cx.waker());
-        regs.ie().modify(|w| w.set_fwmie0(true));
+        regs.ie().modify(|w| w.set_fwmie0(crate::bits::from_bool(true)));
 
         if regs.stat().read().rdy0().to_bits() != 0 {
             Poll::Ready(())
@@ -332,8 +337,8 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         // stays asserted (FCOUNT above FWMARK) until a RESFIFO0 read drains
         // it below the watermark, not a one-shot pulse - leaving FWMIE0 set
         // would re-fire this interrupt forever until something polls again.
-        if regs.ie().read().fwmie0() && regs.stat().read().rdy0().to_bits() != 0 {
-            regs.ie().modify(|w| w.set_fwmie0(false));
+        if crate::bits::is_set(regs.ie().read().fwmie0()) && regs.stat().read().rdy0().to_bits() != 0 {
+            regs.ie().modify(|w| w.set_fwmie0(crate::bits::from_bool(false)));
             waker(index).wake();
         }
     }
@@ -352,12 +357,12 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 }
 
 pub(crate) struct Info {
-    pub(crate) regs: pac::adc::Adc,
+    pub(crate) regs: pac::adc::AdcAlpha,
 }
 
 impl Info {
     #[inline(always)]
-    fn regs(&self) -> pac::adc::Adc {
+    fn regs(&self) -> pac::adc::AdcAlpha {
         self.regs
     }
 }

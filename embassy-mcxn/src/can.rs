@@ -44,7 +44,6 @@ use crate::clocks::{ClockError, Gate, enable_and_reset_with_clock};
 use crate::interrupt::typelevel;
 use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::pac;
-use crate::pac::can::{Frz, Halt, Lpb, Lpmack, Mdis, Softrst, Srxdis};
 
 /// Transmit message buffer index.
 const TX_MB: usize = 1;
@@ -398,13 +397,13 @@ impl<'d, T: Instance> Can<'d, T> {
 
         // Leave low-power mode before anything else; the reset below asserts
         // this is already done.
-        regs.mcr().modify(|w| w.set_mdis(Mdis::FlexcanEnabled));
-        wait_for(|| regs.mcr().read().lpmack() == Lpmack::LowPowerNo)?;
+        regs.mcr().modify(|w| w.set_mdis(crate::bits::flag(0)));
+        wait_for(|| crate::bits::raw(regs.mcr().read().lpmack()) == 0)?;
 
         // Soft reset. This also puts the module into freeze mode, which is
         // where the rest of the configuration below has to happen.
-        regs.mcr().modify(|w| w.set_softrst(Softrst::SoftrstResetRegisters));
-        wait_for(|| regs.mcr().read().softrst() == Softrst::SoftrstNoResetRequest)?;
+        regs.mcr().modify(|w| w.set_softrst(crate::bits::flag(1)));
+        wait_for(|| crate::bits::raw(regs.mcr().read().softrst()) == 0)?;
         cortex_m::asm::delay(16);
 
         // Clear the whole message-buffer region and every acceptance mask,
@@ -414,26 +413,26 @@ impl<'d, T: Instance> Can<'d, T> {
             unsafe { base.add(MB_BASE_WORD + word).write_volatile(0) };
         }
         for n in 0..32 {
-            regs.rximr(n).write_value(pac::can::Rximr(MASK_ALL));
+            regs.rximr(n).write_value(crate::bits::from_raw(MASK_ALL));
         }
-        regs.rxmgmask().write_value(pac::can::Rxmgmask(MASK_ALL));
-        regs.rx14mask().write_value(pac::can::Rx14mask(MASK_ALL));
-        regs.rx15mask().write_value(pac::can::Rx15mask(MASK_ALL));
-        regs.rxfgmask().write_value(pac::can::Rxfgmask(MASK_ALL));
+        regs.rxmgmask().write_value(crate::bits::from_raw(MASK_ALL));
+        regs.rx14mask().write_value(crate::bits::from_raw(MASK_ALL));
+        regs.rx15mask().write_value(crate::bits::from_raw(MASK_ALL));
+        regs.rxfgmask().write_value(crate::bits::from_raw(MASK_ALL));
 
         enter_freeze(regs)?;
 
         regs.ctrl1().modify(|w| {
             w.set_lpb(if config.loopback {
-                Lpb::LoopbackEnabled
+                crate::bits::flag(1)
             } else {
-                Lpb::LoopbackDisabled
+                crate::bits::flag(0)
             });
             // Three-sample mode is not valid for FD and NXP clears it there.
             w.set_smp(if config.fd.is_some() {
-                pac::can::Smp::OneSample
+                crate::bits::flag(0)
             } else {
-                pac::can::Smp::ThreeSample
+                crate::bits::flag(1)
             });
         });
 
@@ -441,17 +440,17 @@ impl<'d, T: Instance> Can<'d, T> {
             w.set_maxmb(MAX_MB);
             // Self-reception must stay enabled or loopback frames are
             // discarded before they reach a receive buffer.
-            w.set_srxdis(Srxdis::SelfReceptionEnabled);
+            w.set_srxdis(crate::bits::flag(0));
             if config.fd.is_some() {
-                w.set_fden(pac::can::Fden::CanFdEnabled);
+                w.set_fden(crate::bits::flag(1));
             }
         });
 
         // Nominal timing. `Ctrl2.bte` is what makes `Eprs`/`Encbt`
         // authoritative over the inert `Ctrl1` fields.
-        regs.ctrl2().modify(|w| w.set_bte(true));
+        regs.ctrl2().modify(|w| w.set_bte(crate::bits::from_bool(true)));
         regs.eprs().modify(|w| w.set_enpresdiv(nominal.prescaler));
-        regs.encbt().write_value(pac::can::Encbt(
+        regs.encbt().write_value(crate::bits::from_raw(
             ((nominal.rjw as u32) << 22) | ((nominal.tseg2 as u32) << 12) | (nominal.tseg1 as u32),
         ));
 
@@ -465,31 +464,32 @@ impl<'d, T: Instance> Can<'d, T> {
                 }
                 let data = BitTiming::solve_data(fd.data_bitrate, clock_hz).ok_or(Error::UnsupportedBitrate)?;
                 regs.eprs().modify(|w| w.set_edpresdiv(data.prescaler));
-                regs.edcbt().write_value(pac::can::Edcbt(
+                regs.edcbt().write_value(crate::bits::from_raw(
                     ((data.rjw as u32) << 22) | ((data.tseg2 as u32) << 12) | (data.tseg1 as u32),
                 ));
             }
             regs.fdctrl().modify(|w| {
                 w.set_fdrate(if fd.brs {
-                    pac::can::Fdrate::BitRateSwitching
+                    crate::bits::flag(1)
                 } else {
-                    pac::can::Fdrate::Nominal
+                    crate::bits::flag(0)
                 });
                 w.set_mbdsr0(match fd.payload {
-                    PayloadSize::Bytes8 => pac::can::Mbdsr0::R08Bytes,
-                    PayloadSize::Bytes16 => pac::can::Mbdsr0::R016Bytes,
-                    PayloadSize::Bytes32 => pac::can::Mbdsr0::R032Bytes,
-                    PayloadSize::Bytes64 => pac::can::Mbdsr0::R064Bytes,
+                    PayloadSize::Bytes8 => crate::bits::flag(0),
+                    PayloadSize::Bytes16 => crate::bits::flag(1),
+                    PayloadSize::Bytes32 => crate::bits::flag(2),
+                    PayloadSize::Bytes64 => crate::bits::flag(3),
                 });
             });
-            regs.ctrl2().modify(|w| w.set_isocanfden(pac::can::Isocanfden::Iso));
+            regs.ctrl2().modify(|w| w.set_isocanfden(crate::bits::flag(1)));
         }
 
         // Arm the receive buffer: identifier first, activating code last.
         let rx = payload.mb_word_offset(RX_MB);
         unsafe {
             base.add(MB_BASE_WORD + rx).write_volatile(0);
-            base.add(MB_BASE_WORD + rx + 1).write_volatile(config.rx_id.to_register());
+            base.add(MB_BASE_WORD + rx + 1)
+                .write_volatile(config.rx_id.to_register());
             let mut cs = (CODE_RX_EMPTY as u32) << 24;
             if config.rx_id.is_extended() {
                 cs |= CS_IDE;
@@ -499,7 +499,10 @@ impl<'d, T: Instance> Can<'d, T> {
 
         // And the transmit buffer, left inactive until `send`.
         let tx = payload.mb_word_offset(TX_MB);
-        unsafe { base.add(MB_BASE_WORD + tx).write_volatile((CODE_TX_INACTIVE as u32) << 24) };
+        unsafe {
+            base.add(MB_BASE_WORD + tx)
+                .write_volatile((CODE_TX_INACTIVE as u32) << 24)
+        };
 
         exit_freeze(regs)?;
 
@@ -559,7 +562,7 @@ impl<'d, T: Instance> Can<'d, T> {
         }
 
         wait_for_mb::<T>(TX_MB).await;
-        regs.iflag1().write_value(pac::can::Iflag1(1 << TX_MB));
+        regs.iflag1().write_value(crate::bits::from_raw(1 << TX_MB));
         Ok(())
     }
 
@@ -590,7 +593,7 @@ impl<'d, T: Instance> Can<'d, T> {
         };
         // Releases the buffer lock; nothing above may be re-read after this.
         let _ = regs.timer().read();
-        regs.iflag1().write_value(pac::can::Iflag1(1 << RX_MB));
+        regs.iflag1().write_value(crate::bits::from_raw(1 << RX_MB));
 
         let code = (cs >> 24) & 0xF;
         if code == CODE_RX_OVERRUN as u32 {
@@ -648,17 +651,17 @@ fn wait_for(mut ready: impl FnMut() -> bool) -> Result<(), Error> {
 
 /// Enter freeze mode - required before touching timing, `Mcr.maxmb` or the
 /// FD controls.
-fn enter_freeze(regs: pac::can::Can) -> Result<(), Error> {
-    regs.mcr().modify(|w| w.set_frz(Frz::FreezeModeEnabled));
-    regs.mcr().modify(|w| w.set_halt(Halt::HaltEnable));
-    wait_for(|| regs.mcr().read().frzack() == pac::can::Frzack::FreezeModeYes)
+fn enter_freeze(regs: pac::can::CanAlpha) -> Result<(), Error> {
+    regs.mcr().modify(|w| w.set_frz(crate::bits::flag(1)));
+    regs.mcr().modify(|w| w.set_halt(crate::bits::flag(1)));
+    wait_for(|| crate::bits::raw(regs.mcr().read().frzack()) == 1)
 }
 
 /// Leave freeze mode, in the reverse order.
-fn exit_freeze(regs: pac::can::Can) -> Result<(), Error> {
-    regs.mcr().modify(|w| w.set_halt(Halt::HaltDisable));
-    regs.mcr().modify(|w| w.set_frz(Frz::FreezeModeDisabled));
-    wait_for(|| regs.mcr().read().frzack() == pac::can::Frzack::FreezeModeNo)
+fn exit_freeze(regs: pac::can::CanAlpha) -> Result<(), Error> {
+    regs.mcr().modify(|w| w.set_halt(crate::bits::flag(0)));
+    regs.mcr().modify(|w| w.set_frz(crate::bits::flag(0)));
+    wait_for(|| crate::bits::raw(regs.mcr().read().frzack()) == 0)
 }
 
 /// Wait for a message buffer's interrupt flag.
@@ -720,12 +723,12 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 }
 
 pub(crate) struct Info {
-    pub(crate) regs: pac::can::Can,
+    pub(crate) regs: pac::can::CanAlpha,
 }
 
 impl Info {
     #[inline(always)]
-    fn regs(&self) -> pac::can::Can {
+    fn regs(&self) -> pac::can::CanAlpha {
         self.regs
     }
 }

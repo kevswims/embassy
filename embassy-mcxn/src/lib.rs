@@ -13,42 +13,47 @@ mod mcxn947_exclusive {
     pub use crate::chips::mcxn947::init;
 }
 
-#[cfg(mcxn_adc)]
+#[cfg(feature = "unstable-pac")]
+pub mod bits;
+#[cfg(not(feature = "unstable-pac"))]
+pub(crate) mod bits;
+
+#[cfg(mcx_n_adc)]
 pub mod adc;
-#[cfg(mcxn_can)]
+#[cfg(mcx_n_can)]
 pub mod can;
 pub mod clocks;
 pub mod config;
-#[cfg(mcxn_crc)]
+#[cfg(mcx_n_crc)]
 pub mod crc;
-pub(crate) mod delay;
-#[cfg(mcx_ctimer)]
+#[cfg(mcx_n_ctimer)]
 pub mod ctimer;
+pub(crate) mod delay;
 // Gated so a PAC regression that drops the eDMA blocks surfaces as one missing
 // module rather than errors inside every generated channel impl.
-#[cfg(mcxn_dma)]
+#[cfg(mcx_n_dma)]
 pub mod dma;
-#[cfg(mcxn_enet)]
+#[cfg(mcx_n_enet)]
 pub mod enet;
-#[cfg(mcxn_flexspi)]
+#[cfg(mcx_n_flexspi)]
 pub mod flexspi;
 pub mod gpio;
-#[cfg(mcxn_lptmr)]
+#[cfg(mcx_n_lptmr)]
 pub mod lptmr;
-#[cfg(mcxn_lpuart)]
+#[cfg(mcx_n_lpuart)]
 pub mod lpuart;
-#[cfg(mcxn_ostimer)]
+#[cfg(mcx_n_ostimer)]
 pub mod ostimer;
 pub mod power;
-#[cfg(mcxn_cmc)]
+#[cfg(mcx_n_cmc)]
 pub mod reset_reason;
-#[cfg(mcx_rtc5xx)]
+#[cfg(mcx_n_rtc)]
 pub mod rtc;
-#[cfg(mcxn_usbhs1__usbc)]
+#[cfg(mcx_n_usbhs)]
 pub mod usb;
-#[cfg(mcxn_vref)]
+#[cfg(mcx_n_vref)]
 pub mod vref;
-#[cfg(mcx_wwdt)]
+#[cfg(mcx_n_wwdt)]
 pub mod wwdt;
 
 #[cfg(feature = "mcxn947")]

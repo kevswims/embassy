@@ -12,7 +12,6 @@ use core::marker::PhantomData;
 use super::Instance;
 use super::ptp::PtpTimestamp;
 use crate::pac;
-use crate::pac::enet as vals;
 
 /// The PTP reference clock, in Hz.
 ///
@@ -164,7 +163,7 @@ impl<T: Instance> PtpClock<T> {
         // whose variants are unnamed, so the raw value is written.
         pac::SYSCON0
             .enetptprefclksel()
-            .modify(|w| w.set_sel(vals_syscon::EnetptprefclkselSel::from_bits(4)));
+            .modify(|w| w.set_sel(crate::bits::flag(4)));
 
         // ENETPTPREFCLKDIV resets *halted*, like the other SYSCON dividers, so
         // it has to be explicitly run or the timestamp unit gets no clock at
@@ -174,14 +173,14 @@ impl<T: Instance> PtpClock<T> {
         let div = pac::SYSCON0.enetptprefclkdiv();
         div.modify(|w| {
             w.set_div(0);
-            w.set_halt(vals_syscon::EnetptprefclkdivHalt::Halt);
-            w.set_reset(vals_syscon::EnetptprefclkdivReset::Asserted);
+            w.set_halt(crate::bits::flag(1));
+            w.set_reset(crate::bits::flag(1));
         });
         div.modify(|w| {
-            w.set_halt(vals_syscon::EnetptprefclkdivHalt::Run);
-            w.set_reset(vals_syscon::EnetptprefclkdivReset::Released);
+            w.set_halt(crate::bits::flag(0));
+            w.set_reset(crate::bits::flag(0));
         });
-        wait_while(|| div.read().unstab() == vals_syscon::EnetptprefclkdivUnstab::Ongoing);
+        wait_while(|| crate::bits::raw(div.read().unstab()) == 1);
 
         let rate = ClockRate::from_ref_clk(PTP_REF_CLOCK_HZ, config.subsecond_increment);
         let clock = Self {
@@ -244,24 +243,26 @@ impl<T: Instance> PtpClock<T> {
         // TSADDREG is a self-clearing "load the addend" trigger. It only
         // completes once the timestamp unit is enabled in fine-update mode, so
         // the spin is bounded rather than trusting that unconditionally.
-        wait_while::<_>(|| regs.mac_timestamp_control().read().tsaddreg());
-        regs.mac_timestamp_control().modify(|w| w.set_tsaddreg(true));
-        wait_while::<_>(|| regs.mac_timestamp_control().read().tsaddreg());
+        wait_while::<_>(|| crate::bits::is_set(regs.mac_timestamp_control().read().tsaddreg()));
+        regs.mac_timestamp_control()
+            .modify(|w| w.set_tsaddreg(crate::bits::from_bool(true)));
+        wait_while::<_>(|| crate::bits::is_set(regs.mac_timestamp_control().read().tsaddreg()));
     }
 
     fn configure(&self) {
         let regs = T::info().regs();
 
-        regs.mac_interrupt_enable().modify(|w| w.set_tsie(false));
+        regs.mac_interrupt_enable()
+            .modify(|w| w.set_tsie(crate::bits::from_bool(false)));
 
         // Order follows the Synopsys initialisation sequence: enable the
         // timestamp unit and select fine update *first*, because TSADDREG only
         // self-clears once both are in effect - programming the addend before
         // this leaves the handshake spinning forever.
         regs.mac_timestamp_control().write(|w| {
-            w.set_tsena(true);
-            w.set_tscfupdt(vals::Tscfupdt::Fine);
-            w.set_tsctrlssr(vals::Tsctrlssr::DigEnable);
+            w.set_tsena(crate::bits::from_bool(true));
+            w.set_tscfupdt(crate::bits::flag(1));
+            w.set_tsctrlssr(crate::bits::flag(1));
         });
 
         // The PAC calls this field `snsinc`, but it sits at bits [23:16], which
@@ -277,23 +278,22 @@ impl<T: Instance> PtpClock<T> {
 
         // Now the packet-classification bits, keeping the mode bits set above.
         regs.mac_timestamp_control().modify(|w| {
-            w.set_tsver2ena(true);
-            w.set_tsipv4ena(true);
-            w.set_tsipv6ena(true);
+            w.set_tsver2ena(crate::bits::from_bool(true));
+            w.set_tsipv4ena(crate::bits::from_bool(true));
+            w.set_tsipv6ena(crate::bits::from_bool(true));
             // Timestamp event messages (Sync/Delay_Req/...) only, not every
             // frame - hardware has only a handful of timestamp slots.
-            w.set_tsevntena(true);
+            w.set_tsevntena(crate::bits::from_bool(true));
             w.set_snaptypsel(0b01);
             // Report the transmit timestamp in the descriptor rather than in
             // the MAC status registers. The whole TDES3.TTSS path depends on
             // this bit.
-            w.set_txtsstsm(true);
+            w.set_txtsstsm(crate::bits::from_bool(true));
         });
     }
 }
 
 /// The SYSCON selector enums live at the module root, like the ENET ones.
-use crate::pac::syscon as vals_syscon;
 
 fn read_timestamp<T: Instance>() -> PtpTimestamp {
     let regs = T::info().regs();
@@ -311,8 +311,8 @@ fn apply_time_update<T: Instance>(timestamp: PtpTimestamp, subtract: bool, updat
     write_time_update::<T>(timestamp, subtract);
     wait_timestamp_init_or_update_clear::<T>();
     T::info().regs().mac_timestamp_control().modify(|w| match update {
-        TimeUpdate::Init => w.set_tsinit(true),
-        TimeUpdate::Offset => w.set_tsupdt(true),
+        TimeUpdate::Init => w.set_tsinit(crate::bits::from_bool(true)),
+        TimeUpdate::Offset => w.set_tsupdt(crate::bits::from_bool(true)),
     });
     wait_timestamp_init_or_update_clear::<T>();
 }
@@ -331,7 +331,11 @@ fn write_time_update<T: Instance>(timestamp: PtpTimestamp, subtract: bool) {
             timestamp.nanos
         };
         w.set_tsss(nanos);
-        w.set_addsub(if subtract { vals::Addsub::Sub } else { vals::Addsub::Add });
+        w.set_addsub(if subtract {
+            crate::bits::flag(1)
+        } else {
+            crate::bits::flag(0)
+        });
     });
 }
 
@@ -339,7 +343,7 @@ fn wait_timestamp_init_or_update_clear<T: Instance>() {
     let regs = T::info().regs();
     wait_while::<_>(|| {
         let control = regs.mac_timestamp_control().read();
-        control.tsinit() || control.tsupdt()
+        crate::bits::is_set(control.tsinit()) || crate::bits::is_set(control.tsupdt())
     });
 }
 

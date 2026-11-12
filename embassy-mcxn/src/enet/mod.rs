@@ -62,7 +62,6 @@ use crate::interrupt::typelevel::{self, Handler, Interrupt as _};
 use crate::pac;
 // This PAC block keeps its field enums at the module root rather than in a
 // `vals` submodule; alias it so the register writes read the usual way.
-use crate::pac::enet as vals;
 
 /// Largest Ethernet frame the driver hands to, or accepts from, the stack.
 const MTU: usize = 1514;
@@ -239,9 +238,9 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         // they must be cleared here or the line re-asserts immediately. The
         // rings themselves are inspected from the poll side.
         regs.dma_ch0_status().write(|w| {
-            w.set_ti(true);
-            w.set_ri(true);
-            w.set_nis(true);
+            w.set_ti(crate::bits::from_bool(true));
+            w.set_ri(crate::bits::from_bool(true));
+            w.set_nis(crate::bits::from_bool(true));
         });
 
         WAKER.wake();
@@ -268,15 +267,13 @@ const RMII_REF_CLOCK_HZ: u32 = 50_000_000;
 
 /// Point `ENETRMIICLKSEL`/`ENETRMIICLKDIV` at the requested reference.
 fn configure_rmii_ref_clock(source: RmiiRefClock) -> Result<(), Error> {
-    use pac::syscon::{EnetrmiiclkdivHalt, EnetrmiiclkdivReset, EnetrmiiclkdivUnstab, EnetrmiiclkselSel};
-
     let sel = pac::SYSCON0.enetrmiiclksel();
 
     let divisor = match source {
         RmiiRefClock::External => {
             // "No clock" is what tells the RMII block to take its reference
             // from the pad rather than from a SYSCON source.
-            sel.modify(|w| w.set_sel(EnetrmiiclkselSel::Enum0));
+            sel.modify(|w| w.set_sel(crate::bits::flag(0)));
             return Ok(());
         }
         RmiiRefClock::Pll0 => {
@@ -284,7 +281,7 @@ fn configure_rmii_ref_clock(source: RmiiRefClock) -> Result<(), Error> {
             if pll0 % RMII_REF_CLOCK_HZ != 0 {
                 return Err(Error::RmiiRefClockNotDivisible(pll0));
             }
-            sel.modify(|w| w.set_sel(EnetrmiiclkselSel::Enum1));
+            sel.modify(|w| w.set_sel(crate::bits::flag(1)));
             pll0 / RMII_REF_CLOCK_HZ
         }
     };
@@ -295,14 +292,14 @@ fn configure_rmii_ref_clock(source: RmiiRefClock) -> Result<(), Error> {
     let div = pac::SYSCON0.enetrmiiclkdiv();
     div.modify(|w| {
         w.set_div((divisor - 1) as u8);
-        w.set_halt(EnetrmiiclkdivHalt::Halt);
-        w.set_reset(EnetrmiiclkdivReset::Asserted);
+        w.set_halt(crate::bits::flag(1));
+        w.set_reset(crate::bits::flag(1));
     });
     div.modify(|w| {
-        w.set_halt(EnetrmiiclkdivHalt::Run);
-        w.set_reset(EnetrmiiclkdivReset::Released);
+        w.set_halt(crate::bits::flag(0));
+        w.set_reset(crate::bits::flag(0));
     });
-    while div.read().unstab() == EnetrmiiclkdivUnstab::Ongoing {}
+    while crate::bits::raw(div.read().unstab()) == 1 {}
 
     Ok(())
 }
@@ -450,7 +447,7 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         // The synthesised core may omit the timestamp unit entirely; fail
         // loudly rather than silently producing zero timestamps.
         assert!(
-            T::info().regs().mac_hw_feature0().read().tssel(),
+            crate::bits::is_set(T::info().regs().mac_hw_feature0().read().tssel()),
             "this ENET instance has no IEEE 1588 timestamp unit"
         );
 
@@ -490,7 +487,8 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
 
         // Reading is what clears a previously latched event.
         let _ = regs.mac_pmt_control_status().read();
-        regs.mac_pmt_control_status().modify(|w| w.set_mgkpkten(true));
+        regs.mac_pmt_control_status()
+            .modify(|w| w.set_mgkpkten(crate::bits::from_bool(true)));
     }
 
     /// Stop detecting magic packets.
@@ -498,14 +496,14 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         T::info()
             .regs()
             .mac_pmt_control_status()
-            .modify(|w| w.set_mgkpkten(false));
+            .modify(|w| w.set_mgkpkten(crate::bits::from_bool(false)));
     }
 
     /// Check for a magic packet, consuming the event.
     ///
     /// `MGKPRCVD` is read-clear, so a `true` result is consumed by this call.
     pub fn magic_packet_received(&mut self) -> bool {
-        T::info().regs().mac_pmt_control_status().read().mgkprcvd()
+        crate::bits::is_set(T::info().regs().mac_pmt_control_status().read().mgkprcvd())
     }
 
     /// Wait for a magic packet, polling every `interval`.
@@ -539,48 +537,49 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         // The PHY interface must be selected before the MAC leaves reset.
         pac::SYSCON0
             .enet_phy_intf_sel()
-            .modify(|w| w.set_phy_sel(pac::syscon::PhySel::Rmii));
+            .modify(|w| w.set_phy_sel(crate::bits::flag(1)));
 
         unsafe { crate::clocks::enable_and_reset::<T>() };
 
         let regs = T::info().regs();
 
         // Software reset clears every DMA/MTL/MAC register bank.
-        regs.dma_mode().modify(|w| w.set_swr(true));
-        while regs.dma_mode().read().swr() {}
+        regs.dma_mode().modify(|w| w.set_swr(crate::bits::from_bool(true)));
+        while crate::bits::is_set(regs.dma_mode().read().swr()) {}
 
         regs.mac_configuration().modify(|w| {
-            w.set_ipg(vals::Ipg::Ipg96);
+            w.set_ipg(crate::bits::flag(0));
             // ACS strips pad+FCS from *length* frames (length field <= 1500);
             // CST strips the FCS from *type* frames. IP traffic is all type
             // frames, so without CST every received packet arrives with four
             // trailing CRC bytes.
-            w.set_acs(true);
-            w.set_cst(true);
+            w.set_acs(crate::bits::from_bool(true));
+            w.set_cst(crate::bits::from_bool(true));
             // PS selects the 10/100 port; FES then picks 100 over 10. FES is
             // meaningless without PS, so the two must be set together.
-            w.set_ps(vals::Ps::M10100m);
-            w.set_fes(vals::Fes::M1002500m);
-            w.set_dm(vals::Dm::Fduplx);
+            w.set_ps(crate::bits::flag(1));
+            w.set_fes(crate::bits::flag(1));
+            w.set_dm(crate::bits::flag(1));
             // RX checksum offload. Requires RX store-and-forward, set below.
             // TX insertion is requested per frame through TDES3.CIC.
-            w.set_ipc(true);
+            w.set_ipc(crate::bits::from_bool(true));
         });
 
         // Enable RX queue 0 for generic (non-AV) traffic. This MAC is
         // multi-queue, so unlike single-queue DWMAC variants the queues come
         // out of reset disabled.
-        regs.mac_rxq_ctrl0().modify(|w| w.set_rxq0en(vals::Rxq0en::EnDcbGen));
+        regs.mac_rxq_ctrl0().modify(|w| w.set_rxq0en(crate::bits::flag(2)));
 
-        regs.mac_packet_filter().modify(|w| w.set_pm(config.promiscuous));
+        regs.mac_packet_filter()
+            .modify(|w| w.set_pm(crate::bits::from_bool(config.promiscuous)));
 
         regs.mtl_rxq0_operation_mode().modify(|w| {
-            w.set_rsf(true); // store and forward
+            w.set_rsf(crate::bits::from_bool(true)); // store and forward
             w.set_rqs(7); // 2 KB receive queue
         });
         regs.mtl_txq0_operation_mode().modify(|w| {
-            w.set_tsf(true); // store and forward
-            w.set_txqen(vals::MtlTxq0OperationModeTxqen::Enable);
+            w.set_tsf(crate::bits::from_bool(true)); // store and forward
+            w.set_txqen(crate::bits::flag(2));
             w.set_tqs(7); // 2 KB transmit queue
         });
 
@@ -589,8 +588,8 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         regs.mtl_rxq_dma_map0().modify(|w| w.set_q0mdmach(false));
 
         regs.dma_sysbus_mode().modify(|w| {
-            w.set_fb(true); // fixed burst length
-            w.set_aal(true); // address-aligned beats
+            w.set_fb(crate::bits::from_bool(true)); // fixed burst length
+            w.set_aal(crate::bits::from_bool(true)); // address-aligned beats
         });
 
         regs.dma_ch0_tx_control().modify(|w| w.set_tx_pbl(32));
@@ -651,20 +650,19 @@ impl<'d, T: Instance, P: Phy> Enet<'d, T, P> {
         regs.dma_ch0_status().write(|w| w.0 = !0);
 
         regs.mac_configuration().modify(|w| {
-            w.set_re(true);
-            w.set_te(true);
+            w.set_re(crate::bits::from_bool(true));
+            w.set_te(crate::bits::from_bool(true));
         });
-        regs.mtl_txq0_operation_mode().modify(|w| w.set_ftq(true));
+        regs.mtl_txq0_operation_mode()
+            .modify(|w| w.set_ftq(crate::bits::from_bool(true)));
 
-        regs.dma_ch0_tx_control()
-            .modify(|w| w.set_st(vals::DmaCh0TxControlSt::Start));
-        regs.dma_ch0_rx_control()
-            .modify(|w| w.set_sr(vals::DmaCh0RxControlSr::Start));
+        regs.dma_ch0_tx_control().modify(|w| w.set_st(crate::bits::flag(1)));
+        regs.dma_ch0_rx_control().modify(|w| w.set_sr(crate::bits::flag(1)));
 
         regs.dma_ch0_interrupt_enable().modify(|w| {
-            w.set_nie(true);
-            w.set_rie(true);
-            w.set_tie(true);
+            w.set_nie(crate::bits::from_bool(true));
+            w.set_rie(crate::bits::from_bool(true));
+            w.set_tie(crate::bits::from_bool(true));
         });
 
         this.phy.phy_reset();
@@ -682,24 +680,22 @@ impl<'d, T: Instance, P: Phy> Drop for Enet<'d, T, P> {
         let regs = T::info().regs();
 
         // Let anything already queued drain before tearing the MAC down.
-        regs.dma_ch0_tx_control()
-            .modify(|w| w.set_st(vals::DmaCh0TxControlSt::Stop));
+        regs.dma_ch0_tx_control().modify(|w| w.set_st(crate::bits::flag(0)));
         while {
             let d = regs.mtl_txq0_debug().read();
-            d.trcsts() == vals::MtlTxq0DebugTrcsts::Read || d.txqsts()
+            crate::bits::raw(d.trcsts()) == 1 || crate::bits::is_set(d.txqsts())
         } {}
 
         regs.mac_configuration().modify(|w| {
-            w.set_re(false);
-            w.set_te(false);
+            w.set_re(crate::bits::from_bool(false));
+            w.set_te(crate::bits::from_bool(false));
         });
 
         while {
             let d = regs.mtl_rxq0_debug().read();
-            d.rxqsts() != vals::MtlRxq0DebugRxqsts::Empty || d.prxq() != 0
+            crate::bits::raw(d.rxqsts()) != 0 || d.prxq() != 0
         } {}
-        regs.dma_ch0_rx_control()
-            .modify(|w| w.set_sr(vals::DmaCh0RxControlSr::Stop));
+        regs.dma_ch0_rx_control().modify(|w| w.set_sr(crate::bits::flag(0)));
     }
 }
 
@@ -776,12 +772,12 @@ impl<'d, T: Instance, P: Phy> Driver for Enet<'d, T, P> {
 }
 
 pub(crate) struct Info {
-    pub(crate) regs: pac::enet::Enet,
+    pub(crate) regs: pac::enet::EnetAlpha,
 }
 
 impl Info {
     #[inline(always)]
-    fn regs(&self) -> pac::enet::Enet {
+    fn regs(&self) -> pac::enet::EnetAlpha {
         self.regs
     }
 }
@@ -887,7 +883,7 @@ macro_rules! impl_enet_pin {
                     self.set_pull(crate::gpio::Pull::Disabled);
                     self.set_slew_rate(crate::gpio::SlewRate::Fast);
                     self.set_drive_strength(crate::gpio::DriveStrength::Normal);
-                    self.set_function(crate::pac::port::Mux::$mux);
+                    self.set_function(crate::gpio::Mux::$mux);
                     // Every ENET pad runs with the input buffer enabled,
                     // outputs included - this matches NXP's own pin_mux for the
                     // FRDM-MCXN947, and MDIO is bidirectional besides.

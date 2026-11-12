@@ -33,7 +33,6 @@
 
 use super::types::ClockError;
 use crate::pac;
-use crate::pac::scg::{CsrScs, FirccfgRange, FirccsrLk, Fircvld, RccrScs};
 use crate::power::{self, ActiveModeConfig, ClockNode, CoreVoltage, DriveStrength};
 
 use super::config::MainClock;
@@ -60,7 +59,7 @@ pub(super) fn switch(target: MainClock) -> Result<Outcome, ClockError> {
     // A source this crate cannot describe means a bootloader moved `main_clk`
     // somewhere unexpected. Switching out from under that is more likely to
     // break the caller's assumptions than to help.
-    if current_scs != CsrScs::Firc && current_scs != CsrScs::Sirc {
+    if crate::bits::raw(current_scs) != 3 && crate::bits::raw(current_scs) != 2 {
         return Err(ClockError::UnsupportedMainClockSource);
     }
 
@@ -70,15 +69,13 @@ pub(super) fn switch(target: MainClock) -> Result<Outcome, ClockError> {
         // The default costs no register writes at all when the part is already
         // where it resets to, which keeps `MainClock::FroHf48m` byte-identical
         // to the previous verify-only behaviour.
-        MainClock::FroHf48m if current_scs == CsrScs::Firc && range == FirccfgRange::Firc48mhz => {
-            Ok(Outcome {
-                main_clk_hz: super::source::FIRC_SCLK_HZ,
-                core_voltage: observed_core_voltage()?,
-                pll0_hz: None,
-            })
-        }
-        MainClock::FroHf48m => configure(FirccfgRange::Firc48mhz, super::source::FIRC_SCLK_HZ),
-        MainClock::FroHf144m => configure(FirccfgRange::Firc144mhz, super::source::FIRC_FCLK_HZ),
+        MainClock::FroHf48m if crate::bits::raw(current_scs) == 3 && crate::bits::raw(range) == 0 => Ok(Outcome {
+            main_clk_hz: super::source::FIRC_SCLK_HZ,
+            core_voltage: observed_core_voltage()?,
+            pll0_hz: None,
+        }),
+        MainClock::FroHf48m => configure(0, super::source::FIRC_SCLK_HZ),
+        MainClock::FroHf144m => configure(1, super::source::FIRC_FCLK_HZ),
         MainClock::Pll0At150m => configure_pll0(),
     }
 }
@@ -90,15 +87,16 @@ fn observed_core_voltage() -> Result<CoreVoltage, ClockError> {
         .ok_or(ClockError::UnknownCoreVoltage)
 }
 
-fn configure(range: FirccfgRange, target_hz: u32) -> Result<Outcome, ClockError> {
+fn configure(range: u8, target_hz: u32) -> Result<Outcome, ClockError> {
     // What this frequency needs. Computed from `main_clk`, not `system_clk`:
     // `AHBCLKDIV` only divides, so sizing the wait states for the undivided
     // rate is always conservative however the divider is later set.
     let voltage = required_voltage(target_hz, &[ClockNode::SystemClk, ClockNode::FroHf])?;
-    let rwsc = power::flash_wait_states(voltage, target_hz).ok_or(ClockError::MainClockUnsupportedFrequency(target_hz))?;
+    let rwsc =
+        power::flash_wait_states(voltage, target_hz).ok_or(ClockError::MainClockUnsupportedFrequency(target_hz))?;
 
     // 1. Park. Everything after this runs at 12 MHz.
-    attach(RccrScs::Sirc, CsrScs::Sirc)?;
+    attach(2, 2)?;
 
     // 2. Rail, then SRAM timing, then flash wait states - each one ahead of the
     //    frequency that will need it.
@@ -120,7 +118,7 @@ fn configure(range: FirccfgRange, target_hz: u32) -> Result<Outcome, ClockError>
     configure_firc(range)?;
 
     // 4. Attach.
-    attach(RccrScs::Firc, CsrScs::Firc)?;
+    attach(3, 3)?;
 
     Ok(Outcome {
         main_clk_hz: target_hz,
@@ -144,7 +142,7 @@ fn configure_pll0() -> Result<Outcome, ClockError> {
     let rwsc =
         power::flash_wait_states(voltage, target_hz).ok_or(ClockError::MainClockUnsupportedFrequency(target_hz))?;
 
-    attach(RccrScs::Sirc, CsrScs::Sirc)?;
+    attach(2, 2)?;
 
     power::set_active_mode(&ActiveModeConfig {
         core_voltage: voltage,
@@ -159,11 +157,11 @@ fn configure_pll0() -> Result<Outcome, ClockError> {
     // The reference. `configure_firc` also sets `FIRC_SCLK_PERIPH_EN`, which
     // `ApllctrlSource::Firc` requires, and it is safe to (re)write the range
     // here because the core is parked on SIRC.
-    configure_firc(FirccfgRange::Firc48mhz)?;
+    configure_firc(0)?;
 
     let pll0_hz = super::pll::configure_pll0_150m()?;
 
-    attach(RccrScs::Apll, CsrScs::Apll)?;
+    attach(5, 5)?;
 
     Ok(Outcome {
         main_clk_hz: pll0_hz,
@@ -194,28 +192,28 @@ fn required_voltage(hz: u32, nodes: &[ClockNode]) -> Result<CoreVoltage, ClockEr
 ///
 /// Mirrors `CLOCK_SetupFROHFClocking`. `FIRCCFG` is written whole, as the SDK
 /// does - it carries only `RANGE`.
-fn configure_firc(range: FirccfgRange) -> Result<(), ClockError> {
+fn configure_firc(range: u8) -> Result<(), ClockError> {
     let csr = pac::SCG0.firccsr();
 
     // `LK` freezes FIRCCSR. Nothing here sets it, but a bootloader can have,
     // and the enables below would then be dropped silently.
-    if csr.read().lk() == FirccsrLk::WriteDisabled {
-        csr.modify(|w| w.set_lk(FirccsrLk::WriteEnabled));
-        if csr.read().lk() == FirccsrLk::WriteDisabled {
+    if crate::bits::raw(csr.read().lk()) == 1 {
+        csr.modify(|w| w.set_lk(crate::bits::flag(0)));
+        if crate::bits::raw(csr.read().lk()) == 1 {
             return Err(ClockError::FircLocked);
         }
     }
 
-    pac::SCG0.firccfg().write(|w| w.set_range(range));
+    pac::SCG0.firccfg().write(|w| w.set_range(crate::bits::flag(range)));
 
     csr.modify(|w| {
-        w.set_firc_sclk_periph_en(true);
-        w.set_firc_fclk_periph_en(true);
-        w.set_fircen(true);
+        w.set_firc_sclk_periph_en(crate::bits::from_bool(true));
+        w.set_firc_fclk_periph_en(crate::bits::from_bool(true));
+        w.set_fircen(crate::bits::from_bool(true));
     });
 
     let mut spins = 0u32;
-    while csr.read().fircvld() != Fircvld::EnabledAndValid {
+    while crate::bits::raw(csr.read().fircvld()) != 1 {
         spins += 1;
         if spins > SPIN_CAP {
             return Err(ClockError::FircNotValid);
@@ -229,11 +227,11 @@ fn configure_firc(range: FirccfgRange) -> Result<(), ClockError> {
 ///
 /// `RCCR[SCS]` is the request; `CSR[SCS]` is read-only and reports the source in
 /// use, so polling it is what makes the handover observed rather than assumed.
-fn attach(request: RccrScs, expect: CsrScs) -> Result<(), ClockError> {
-    pac::SCG0.rccr().modify(|w| w.set_scs(request));
+fn attach(request: u8, expect: u8) -> Result<(), ClockError> {
+    pac::SCG0.rccr().modify(|w| w.set_scs(crate::bits::flag(request)));
 
     let mut spins = 0u32;
-    while pac::SCG0.csr().read().scs() != expect {
+    while crate::bits::raw(pac::SCG0.csr().read().scs()) != expect {
         spins += 1;
         if spins > SPIN_CAP {
             return Err(ClockError::MainClockNotStable);
@@ -245,11 +243,3 @@ fn attach(request: RccrScs, expect: CsrScs) -> Result<(), ClockError> {
 
     Ok(())
 }
-
-/// `RccrScs` and `CsrScs` are distinct PAC types with no guaranteed relation;
-/// [`attach`] pairs them by hand, so pin the encodings it relies on.
-const _: () = {
-    assert!(RccrScs::Sirc.to_bits() == CsrScs::Sirc.to_bits());
-    assert!(RccrScs::Firc.to_bits() == CsrScs::Firc.to_bits());
-    assert!(RccrScs::Apll.to_bits() == CsrScs::Apll.to_bits());
-};

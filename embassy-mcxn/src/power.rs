@@ -33,9 +33,6 @@
 //! here touches it.
 
 use crate::pac;
-use crate::pac::spc::{
-    Ack, ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, ActiveCfgDcdcVddDs, ActiveCfgDcdcVddLvl, Busy, Req, Vsm,
-};
 
 /// Bounded spin, matching the convention in `clocks::source` and `adc`. These
 /// run once at start-up, before the executor exists.
@@ -298,50 +295,50 @@ pub fn active_mode_status() -> ActiveModeStatus {
     let sramctl = pac::SPC0.sramctl().read();
 
     ActiveModeStatus {
-        core_ldo_enabled: cntrl.coreldo_en(),
-        dcdc_enabled: cntrl.dcdc_en(),
-        sys_ldo_enabled: cntrl.sysldo_en(),
-        core_ldo_voltage: match cfg.coreldo_vdd_lvl() {
-            ActiveCfgCoreldoVddLvl::Mid => Some(CoreVoltage::Mid),
-            ActiveCfgCoreldoVddLvl::Normal => Some(CoreVoltage::Normal),
-            ActiveCfgCoreldoVddLvl::Over => Some(CoreVoltage::Over),
+        core_ldo_enabled: crate::bits::is_set(cntrl.coreldo_en()),
+        dcdc_enabled: crate::bits::is_set(cntrl.dcdc_en()),
+        sys_ldo_enabled: crate::bits::is_set(cntrl.sysldo_en()),
+        core_ldo_voltage: match crate::bits::raw(cfg.coreldo_vdd_lvl()) {
+            1 => Some(CoreVoltage::Mid),
+            2 => Some(CoreVoltage::Normal),
+            3 => Some(CoreVoltage::Over),
             _ => None,
         },
-        dcdc_voltage: match cfg.dcdc_vdd_lvl() {
-            ActiveCfgDcdcVddLvl::Dcdc01 => Some(CoreVoltage::Mid),
-            ActiveCfgDcdcVddLvl::Dcdc10 => Some(CoreVoltage::Normal),
-            ActiveCfgDcdcVddLvl::Dcdc11 => Some(CoreVoltage::Over),
+        dcdc_voltage: match crate::bits::raw(cfg.dcdc_vdd_lvl()) {
+            1 => Some(CoreVoltage::Mid),
+            2 => Some(CoreVoltage::Normal),
+            3 => Some(CoreVoltage::Over),
             _ => None,
         },
-        core_ldo_drive_strength: match cfg.coreldo_vdd_ds() {
-            ActiveCfgCoreldoVddDs::Low => DriveStrength::Low,
-            ActiveCfgCoreldoVddDs::Normal => DriveStrength::Normal,
+        core_ldo_drive_strength: match crate::bits::raw(cfg.coreldo_vdd_ds()) {
+            0 => DriveStrength::Low,
+            _ => DriveStrength::Normal,
         },
-        dcdc_drive_strength: match cfg.dcdc_vdd_ds() {
-            ActiveCfgDcdcVddDs::Low => Some(DriveStrength::Low),
-            ActiveCfgDcdcVddDs::Normal => Some(DriveStrength::Normal),
+        dcdc_drive_strength: match crate::bits::raw(cfg.dcdc_vdd_ds()) {
+            1 => Some(DriveStrength::Low),
+            2 => Some(DriveStrength::Normal),
             _ => None,
         },
-        sram_margin: match sramctl.vsm() {
-            Vsm::Vsm1 => Some(SramMargin::Mid),
-            Vsm::Vsm2 => Some(SramMargin::Normal),
+        sram_margin: match crate::bits::raw(sramctl.vsm()) {
+            1 => Some(SramMargin::Mid),
+            2 => Some(SramMargin::Normal),
             _ => None,
         },
         flash_wait_states: pac::FMU0.fctrl().read().rwsc(),
         active_vdelay: pac::SPC0.active_vdelay().read().active_vdelay(),
-        voltage_detects_enabled: cfg.core_lvde()
-            || cfg.sys_lvde()
-            || cfg.io_lvde()
-            || cfg.core_hvde()
-            || cfg.sys_hvde()
-            || cfg.io_hvde(),
+        voltage_detects_enabled: crate::bits::is_set(cfg.core_lvde())
+            || crate::bits::is_set(cfg.sys_lvde())
+            || crate::bits::is_set(cfg.io_lvde())
+            || crate::bits::is_set(cfg.core_hvde())
+            || crate::bits::is_set(cfg.sys_hvde())
+            || crate::bits::is_set(cfg.io_hvde()),
     }
 }
 
 /// Spin until `SC[BUSY]` clears.
 fn wait_not_busy() -> Result<(), PowerError> {
     let mut spins = 0u32;
-    while pac::SPC0.sc().read().busy() == Busy::BusyYes {
+    while crate::bits::raw(pac::SPC0.sc().read().busy()) == 1 {
         spins += 1;
         if spins > SPIN_CAP {
             return Err(PowerError::Busy);
@@ -385,16 +382,18 @@ fn wait_not_busy() -> Result<(), PowerError> {
 /// detector was measured to still reset the chip, because the ITRC routes both
 /// the analog and the digital (`GDET0`/`GDET1`) detectors to `CHIP_RESET`.
 pub fn disable_core_glitch_detect() {
-    pac::SPC0.active_cfg().modify(|w| w.set_glitch_detect_disable(true));
+    pac::SPC0
+        .active_cfg()
+        .modify(|w| w.set_glitch_detect_disable(crate::bits::from_bool(true)));
 
     let sc = pac::SPC0.glitch_detect_sc();
-    sc.modify(|w| w.set_lock(false));
+    sc.modify(|w| w.set_lock(crate::bits::from_bool(false)));
     sc.write(|w| {
         w.set_timeout(0xF);
-        w.set_re(false);
-        w.set_ie(false);
+        w.set_re(crate::bits::from_bool(false));
+        w.set_ie(crate::bits::from_bool(false));
     });
-    sc.modify(|w| w.set_lock(true));
+    sc.modify(|w| w.set_lock(crate::bits::from_bool(true)));
 
     // Disabling the SPC detector alone is not sufficient - measured: the rail
     // raise still reset the chip. The event reaches `CHIP_RESET` through the
@@ -409,8 +408,8 @@ pub fn disable_core_glitch_detect() {
         });
     }
 
-    pac::GDET0.gdet_enable1().write_value(pac::gdet::GdetEnable1(0));
-    pac::GDET1.gdet_enable1().write_value(pac::gdet::GdetEnable1(0));
+    pac::GDET0.gdet_enable1().write_value(crate::bits::from_raw(0));
+    pac::GDET1.gdet_enable1().write_value(crate::bits::from_raw(0));
 }
 
 /// Raise the active-mode core rail to `cfg`.
@@ -438,7 +437,7 @@ pub fn disable_core_glitch_detect() {
 /// alone and only the drive strengths are applied.
 pub fn set_active_mode(cfg: &ActiveModeConfig) -> Result<(), PowerError> {
     let cntrl = pac::SPC0.cntrl().read();
-    if !cntrl.coreldo_en() && !cntrl.dcdc_en() {
+    if !crate::bits::is_set(cntrl.coreldo_en()) && !crate::bits::is_set(cntrl.dcdc_en()) {
         return Err(PowerError::CoreRegulatorDisabled);
     }
 
@@ -462,7 +461,12 @@ pub fn set_active_mode(cfg: &ActiveModeConfig) -> Result<(), PowerError> {
     // They are not what resets the part here: `VD_STAT` reads 0x00000000
     // throughout and `CMC0.SRS` never reports `VoltageDetect`. Muting them
     // would only widen the window in which a genuine brown-out goes unnoticed.
-    raise_levels(cfg, &status, cntrl.dcdc_en(), cntrl.coreldo_en())
+    raise_levels(
+        cfg,
+        &status,
+        crate::bits::is_set(cntrl.dcdc_en()),
+        crate::bits::is_set(cntrl.coreldo_en()),
+    )
 }
 
 /// The rail writes themselves — one per regulator, straight to the target.
@@ -490,9 +494,9 @@ fn raise_levels(
         let level = target(status.dcdc_voltage);
         pac::SPC0.active_cfg().modify(|w| {
             w.set_dcdc_vdd_lvl(match level {
-                CoreVoltage::Mid => ActiveCfgDcdcVddLvl::Dcdc01,
-                CoreVoltage::Normal => ActiveCfgDcdcVddLvl::Dcdc10,
-                CoreVoltage::Over => ActiveCfgDcdcVddLvl::Dcdc11,
+                CoreVoltage::Mid => crate::bits::flag(1),
+                CoreVoltage::Normal => crate::bits::flag(2),
+                CoreVoltage::Over => crate::bits::flag(3),
             });
             w.set_dcdc_vdd_ds(dcdc_ds(cfg.dcdc_drive_strength));
         });
@@ -506,11 +510,11 @@ fn raise_levels(
         let level = target(status.core_ldo_voltage);
         pac::SPC0.active_cfg().modify(|w| {
             w.set_coreldo_vdd_lvl(match level {
-                CoreVoltage::Mid => ActiveCfgCoreldoVddLvl::Mid,
-                CoreVoltage::Normal => ActiveCfgCoreldoVddLvl::Normal,
-                CoreVoltage::Over => ActiveCfgCoreldoVddLvl::Over,
+                CoreVoltage::Mid => crate::bits::flag(1),
+                CoreVoltage::Normal => crate::bits::flag(2),
+                CoreVoltage::Over => crate::bits::flag(3),
             });
-            w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Normal);
+            w.set_coreldo_vdd_ds(crate::bits::flag(1));
         });
         wait_not_busy()?;
 
@@ -537,24 +541,24 @@ pub fn set_sram_margin(margin: SramMargin) -> Result<(), PowerError> {
 
     sramctl.modify(|w| {
         w.set_vsm(match margin {
-            SramMargin::Mid => Vsm::Vsm1,
-            SramMargin::Normal => Vsm::Vsm2,
+            SramMargin::Mid => crate::bits::flag(1),
+            SramMargin::Normal => crate::bits::flag(2),
         })
     });
 
-    sramctl.modify(|w| w.set_req(Req::ReqYes));
+    sramctl.modify(|w| w.set_req(crate::bits::flag(1)));
 
     let mut spins = 0u32;
-    while sramctl.read().ack() != Ack::AckYes {
+    while crate::bits::raw(sramctl.read().ack()) != 1 {
         spins += 1;
         if spins > SPIN_CAP {
             // Leave REQ clear rather than latched on the way out.
-            sramctl.modify(|w| w.set_req(Req::ReqNo));
+            sramctl.modify(|w| w.set_req(crate::bits::flag(0)));
             return Err(PowerError::SramVoltageNotAcked);
         }
     }
 
-    sramctl.modify(|w| w.set_req(Req::ReqNo));
+    sramctl.modify(|w| w.set_req(crate::bits::flag(0)));
 
     Ok(())
 }
@@ -573,17 +577,17 @@ pub fn set_flash_wait_states(rwsc: u8) {
     unsafe { core::arch::asm!("dsb sy", "isb sy", options(nomem, nostack, preserves_flags)) };
 }
 
-fn coreldo_ds(ds: DriveStrength) -> ActiveCfgCoreldoVddDs {
+fn coreldo_ds<T: Copy>(ds: DriveStrength) -> T {
     match ds {
-        DriveStrength::Low => ActiveCfgCoreldoVddDs::Low,
-        DriveStrength::Normal => ActiveCfgCoreldoVddDs::Normal,
+        DriveStrength::Low => crate::bits::flag(0),
+        DriveStrength::Normal => crate::bits::flag(1),
     }
 }
 
-fn dcdc_ds(ds: DriveStrength) -> ActiveCfgDcdcVddDs {
+fn dcdc_ds<T: Copy>(ds: DriveStrength) -> T {
     match ds {
-        DriveStrength::Low => ActiveCfgDcdcVddDs::Low,
-        DriveStrength::Normal => ActiveCfgDcdcVddDs::Normal,
+        DriveStrength::Low => crate::bits::flag(1),
+        DriveStrength::Normal => crate::bits::flag(2),
     }
 }
 
