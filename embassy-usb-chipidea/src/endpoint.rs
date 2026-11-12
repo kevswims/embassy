@@ -8,6 +8,7 @@ use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{
     Direction, Endpoint as EndpointTrait, EndpointError, EndpointIn, EndpointInfo, EndpointOut, EndpointType,
+    Unsupported,
 };
 use portable_atomic::AtomicBool;
 
@@ -257,7 +258,11 @@ impl<'d, D: Dir> Endpoint<'d, D> {
             return Err(EndpointError::Disabled);
         }
         if self.aborted_by_setup() {
-            trace!("ep{}{} transfer: setup pending at entry", self.index(), dir_str(D::dir()));
+            trace!(
+                "ep{}{} transfer: setup pending at entry",
+                self.index(),
+                dir_str(D::dir())
+            );
             return Err(EndpointError::Disabled);
         }
 
@@ -300,7 +305,6 @@ impl<'d, D: Dir> Endpoint<'d, D> {
         compiler_fence(Ordering::Release);
 
         self.prime(mask, dtd);
-
 
         let mut guard = CancelGuard {
             regs: self.regs,
@@ -401,6 +405,15 @@ impl<D: Dir> EndpointTrait for Endpoint<'_, D> {
             }
         })
         .await
+    }
+
+    fn set_stall(&mut self, stalled: bool) -> Result<(), Unsupported> {
+        set_endpoint_stalled(self.regs, self.info.addr.index(), D::dir(), stalled);
+        Ok(())
+    }
+
+    fn is_stalled(&self) -> Result<bool, Unsupported> {
+        Ok(endpoint_is_stalled(self.regs, self.info.addr.index(), D::dir()))
     }
 }
 

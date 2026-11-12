@@ -20,9 +20,7 @@ pub use endpoint::{Dir, Endpoint, In, Out};
 use core::cell::UnsafeCell;
 
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_usb_driver::{
-    Direction, EndpointAddress, EndpointAllocError, EndpointInfo, EndpointType,
-};
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointAllocError, EndpointConfig, EndpointInfo, EndpointType};
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::dtd::{DmaArena, MAX_EP};
@@ -399,6 +397,7 @@ impl<'d> Driver<'d> {
                 ep_type,
                 max_packet_size,
                 interval_ms,
+                max_burst: 0,
             },
         ))
     }
@@ -421,24 +420,12 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
     type ControlPipe = ControlPipe<'d>;
     type Bus = Bus<'d>;
 
-    fn alloc_endpoint_out(
-        &mut self,
-        ep_type: EndpointType,
-        ep_addr: Option<EndpointAddress>,
-        max_packet_size: u16,
-        interval_ms: u8,
-    ) -> Result<Self::EndpointOut, EndpointAllocError> {
-        self.alloc_endpoint(ep_type, ep_addr, max_packet_size, interval_ms)
+    fn alloc_endpoint_out(&mut self, config: &EndpointConfig) -> Result<Self::EndpointOut, EndpointAllocError> {
+        self.alloc_endpoint(config.ep_type, config.addr, config.max_packet_size, config.interval_ms)
     }
 
-    fn alloc_endpoint_in(
-        &mut self,
-        ep_type: EndpointType,
-        ep_addr: Option<EndpointAddress>,
-        max_packet_size: u16,
-        interval_ms: u8,
-    ) -> Result<Self::EndpointIn, EndpointAllocError> {
-        self.alloc_endpoint(ep_type, ep_addr, max_packet_size, interval_ms)
+    fn alloc_endpoint_in(&mut self, config: &EndpointConfig) -> Result<Self::EndpointIn, EndpointAllocError> {
+        self.alloc_endpoint(config.ep_type, config.addr, config.max_packet_size, config.interval_ms)
     }
 
     fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
