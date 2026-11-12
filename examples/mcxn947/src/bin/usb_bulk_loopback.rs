@@ -43,7 +43,7 @@ use embassy_futures::join::join;
 use embassy_mcxn as hal;
 use embassy_usb::driver::{Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::msos::{self, windows_version};
-use embassy_usb::{Builder, Config, UsbDeviceSpeed};
+use embassy_usb::{Builder, Config, EndpointOptions, UsbDeviceSpeed};
 use hal::bind_interrupts;
 use hal::clocks::{SoscConfig, SoscMode};
 use hal::usb::{self, UsbHs};
@@ -56,11 +56,8 @@ const DEVICE_INTERFACE_GUIDS: &[&str] = &["{B7B0B4D0-3E5F-4C1E-9A2B-1D9E9C0A55F3
 /// nothing measures it, and a wrong value shows up as a PHY PLL lock failure.
 const CRYSTAL_HZ: u32 = 24_000_000;
 
-/// Raise to 512 once high speed is confirmed working; 64 is valid at either
-/// speed, so it keeps first bring-up honest. A device that enumerates at full
-/// speed while advertising 512-byte bulk endpoints is illegal, and Windows
-/// rejects it in a way that is tedious to diagnose.
-const BULK_PACKET_SIZE: u16 = 64;
+/// `embassy-usb` requires the maximum size for bulk endpoints at high speed.
+const BULK_PACKET_SIZE: u16 = 512;
 
 bind_interrupts!(struct Irqs {
     USB1_HS => usb::InterruptHandler<UsbHs>;
@@ -78,13 +75,7 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("USB HS bulk loopback example");
 
-    let driver = match usb::Driver::new(
-        p.USBHS1__USBC,
-        p.USBPHY,
-        p.USBHS1__USBNC,
-        Irqs,
-        usb::Config::default(),
-    ) {
+    let driver = match usb::Driver::new(p.USB1, p.USB1_HS_PHY, p.USB1_NC, Irqs, usb::Config::default()) {
         Ok(d) => d,
         Err(e) => {
             defmt::panic!("USB bring-up failed: {:?}", e);
@@ -128,8 +119,10 @@ async fn main(_spawner: Spawner) {
     let mut function = builder.function(0xFF, 0, 0);
     let mut interface = function.interface();
     let mut alt = interface.alt_setting(0xFF, 0, 0, None);
-    let mut read_ep = alt.endpoint_bulk_out(None, BULK_PACKET_SIZE);
-    let mut write_ep = alt.endpoint_bulk_in(None, BULK_PACKET_SIZE);
+    let mut bulk_options = EndpointOptions::new();
+    bulk_options.max_packet_size = Some(BULK_PACKET_SIZE);
+    let mut read_ep = alt.endpoint_bulk_out(None, bulk_options);
+    let mut write_ep = alt.endpoint_bulk_in(None, bulk_options);
     drop(function);
 
     let mut usb = builder.build();

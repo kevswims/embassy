@@ -189,13 +189,14 @@ async fn main(_spawner: Spawner) -> ! {
             status.tps(),
         );
 
-        if status.fbe() {
+        if embassy_mcxn::bits::is_set(status.fbe()) {
             error!(
                 "fresh fatal bus error: teb={} reb={} (bit2=read/write, bit1=descriptor/data)",
                 status.teb(),
                 status.reb()
             );
-            regs.dma_ch0_status().write(|w| w.set_fbe(true));
+            regs.dma_ch0_status()
+                .write(|w| w.set_fbe(embassy_mcxn::bits::from_bool(true)));
         }
 
         Timer::after_secs(2).await;

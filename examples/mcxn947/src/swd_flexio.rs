@@ -45,11 +45,6 @@
 use embassy_mcxn as hal;
 use hal::gpio::{DriveStrength, Flex, GpioPin, Level, OutputOpenDrain, SlewRate};
 use hal::pac;
-use hal::pac::flexio::{
-    Dbge, ShiftctlPincfg, Smod, TimctlPincfg, Timdec, Timdis, Timena, Timod, Timout, Timpol, Timrst, Trgpol, Trgsrc,
-    Tstop,
-};
-use hal::pac::port::{Dse, Ibe, Mux, Pe, Ps, Sre};
 
 use crate::swd::{
     A2, A3, ACK_FAULT, ACK_NO_ACK, ACK_OK, ACK_WAIT, APNDP, MATCH_MASK, MATCH_VALUE, PIN_NRESET, PIN_SWCLK, PIN_SWDIO,
@@ -68,7 +63,7 @@ const TIMER: usize = 0;
 /// The PAC metadata carries no FlexIO pin functions at all, so there are no
 /// generated pin traits for this and the pads are muxed by hand. Alt 6 is from
 /// NXP's own board code, which is the only machine-readable source for it here.
-const MUX_FLEXIO: Mux = Mux::Mux6;
+const MUX_FLEXIO: u32 = 6;
 
 /// Longest phase a single shifter load can carry. The shifter is 32 bits, so
 /// SWD's 33-bit data phase is split.
@@ -80,18 +75,10 @@ const MAX_PHASE_BITS: u8 = 32;
 /// - the fastest that still satisfies the quarter-clock input sampling limit.
 const MIN_DIV: u32 = 1;
 
-/// `PORT0..PORT5` are separate constants in the PAC with no array to index, so
-/// the port number has to be resolved by hand.
-fn port_pcr(port: usize, pin: usize) -> pac::common::Reg<pac::port::Pcr, pac::common::RW> {
-    let p = match port {
-        0 => pac::PORT0,
-        1 => pac::PORT1,
-        2 => pac::PORT2,
-        3 => pac::PORT3,
-        4 => pac::PORT4,
-        _ => pac::PORT5,
-    };
-    p.pcr(pin)
+/// Replace the `width`-bit field at `shift` in a `PCR` value.
+fn pcr_set(reg: &mut u32, shift: u32, width: u32, val: u32) {
+    let mask = ((1u32 << width) - 1) << shift;
+    *reg = (*reg & !mask) | ((val << shift) & mask);
 }
 
 /// SWD on FlexIO shifters 0 and 1 with timer 0.
@@ -150,16 +137,16 @@ impl<'d, C: GpioPin, D: GpioPin, R: GpioPin> FlexioSwd<'d, C, D, R> {
             (clk.port_index() as usize, clk.pin_index() as usize, false),
             (io.port_index() as usize, io.pin_index() as usize, true),
         ] {
-            port_pcr(port, pin).modify(|w| {
-                w.set_mux(MUX_FLEXIO);
-                w.set_ibe(Ibe::Ibe1);
-                w.set_dse(Dse::Dse0);
-                w.set_sre(Sre::Sre0);
+            hal::gpio::pcr(port, pin).modify(|w| {
+                pcr_set(w, 8, 4, MUX_FLEXIO);
+                pcr_set(w, 12, 1, 1); // IBE
+                pcr_set(w, 6, 1, 0); // DSE
+                pcr_set(w, 3, 1, 0); // SRE
                 // SWDIO is held up by the target; a pull here only matters when
                 // nothing is attached, and it keeps a floating pad from reading
                 // as a stream of zero acknowledgements.
-                w.set_pe(if pull_up { Pe::Pe1 } else { Pe::Pe0 });
-                w.set_ps(if pull_up { Ps::Ps1 } else { Ps::Ps0 });
+                pcr_set(w, 1, 1, pull_up as u32); // PE
+                pcr_set(w, 0, 1, pull_up as u32); // PS
             });
         }
 
@@ -187,25 +174,25 @@ impl<'d, C: GpioPin, D: GpioPin, R: GpioPin> FlexioSwd<'d, C, D, R> {
     fn configure(&mut self) {
         let f = pac::FLEXIO0;
 
-        f.ctrl().modify(|w| w.set_flexen(false));
+        f.ctrl().modify(|w| w.set_flexen(embassy_mcxn::bits::from_bool(false)));
 
         // Shifter 0: transmit on SWDIO, shifting on the falling edge.
         f.shiftctl(SHIFTER_TX).write(|w| {
             w.set_timsel(TIMER as u8);
-            w.set_timpol(Timpol::Negedge);
-            w.set_pincfg(ShiftctlPincfg::Output);
+            w.set_timpol(embassy_mcxn::bits::flag(1));
+            w.set_pincfg(embassy_mcxn::bits::flag(3));
             w.set_pinsel(self.io_fxio);
-            w.set_smod(Smod::Transmit);
+            w.set_smod(embassy_mcxn::bits::flag(2));
         });
         f.shiftcfg(SHIFTER_TX).write(|_| {});
 
         // Shifter 1: receive from SWDIO, sampling on the rising edge.
         f.shiftctl(SHIFTER_RX).write(|w| {
             w.set_timsel(TIMER as u8);
-            w.set_timpol(Timpol::Posedge);
-            w.set_pincfg(ShiftctlPincfg::Disable);
+            w.set_timpol(embassy_mcxn::bits::flag(0));
+            w.set_pincfg(embassy_mcxn::bits::flag(0));
             w.set_pinsel(self.io_fxio);
-            w.set_smod(Smod::Receive);
+            w.set_smod(embassy_mcxn::bits::flag(1));
         });
         f.shiftcfg(SHIFTER_RX).write(|_| {});
 
@@ -214,27 +201,27 @@ impl<'d, C: GpioPin, D: GpioPin, R: GpioPin> FlexioSwd<'d, C, D, R> {
         // stops itself once the programmed number of edges has been produced.
         f.timctl(TIMER).write(|w| {
             w.set_trgsel((4 * SHIFTER_TX as u8) + 1);
-            w.set_trgpol(Trgpol::ActiveLow);
-            w.set_trgsrc(Trgsrc::InternalTrig);
-            w.set_pincfg(TimctlPincfg::Output);
+            w.set_trgpol(embassy_mcxn::bits::flag(1));
+            w.set_trgsrc(embassy_mcxn::bits::flag(1));
+            w.set_pincfg(embassy_mcxn::bits::flag(3));
             w.set_pinsel(self.clk_fxio);
-            w.set_timod(Timod::Dual8bitBaud);
+            w.set_timod(embassy_mcxn::bits::flag(1));
         });
         f.timcfg(TIMER).write(|w| {
-            w.set_timout(Timout::Zero);
-            w.set_timdec(Timdec::FlexioClkShiftclkTmrOut);
-            w.set_timrst(Timrst::Never);
-            w.set_timdis(Timdis::TmrCmp);
-            w.set_timena(Timena::TmrTrighiEn);
-            w.set_tstop(Tstop::EnableTmrdisable);
-            w.set_tstart(true);
+            w.set_timout(embassy_mcxn::bits::flag(1));
+            w.set_timdec(embassy_mcxn::bits::flag(0));
+            w.set_timrst(embassy_mcxn::bits::flag(0));
+            w.set_timdis(embassy_mcxn::bits::flag(2));
+            w.set_timena(embassy_mcxn::bits::flag(2));
+            w.set_tstop(embassy_mcxn::bits::flag(2));
+            w.set_tstart(embassy_mcxn::bits::from_bool(true));
         });
 
         self.write_timcmp(8);
 
         f.ctrl().modify(|w| {
-            w.set_flexen(true);
-            w.set_dbge(Dbge::Emable);
+            w.set_flexen(embassy_mcxn::bits::from_bool(true));
+            w.set_dbge(embassy_mcxn::bits::flag(1));
         });
     }
 
@@ -258,9 +245,9 @@ impl<'d, C: GpioPin, D: GpioPin, R: GpioPin> FlexioSwd<'d, C, D, R> {
         self.write_timcmp(bits);
         f.shiftctl(SHIFTER_TX).modify(|w| {
             w.set_pincfg(if drive {
-                ShiftctlPincfg::Output
+                embassy_mcxn::bits::flag(3)
             } else {
-                ShiftctlPincfg::Disable
+                embassy_mcxn::bits::flag(0)
             })
         });
 

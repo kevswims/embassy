@@ -25,10 +25,8 @@ async fn main(_spawner: Spawner) {
     defmt::info!("CTIMER0-paced DMA example");
 
     // clk_1m divided by 1, so the timer counts microseconds.
-    let ctimer_hz = unsafe {
-        enable_and_reset_with_clock::<hal::peripherals::CTIMER0>(&Ctimer0ClockConfig::default())
-    }
-    .unwrap();
+    let ctimer_hz =
+        unsafe { enable_and_reset_with_clock::<hal::peripherals::CTIMER0>(&Ctimer0ClockConfig::default()) }.unwrap();
     defmt::info!("CTIMER0 functional clock {} Hz", ctimer_hz);
     defmt::assert_eq!(ctimer_hz, 1_000_000);
 
@@ -60,7 +58,7 @@ async fn main(_spawner: Spawner) {
         ch.read_from_peripheral(
             &src as *const u8,
             &mut dst,
-            DmaRequest::Ctimer0M0,
+            DmaRequest::Ctimer0DmareqM0,
             TransferOptions::COMPLETE_INTERRUPT,
         )
     }
@@ -80,7 +78,7 @@ async fn main(_spawner: Spawner) {
             result.unwrap();
             defmt::info!("dst = {:?}", dst);
             defmt::assert!(dst.iter().all(|b| *b == src), "destination not filled");
-            defmt::info!("peripheral-paced DMA works; DmaRequest::Ctimer0M0 is correct");
+            defmt::info!("peripheral-paced DMA works; DmaRequest::Ctimer0DmareqM0 is correct");
         }
         embassy_futures::select::Either::Second(()) => {
             defmt::error!(

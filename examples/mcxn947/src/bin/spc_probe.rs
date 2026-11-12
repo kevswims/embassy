@@ -27,8 +27,6 @@ use embassy_mcxn as hal;
 use embassy_time::Timer;
 use hal::config::Config;
 use hal::pac;
-use hal::pac::scg::{CsrScs, RccrScs};
-use hal::pac::spc::{ActiveCfgCoreldoVddDs, ActiveCfgCoreldoVddLvl, ActiveCfgDcdcVddDs, ActiveCfgDcdcVddLvl, Busy};
 use panic_probe as _;
 
 /// Settling delay inserted after each SPC write. The sequence passes with 40 ms
@@ -78,10 +76,10 @@ fn step_name(step: u32) -> &'static str {
     }
 }
 
-fn attach_main_clk(scs: RccrScs, expect: CsrScs) {
-    pac::SCG0.rccr().modify(|w| w.set_scs(scs));
+fn attach_main_clk(scs: u8, expect: u8) {
+    pac::SCG0.rccr().modify(|w| w.set_scs(embassy_mcxn::bits::flag(scs)));
     let mut spins = 0u32;
-    while pac::SCG0.csr().read().scs() != expect {
+    while embassy_mcxn::bits::raw(pac::SCG0.csr().read().scs()) != expect {
         spins += 1;
         if spins > 1_000_000 {
             warn!("main_clk never reported the requested source");
@@ -92,7 +90,7 @@ fn attach_main_clk(scs: RccrScs, expect: CsrScs) {
 
 fn wait_not_busy() {
     let mut spins = 0u32;
-    while pac::SPC0.sc().read().busy() == Busy::BusyYes {
+    while embassy_mcxn::bits::raw(pac::SPC0.sc().read().busy()) == 1 {
         spins += 1;
         if spins > 1_000_000 {
             warn!("SPC stayed busy");
@@ -138,7 +136,7 @@ async fn main(_spawner: Spawner) {
     Timer::after_millis(500).await;
 
     info!("parking main_clk on SIRC");
-    attach_main_clk(RccrScs::Sirc, CsrScs::Sirc);
+    attach_main_clk(embassy_mcxn::bits::flag(2), embassy_mcxn::bits::flag(2));
     info!("parked; CSR.SCS {}", pac::SCG0.csr().read().scs());
 
     if USE_HAL_SET_ACTIVE_MODE {
@@ -158,7 +156,7 @@ async fn main(_spawner: Spawner) {
         info!("  VD_STAT 0x{=u32:08x}", pac::SPC0.vd_stat().read().0);
         Timer::after_millis(300).await;
         info!("survived the HAL call");
-        attach_main_clk(RccrScs::Firc, CsrScs::Firc);
+        attach_main_clk(embassy_mcxn::bits::flag(3), embassy_mcxn::bits::flag(3));
         loop {
             Timer::after_secs(2).await;
             info!("idle (HAL path)");
@@ -176,44 +174,44 @@ async fn main(_spawner: Spawner) {
     step(1).await;
     let saved = pac::SPC0.active_cfg().read();
     pac::SPC0.active_cfg().modify(|w| {
-        w.set_core_lvde(false);
-        w.set_sys_lvde(false);
-        w.set_io_lvde(false);
-        w.set_core_hvde(false);
-        w.set_sys_hvde(false);
-        w.set_io_hvde(false);
+        w.set_core_lvde(embassy_mcxn::bits::from_bool(false));
+        w.set_sys_lvde(embassy_mcxn::bits::from_bool(false));
+        w.set_io_lvde(embassy_mcxn::bits::from_bool(false));
+        w.set_core_hvde(embassy_mcxn::bits::from_bool(false));
+        w.set_sys_hvde(embassy_mcxn::bits::from_bool(false));
+        w.set_io_hvde(embassy_mcxn::bits::from_bool(false));
     });
     wait_not_busy();
 
     // Step 2: DCDC drive strength.
-    if dcdc_en {
+    if embassy_mcxn::bits::is_set(dcdc_en) {
         step(2).await;
         pac::SPC0
             .active_cfg()
-            .modify(|w| w.set_dcdc_vdd_ds(ActiveCfgDcdcVddDs::Normal));
+            .modify(|w| w.set_dcdc_vdd_ds(embassy_mcxn::bits::flag(2)));
         wait_not_busy();
     }
 
     // Step 3: CORELDO drive strength must be Normal before the level moves.
-    if coreldo_en {
+    if embassy_mcxn::bits::is_set(coreldo_en) {
         step(3).await;
         pac::SPC0
             .active_cfg()
-            .modify(|w| w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Normal));
+            .modify(|w| w.set_coreldo_vdd_ds(embassy_mcxn::bits::flag(1)));
         wait_not_busy();
     }
 
     // Steps 10+/20+: walk both regulators up to Over, one level per round.
-    let dcdc_levels = [ActiveCfgDcdcVddLvl::Dcdc10, ActiveCfgDcdcVddLvl::Dcdc11];
-    let ldo_levels = [ActiveCfgCoreldoVddLvl::Normal, ActiveCfgCoreldoVddLvl::Over];
+    let dcdc_levels = [embassy_mcxn::bits::flag(2), embassy_mcxn::bits::flag(3)];
+    let ldo_levels = [embassy_mcxn::bits::flag(2), embassy_mcxn::bits::flag(3)];
 
     for (round, (dcdc_lvl, ldo_lvl)) in dcdc_levels.iter().zip(ldo_levels.iter()).enumerate() {
-        if dcdc_en {
+        if embassy_mcxn::bits::is_set(dcdc_en) {
             step(10 + round as u32).await;
             pac::SPC0.active_cfg().modify(|w| w.set_dcdc_vdd_lvl(*dcdc_lvl));
             wait_not_busy();
         }
-        if coreldo_en {
+        if embassy_mcxn::bits::is_set(coreldo_en) {
             step(20 + round as u32).await;
             pac::SPC0.active_cfg().modify(|w| w.set_coreldo_vdd_lvl(*ldo_lvl));
             wait_not_busy();
@@ -221,11 +219,11 @@ async fn main(_spawner: Spawner) {
     }
 
     // Step 30: requested drive strength is only safe now.
-    if coreldo_en {
+    if embassy_mcxn::bits::is_set(coreldo_en) {
         step(30).await;
         pac::SPC0
             .active_cfg()
-            .modify(|w| w.set_coreldo_vdd_ds(ActiveCfgCoreldoVddDs::Normal));
+            .modify(|w| w.set_coreldo_vdd_ds(embassy_mcxn::bits::flag(1)));
         wait_not_busy();
     }
 
@@ -272,7 +270,7 @@ async fn main(_spawner: Spawner) {
     }
     info!("step 42: both post-rail steps survived");
 
-    attach_main_clk(RccrScs::Firc, CsrScs::Firc);
+    attach_main_clk(embassy_mcxn::bits::flag(3), embassy_mcxn::bits::flag(3));
     info!("main_clk restored; CSR.SCS {}", pac::SCG0.csr().read().scs());
 
     loop {

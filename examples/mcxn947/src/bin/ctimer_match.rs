@@ -49,7 +49,7 @@ async fn main(_spawner: Spawner) {
     // fails loudly rather than needing an eye on the board. Enabling the input
     // buffer leaves MUX on ALT4, so PDIR samples the level the timer is driving
     // onto the physical pin - the routing itself, not just the match logic.
-    pac::PORT0.pcr(10).modify(|w| w.set_ibe(pac::port::Ibe::Ibe1));
+    hal::gpio::pcr(0, 10).modify(|w| *w |= 1 << 12); // IBE
 
     let mut emr_edges: u32 = 0;
     let mut pad_edges: u32 = 0;

@@ -23,7 +23,6 @@ use defmt::{error, info, warn};
 use defmt_rtt as _;
 use embassy_mcxn as hal;
 use hal::pac;
-use hal::pac::scg::{ApllLock, ApllctrlSource, CsrScs, FirccfgRange, FirccsrLk, Fircvld, RccrScs};
 use hal::power::{self, ActiveModeConfig, CoreVoltage, DriveStrength};
 use panic_probe as _;
 
@@ -61,11 +60,13 @@ fn regs(tag: &str) {
 }
 
 /// `main_clk::attach`, with the spin reported rather than silent.
-fn attach(request: RccrScs, expect: CsrScs) -> bool {
-    pac::SCG0.rccr().modify(|w| w.set_scs(request));
+fn attach(request: u8, expect: u8) -> bool {
+    pac::SCG0
+        .rccr()
+        .modify(|w| w.set_scs(embassy_mcxn::bits::flag(request)));
 
     let mut spins = 0u32;
-    while pac::SCG0.csr().read().scs() != expect {
+    while embassy_mcxn::bits::raw(pac::SCG0.csr().read().scs()) != expect {
         spins += 1;
         if spins > SPIN_CAP {
             return false;
@@ -79,26 +80,28 @@ fn attach(request: RccrScs, expect: CsrScs) -> bool {
 }
 
 /// `main_clk::configure_firc`.
-fn configure_firc(range: FirccfgRange) -> bool {
+fn configure_firc(range: u8) -> bool {
     let csr = pac::SCG0.firccsr();
 
-    if csr.read().lk() == FirccsrLk::WriteDisabled {
-        csr.modify(|w| w.set_lk(FirccsrLk::WriteEnabled));
-        if csr.read().lk() == FirccsrLk::WriteDisabled {
+    if embassy_mcxn::bits::raw(csr.read().lk()) == 1 {
+        csr.modify(|w| w.set_lk(embassy_mcxn::bits::flag(0)));
+        if embassy_mcxn::bits::raw(csr.read().lk()) == 1 {
             return false;
         }
     }
 
-    pac::SCG0.firccfg().write(|w| w.set_range(range));
+    pac::SCG0
+        .firccfg()
+        .write(|w| w.set_range(embassy_mcxn::bits::flag(range)));
 
     csr.modify(|w| {
-        w.set_firc_sclk_periph_en(true);
-        w.set_firc_fclk_periph_en(true);
-        w.set_fircen(true);
+        w.set_firc_sclk_periph_en(embassy_mcxn::bits::from_bool(true));
+        w.set_firc_fclk_periph_en(embassy_mcxn::bits::from_bool(true));
+        w.set_fircen(embassy_mcxn::bits::from_bool(true));
     });
 
     let mut spins = 0u32;
-    while csr.read().fircvld() != Fircvld::EnabledAndValid {
+    while embassy_mcxn::bits::raw(csr.read().fircvld()) != 1 {
         spins += 1;
         if spins > SPIN_CAP {
             return false;
@@ -109,7 +112,7 @@ fn configure_firc(range: FirccfgRange) -> bool {
 
 fn pll0_out_hz() -> u32 {
     let ctrl = pac::SCG0.apllctrl().read();
-    let prediv = if ctrl.bypassprediv() {
+    let prediv = if embassy_mcxn::bits::is_set(ctrl.bypassprediv()) {
         1
     } else {
         match pac::SCG0.apllndiv().read().ndiv() {
@@ -117,11 +120,15 @@ fn pll0_out_hz() -> u32 {
             n => n as u32,
         }
     };
-    let postdiv = if ctrl.bypasspostdiv() {
+    let postdiv = if embassy_mcxn::bits::is_set(ctrl.bypasspostdiv()) {
         1
     } else {
         let pdiv = pac::SCG0.apllpdiv().read().pdiv() as u32;
-        let scaled = if ctrl.bypasspostdiv2() { pdiv } else { 2 * pdiv };
+        let scaled = if embassy_mcxn::bits::is_set(ctrl.bypasspostdiv2()) {
+            pdiv
+        } else {
+            2 * pdiv
+        };
         if scaled == 0 { 2 } else { scaled }
     };
     let mult = match pac::SCG0.apllmdiv().read().mdiv() {
@@ -147,7 +154,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     cortex_m::asm::delay(ONE_SEC * 3);
 
     say("1. attach main_clk -> SIRC (park)");
-    if !attach(RccrScs::Sirc, CsrScs::Sirc) {
+    if !attach(embassy_mcxn::bits::flag(2), embassy_mcxn::bits::flag(2)) {
         error!("    park FAILED (CSR.SCS never followed)");
         loop {
             cortex_m::asm::delay(ONE_SEC);
@@ -164,8 +171,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     if ENABLE_CLK_1M_FIRST {
         say("1b. enable FRO_1MHz (SYSCON CLOCK_CTRL) before touching SPC");
         pac::SYSCON0.clock_ctrl().modify(|w| {
-            w.set_fro1mhz_ena(true);
-            w.set_fro1mhz_clk_ena(true);
+            w.set_fro1mhz_ena(embassy_mcxn::bits::from_bool(true));
+            w.set_fro1mhz_clk_ena(embassy_mcxn::bits::from_bool(true));
         });
         info!("    CLOCK_CTRL now 0x{=u32:08x}", pac::SYSCON0.clock_ctrl().read().0);
         cortex_m::asm::delay(DRAIN);
@@ -201,7 +208,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     cortex_m::asm::delay(DRAIN);
 
     say("5. configure_firc(Firc48mhz)");
-    if !configure_firc(FirccfgRange::Firc48mhz) {
+    if !configure_firc(embassy_mcxn::bits::flag(0)) {
         error!("    configure_firc FAILED");
         loop {
             cortex_m::asm::delay(ONE_SEC);
@@ -211,34 +218,35 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
     say("6a. PLL0: LDO on, power down APLL, write dividers");
     let scg = pac::SCG0;
-    scg.ldocsr().modify(|w| w.set_ldoen(true));
+    scg.ldocsr()
+        .modify(|w| w.set_ldoen(embassy_mcxn::bits::from_bool(true)));
     scg.apllcsr().modify(|w| {
-        w.set_apllpwren(false);
-        w.set_apllclken(false);
+        w.set_apllpwren(embassy_mcxn::bits::from_bool(false));
+        w.set_apllclken(embassy_mcxn::bits::from_bool(false));
     });
     scg.apllctrl().modify(|w| {
-        w.set_source(ApllctrlSource::Firc);
+        w.set_source(embassy_mcxn::bits::flag(1));
         w.set_seli(SELI);
         w.set_selp(SELP);
         w.set_selr(0);
-        w.set_bypassprediv(false);
-        w.set_bypasspostdiv(false);
-        w.set_bypasspostdiv2(false);
+        w.set_bypassprediv(embassy_mcxn::bits::from_bool(false));
+        w.set_bypasspostdiv(embassy_mcxn::bits::from_bool(false));
+        w.set_bypasspostdiv2(embassy_mcxn::bits::from_bool(false));
     });
     scg.apllndiv().write(|w| w.set_ndiv(NDIV));
     scg.apllndiv().write(|w| {
         w.set_ndiv(NDIV);
-        w.set_nreq(true);
+        w.set_nreq(embassy_mcxn::bits::from_bool(true));
     });
     scg.apllpdiv().write(|w| w.set_pdiv(PDIV));
     scg.apllpdiv().write(|w| {
         w.set_pdiv(PDIV);
-        w.set_preq(true);
+        w.set_preq(embassy_mcxn::bits::from_bool(true));
     });
     scg.apllmdiv().write(|w| w.set_mdiv(MDIV));
     scg.apllmdiv().write(|w| {
         w.set_mdiv(MDIV);
-        w.set_mreq(true);
+        w.set_mreq(embassy_mcxn::bits::from_bool(true));
     });
     scg.apllsscg0().write(|_| {});
     scg.apllsscg1().write(|_| {});
@@ -248,7 +256,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     say("6b. PLL0: trim lock + lock time");
     scg.trim_lock().write(|w| {
         w.set_trim_lock_key(0x5a5a);
-        w.set_trim_unlock(hal::pac::scg::TrimUnlock::NotLocked);
+        w.set_trim_unlock(embassy_mcxn::bits::flag(1));
     });
     let ref_after_prediv = REF_HZ / NDIV as u32;
     scg.aplllock_cnfg()
@@ -257,12 +265,12 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 
     say("6c. PLL0: power up and wait for lock");
     scg.apllcsr().modify(|w| {
-        w.set_apllpwren(true);
-        w.set_apllclken(true);
+        w.set_apllpwren(embassy_mcxn::bits::from_bool(true));
+        w.set_apllclken(embassy_mcxn::bits::from_bool(true));
     });
     let mut spins = 0u32;
     let mut locked = true;
-    while scg.apllcsr().read().apll_lock() != ApllLock::EnabledAndValid {
+    while embassy_mcxn::bits::raw(scg.apllcsr().read().apll_lock()) != 1 {
         spins += 1;
         if spins > SPIN_CAP {
             locked = false;
@@ -289,7 +297,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     warn!("7. ATTACHING main_clk -> APLL now. If this is the fault, the log ends here.");
     cortex_m::asm::delay(ONE_SEC);
 
-    if attach(RccrScs::Apll, CsrScs::Apll) {
+    if attach(embassy_mcxn::bits::flag(5), embassy_mcxn::bits::flag(5)) {
         info!("    ATTACH SURVIVED - core is running from PLL0");
     } else {
         error!("    attach FAILED (CSR.SCS never followed)");

@@ -140,11 +140,11 @@ async fn main(_spawner: Spawner) {
         "AHBCLKCTRL0 lost a reset-set bit"
     );
 
-    // CLKUNLOCK resets to Unlock::Enable, meaning clock config registers are
+    // CLKUNLOCK resets to embassy_mcxn::bits::flag(0), meaning clock config registers are
     // writable. init() must never freeze it - drivers program their own
     // *CLKSEL/*CLKDIV later.
     defmt::assert!(
-        pac::SYSCON0.clkunlock().read().unlock() == pac::syscon::Unlock::Enable,
+        embassy_mcxn::bits::raw(pac::SYSCON0.clkunlock().read().unlock()) == 0,
         "clock configuration registers are frozen"
     );
 

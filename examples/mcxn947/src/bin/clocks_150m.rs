@@ -10,7 +10,6 @@ use hal::bind_interrupts;
 use hal::clocks::config::Div;
 use hal::clocks::{Adc0ClockConfig, Adc0ClockSource, MainClock};
 use hal::pac;
-use hal::pac::scg::{ApllLock, CsrScs, FirccfgRange};
 use hal::power::CoreVoltage;
 use hal::vref::Vref;
 use panic_probe as _;
@@ -58,20 +57,28 @@ async fn main(_spawner: Spawner) {
     // What the tree claims.
     defmt::assert_eq!(main_hz, 150_000_000, "main_clk not at 150 MHz");
     // The point of this operating point: FIRC stays put, so `fro_hf` does too.
-    defmt::assert_eq!(fro_hf, 48_000_000, "fro_hf should be unchanged at 48 MHz on the PLL0 path");
+    defmt::assert_eq!(
+        fro_hf,
+        48_000_000,
+        "fro_hf should be unchanged at 48 MHz on the PLL0 path"
+    );
     defmt::assert_eq!(pll0, Some(150_000_000), "pll0_clk not recorded");
     defmt::assert_eq!(voltage, CoreVoltage::Over, "core rail not at overdrive");
 
     // What the registers say, independently of the tree.
-    defmt::assert_eq!(pac::SCG0.csr().read().scs(), CsrScs::Apll, "main_clk not on APLL");
+    defmt::assert_eq!(
+        pac::SCG0.csr().read().scs(),
+        embassy_mcxn::bits::flag(5),
+        "main_clk not on APLL"
+    );
     defmt::assert_eq!(
         pac::SCG0.firccfg().read().range(),
-        FirccfgRange::Firc48mhz,
+        embassy_mcxn::bits::flag(0),
         "FIRC range should be untouched on the PLL0 path"
     );
     defmt::assert_eq!(
         pac::SCG0.apllcsr().read().apll_lock(),
-        ApllLock::EnabledAndValid,
+        embassy_mcxn::bits::flag(1),
         "APLL not locked"
     );
     defmt::assert_eq!(

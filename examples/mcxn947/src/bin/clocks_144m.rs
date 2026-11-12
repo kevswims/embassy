@@ -10,7 +10,6 @@ use hal::bind_interrupts;
 use hal::clocks::config::Div;
 use hal::clocks::{Adc0ClockConfig, Adc0ClockSource, MainClock};
 use hal::pac;
-use hal::pac::scg::{CsrScs, FirccfgRange};
 use hal::power::CoreVoltage;
 use hal::vref::Vref;
 use panic_probe as _;
@@ -58,10 +57,14 @@ async fn main(_spawner: Spawner) {
     defmt::assert_eq!(voltage, CoreVoltage::Over, "core rail not at overdrive");
 
     // What the registers say, independently of the tree.
-    defmt::assert_eq!(pac::SCG0.csr().read().scs(), CsrScs::Firc, "main_clk not on FIRC");
+    defmt::assert_eq!(
+        pac::SCG0.csr().read().scs(),
+        embassy_mcxn::bits::flag(3),
+        "main_clk not on FIRC"
+    );
     defmt::assert_eq!(
         pac::SCG0.firccfg().read().range(),
-        FirccfgRange::Firc144mhz,
+        embassy_mcxn::bits::flag(1),
         "FIRCCFG.RANGE not at 144 MHz"
     );
     defmt::assert_eq!(

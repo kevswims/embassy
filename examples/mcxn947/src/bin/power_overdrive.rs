@@ -6,7 +6,6 @@ use embassy_executor::Spawner;
 use embassy_mcxn as hal;
 use embassy_time::{Duration, Timer};
 use hal::pac;
-use hal::pac::scg::{CsrScs, RccrScs};
 use hal::power::{self, ActiveModeConfig, ClockNode, CoreVoltage, DriveStrength};
 use panic_probe as _;
 
@@ -17,11 +16,11 @@ const SPIN_CAP: u32 = 5_000_000;
 ///
 /// `RCCR[SCS]` is the request; `CSR[SCS]` is read-only and reports the source
 /// in use, so the poll is what makes the switch observed rather than assumed.
-fn attach_main_clk(scs: RccrScs, expect: CsrScs) {
-    pac::SCG0.rccr().modify(|w| w.set_scs(scs));
+fn attach_main_clk(scs: u8, expect: u8) {
+    pac::SCG0.rccr().modify(|w| w.set_scs(embassy_mcxn::bits::flag(scs)));
 
     let mut spins = 0u32;
-    while pac::SCG0.csr().read().scs() != expect {
+    while embassy_mcxn::bits::raw(pac::SCG0.csr().read().scs()) != expect {
         spins += 1;
         if spins > SPIN_CAP {
             defmt::panic!("main_clk never switched to {}", expect);
@@ -32,11 +31,11 @@ fn attach_main_clk(scs: RccrScs, expect: CsrScs) {
 
 /// SIRC is 12 MHz, always running, and valid at every core voltage.
 fn park_on_sirc() {
-    attach_main_clk(RccrScs::Sirc, CsrScs::Sirc);
+    attach_main_clk(embassy_mcxn::bits::flag(2), embassy_mcxn::bits::flag(2));
 }
 
 fn restore_firc() {
-    attach_main_clk(RccrScs::Firc, CsrScs::Firc);
+    attach_main_clk(embassy_mcxn::bits::flag(3), embassy_mcxn::bits::flag(3));
 }
 
 /// Raise the core rail to overdrive with `main_clk` left at its reset default.

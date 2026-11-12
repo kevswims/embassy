@@ -49,7 +49,7 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join4;
 use embassy_mcxn as hal;
 use embassy_time::Timer;
-use embassy_usb::class::cmsis_dap_v2::device::{CmsisDapV2Class, State};
+use embassy_usb::class::cmsis_dap_v2::device::{CmsisDapV2Class, Config as DapConfig, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::msos::windows_version;
 use embassy_usb::{Builder, Config, UsbDeviceSpeed};
@@ -179,7 +179,7 @@ async fn main(_spawner: Spawner) {
     let core_hz = hal::clocks::with_clocks(|c| c.main_clk_hz).unwrap();
     info!("CMSIS-DAP probe starting, core clock {=u32} Hz", core_hz);
 
-    let driver = match usb::Driver::new(p.USBHS1__USBC, p.USBPHY, p.USBHS1__USBNC, Irqs, usb::Config::default()) {
+    let driver = match usb::Driver::new(p.USB1, p.USB1_HS_PHY, p.USB1_NC, Irqs, usb::Config::default()) {
         Ok(d) => d,
         Err(e) => defmt::panic!("USB bring-up failed: {:?}", e),
     };
@@ -217,7 +217,12 @@ async fn main(_spawner: Spawner) {
     // CMSIS-DAP interface GUID, so Windows binds WinUSB without an INF. Windows
     // caches these per VID/PID/revision, so they need to be right before the first
     // plug-in.
-    let mut class = CmsisDapV2Class::new(&mut builder, &mut state, PACKET_SIZE, true);
+    let mut dap_config = DapConfig::new();
+    dap_config.trace = true;
+    dap_config.out_endpoint_options.max_packet_size = Some(PACKET_SIZE);
+    dap_config.in_endpoint_options.max_packet_size = Some(PACKET_SIZE);
+    dap_config.trace_endpoint_options.max_packet_size = Some(PACKET_SIZE);
+    let mut class = CmsisDapV2Class::new(&mut builder, &mut state, dap_config);
 
     // Trace is a stream the target produces on its own schedule, so it is driven
     // by its own future rather than selected against command handling - which
@@ -253,9 +258,8 @@ async fn main(_spawner: Spawner) {
     // floats, and the noise it picks up frames into plausible-looking ITM packets
     // rather than into nothing. Idling high makes "no trace" read as no trace. A
     // target driving TRACESWO push-pull is unaffected.
-    pac::PORT4.pcr(12).modify(|w| {
-        w.set_pe(pac::port::Pe::Pe1);
-        w.set_ps(pac::port::Ps::Ps1);
+    hal::gpio::pcr(4, 12).modify(|w| {
+        *w |= 0b11; // PE | PS: pull-up
     });
 
     if SWO_SELFTEST {

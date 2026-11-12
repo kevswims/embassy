@@ -68,7 +68,11 @@ async fn transmit(device: &mut impl Driver, frame: &[u8]) {
 
     poll_fn(|cx| {
         unwrap!(device.register_waker(cx.waker()));
-        if device.can_transmit() { Poll::Ready(()) } else { Poll::Pending }
+        if device.can_transmit() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     })
     .await;
     unwrap!(device.transmit(buf));
@@ -97,7 +101,9 @@ async fn main(_spawner: Spawner) -> ! {
         enet::Config::default(),
     ));
 
-    pac::ENET0.mac_configuration().modify(|w| w.set_lm(true));
+    pac::ENET0
+        .mac_configuration()
+        .modify(|w| w.set_lm(embassy_mcxn::bits::from_bool(true)));
     info!("MAC loopback enabled");
     Timer::after_millis(100).await;
 
