@@ -15,9 +15,11 @@ copy is not covered.
 - Target `thumbv8m.main-none-eabihf`. The HAL runs entirely **Secure** — FLASH
   and RAM are linked through their Secure aliases, and drivers rely on that
   (see eDMA below).
-- The `nxp-pac` dependency is a **local path checkout**, not a pinned upstream
-  rev, because MCXN947 PAC support is still moving. `Cargo.toml` notes this
-  should switch to the `git`/`rev` form used by `embassy-mcxa` once it lands.
+- The `nxp-pac` dependency is pinned to an upstream `embassy-rs/nxp-pac` rev,
+  like `embassy-mcxa`. That PAC names most register field enums anonymously
+  (`ScgAlphaEnumJulietAlpha`) and models flag fields as one-bit enums rather
+  than `bool`, so the HAL goes through `bits::flag`/`bits::raw`/`bits::is_set`
+  instead of naming those types. `bits` is public with `unstable-pac`.
 - `publish = false`. The crate is **not covered by `ci.sh`** and has **no HIL
   test suite** (contrast `tests/mcxa2xx/`). The examples in
   `examples/mcxn947/` are the de-facto smoke tests.
@@ -702,7 +704,7 @@ disable-on-fire interrupt handler.
   `Option3` (VDD_ANA) and `pwrsel` to raw `0b11`. `Option3` matches the
   FRDM-MCXN947 board's own reference wiring for its ADC1 instance — it is a
   **board-specific default**, not a chip default.
-- `Pwrsel::from_bits(0b11)` is used because the PAC only names `0b00`/`0b10`;
+- `PWRSEL` is written as raw `0b11` because the PAC only names `0b00`/`0b10`;
   the RM's highest power level is generated as `_RESERVED_3`.
 - **No pin traits.** `read_channel` takes a raw channel number and **pad muxing
   is entirely the caller's responsibility** — there is no compile-time check
@@ -1147,10 +1149,6 @@ Things a reader will otherwise re-derive from scratch:
   only … and no DMA"; all ten instances are wired and DMA landed.
 - **CTIMER2/3/4 are half-wired** — instances, channels and pin traits generated,
   but no `Gate` or `FunctionalClock`, so they are uninstantiable.
-- **`build.rs`'s `generate_cc_gates()` emits `crate::impl_cc_gate!(...)`, and no
-  such macro exists in `src/`.** The build stays green only because every
-  MCXN947 peripheral in the PAC metadata has `gate = None`. If the PAC ever
-  populates a `gate` field, the build breaks.
 - `PIN_FAMILIES` is the deliberate gate on pin-trait generation: adding a family
   there is the *last* step of implementing its pin traits, not the first.
 - LPUART's generated pin set covers RXD/TXD only; the RTS_b/CTS_b and
@@ -1183,11 +1181,6 @@ than refusing to build or returning an error.
       Instances, channel singletons and pin traits are already generated, so
       three of the five timers are uninstantiable types today.
       (`src/clocks/gate.rs`, `src/clocks/functional.rs`)
-- [ ] Remove or implement `build.rs`'s `generate_cc_gates()`. It emits
-      `crate::impl_cc_gate!(...)`, which does not exist in `src/`; the build is
-      green only because every MCXN947 peripheral currently has `gate = None` in
-      the PAC metadata. A PAC update that populates that field breaks the build
-      with a confusing error.
 - [ ] Write `Ctrl2`'s `TASD`/`RRS`/`EACEN` in FlexCAN before anyone drives a
       real bus. `FLEXCAN_Reset` sets them; leaving them at reset is harmless
       under internal loopback, which is the only configuration exercised so
@@ -1278,8 +1271,6 @@ than refusing to build or returning an error.
 - [ ] Add the crate to `ci.sh` — it is currently built by nobody.
 - [ ] Add a `tests/mcxn947` HIL suite along the lines of `tests/mcxa2xx`. The
       examples are the only executable coverage today.
-- [ ] Switch the `nxp-pac` dependency from the local path checkout back to a
-      pinned `git`/`rev` once MCXN947 support lands upstream.
 
 ---
 
