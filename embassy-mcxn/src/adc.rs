@@ -119,6 +119,35 @@ pub enum Error {
 const ADCK_MIN_HZ: u32 = 6_000_000;
 const ADCK_MAX_HZ: u32 = 48_000_000;
 
+/// How long the ADC samples the input before converting, in ADCK cycles
+/// (`CMDH.STS`).
+///
+/// Longer times let higher-impedance sources charge the sampling capacitor.
+/// The internal supply-monitor channels (`VDD_CORE/4`, `VBAT/4`, ...) and the
+/// temperature sensor are high impedance: at the shortest time they read
+/// several tens of percent low.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum SampleTime {
+    /// 3.5 ADCK cycles.
+    Adck3_5 = 0,
+    /// 5.5 ADCK cycles.
+    Adck5_5 = 1,
+    /// 7.5 ADCK cycles.
+    Adck7_5 = 2,
+    /// 11.5 ADCK cycles.
+    Adck11_5 = 3,
+    /// 19.5 ADCK cycles.
+    Adck19_5 = 4,
+    /// 35.5 ADCK cycles.
+    Adck35_5 = 5,
+    /// 67.5 ADCK cycles.
+    Adck67_5 = 6,
+    /// 131.5 ADCK cycles.
+    Adck131_5 = 7,
+}
+
 /// ADC configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -126,19 +155,26 @@ pub struct Config {
     /// cycles. Must be non-zero - the RM requires this to enable the ADC at
     /// all.
     pub power_up_delay: u8,
+
+    /// Sample time used by [`Adc::read_channel`].
+    pub sample_time: SampleTime,
 }
 
 impl Default for Config {
     fn default() -> Self {
         // Matches `LPADC_GetDefaultConfig()`'s default exactly (0x80, not
         // the max 0xFF).
-        Self { power_up_delay: 0x80 }
+        Self {
+            power_up_delay: 0x80,
+            sample_time: SampleTime::Adck3_5,
+        }
     }
 }
 
 /// Analog-to-digital converter peripheral.
 pub struct Adc<'d, T: Instance> {
     _peri: Peri<'d, T>,
+    sample_time: SampleTime,
 }
 
 impl<'d, T: Instance> Adc<'d, T> {
@@ -261,7 +297,10 @@ impl<'d, T: Instance> Adc<'d, T> {
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
-        Ok(Self { _peri: peri })
+        Ok(Self {
+            _peri: peri,
+            sample_time: config.sample_time,
+        })
     }
 
     /// Run a single-ended, 16-bit conversion on `channel` and return the raw
@@ -278,7 +317,7 @@ impl<'d, T: Instance> Adc<'d, T> {
             w.set_next(0.into());
             w.set_loop_(0.into());
             w.set_avgs(0.into());
-            w.set_sts(0.into());
+            w.set_sts((self.sample_time as u8).into());
             w.set_lwi(crate::bits::from_bool(false));
             w.set_wait_trig(crate::bits::from_bool(false));
             w.set_cmpen(0.into());

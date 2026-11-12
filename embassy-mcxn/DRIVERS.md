@@ -37,7 +37,7 @@ copy is not covered.
 | FlexSPI (serial NOR) | FLEXSPI0 | async + blocking | yes (mem-to-mem to the IP FIFOs) | `flexspi_quad_*.rs`, `flexspi_soak.rs`, `flexspi_stress.rs`, `flexspi_cancel_soak.rs` |
 | ENET (Ethernet MAC) | ENET0 | `xarxa-driver` (`embassy-net`) | own descriptor DMA | `eth.rs`, `eth_loopback.rs`, `eth_ptp_clock.rs`, `eth_ptp_loopback.rs` |
 | USB HS (device) | USBHS1 | `embassy-usb-driver` | own descriptor DMA | `usb_bulk_loopback.rs` |
-| LPADC | ADC0, ADC1 | async | no | `adc.rs`, `adc_vref_buffered.rs` |
+| LPADC | ADC0, ADC1 | async | no | `adc.rs`, `adc_rails.rs`, `adc_vref_buffered.rs` |
 | VREF | VREF0 | blocking | — | `adc_vref_buffered.rs` |
 | CTIMER (match / PWM / capture) | **CTIMER0, CTIMER1 only** (of 0–4) | blocking + async capture | match-triggered requests only | `ctimer_*.rs` |
 | LPTMR | LPTMR0, LPTMR1 | async one-shot | no | `lptmr.rs`, `lptmr1.rs` |
@@ -700,7 +700,10 @@ disable-on-fire interrupt handler.
   mid-scale default `0x8000`, and *both calibrations complete successfully
   while measuring exactly zero*. **This is not enforced by the type system** —
   it is the single easiest way to misuse this driver.
-- **`Config` exposes only `power_up_delay`.** `refsel` is hardcoded to
+- **`Config` exposes only `power_up_delay` and `sample_time`.** The default
+  sample time is the shortest (3.5 ADCK cycles), which is too short for the
+  internal supply-monitor and temperature channels — they read low until
+  `SampleTime::Adck131_5` is selected (`adc_rails.rs`). `refsel` is hardcoded to
   `Option3` (VDD_ANA) and `pwrsel` to raw `0b11`. `Option3` matches the
   FRDM-MCXN947 board's own reference wiring for its ADC1 instance — it is a
   **board-specific default**, not a chip default.
@@ -1346,6 +1349,7 @@ per bit.
 | `eth_ptp_loopback.rs` | ENET0 PTP per-packet timestamping via MAC loopback |
 | `eth_ptp_master.rs` | ENET0 PTP timestamping of live PTP traffic; checks event vs general classification |
 | `adc.rs` | LPADC one-shot conversion |
+| `adc_rails.rs` | LPADC supply-rail monitor channels (VDD_CORE, VBAT, VDD_SYS, VDD_DCDC) |
 | `adc_vref_buffered.rs` | LPADC with a buffered VREF |
 | `ctimer_match.rs` | `MatchOutput` |
 | `ctimer_pwm.rs` / `_dual` / `_triple` | single/dual/triple-channel PWM |
