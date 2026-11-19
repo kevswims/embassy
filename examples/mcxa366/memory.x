@@ -1,0 +1,6 @@
+MEMORY
+{
+  FLASH : ORIGIN = 0x00000000, LENGTH = 1M
+  /* SRAM banks A and B. */
+  RAM : ORIGIN = 0x20000000, LENGTH = 128K
+}
