@@ -466,7 +466,7 @@ impl NorFlash for Flash {
 /// Base address of the internal program flash.
 pub const FLASH_BASE: u32 = 0x0000_0000;
 
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 /// Total size of the internal program flash in bytes (1 MB).
 pub const FLASH_SIZE: usize = 0x10_0000;
 #[cfg(feature = "_mcxa5xx")]

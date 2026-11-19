@@ -291,7 +291,7 @@ pub enum MainClockSource {
     /// Clock derived from `fro_hf_root`, via the internal 45/60/90/180M clock source (45-180MHz)
     FircHfRoot,
     /// Clock derived from `clk_16k` (vdd core)
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     RoscFro16K,
     /// Clock derived from `clk_32k` (vdd core)
     #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
@@ -469,7 +469,7 @@ pub struct FircConfig {
 }
 
 /// Selected FIRC frequency
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 #[derive(Debug, PartialEq)]
 pub enum FircFreqSel {
     /// 45MHz Output
@@ -497,7 +497,7 @@ pub enum FircFreqSel {
 }
 
 impl FircFreqSel {
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     pub(crate) fn to_freq_and_sel(&self) -> (u32, FreqSel) {
         match self {
             FircFreqSel::Mhz45 => {
@@ -672,7 +672,7 @@ impl Default for Osc32KConfig {
 impl Default for FircConfig {
     fn default() -> Self {
         FircConfig {
-            #[cfg(feature = "_mcxa2xx")]
+            #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
             frequency: FircFreqSel::Mhz45,
             #[cfg(feature = "_mcxa5xx")]
             frequency: FircFreqSel::Mhz48,
@@ -705,7 +705,7 @@ impl Default for ClocksConfig {
                 ahb_clk_div: Div8::no_div(),
             },
             firc: Some(FircConfig {
-                #[cfg(feature = "_mcxa2xx")]
+                #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
                 frequency: FircFreqSel::Mhz45,
                 #[cfg(feature = "_mcxa5xx")]
                 frequency: FircFreqSel::Mhz48,

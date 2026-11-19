@@ -24,6 +24,8 @@ build = [
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa276"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa286"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa287"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa365"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa366"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa456"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa457"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa536"]},
@@ -44,6 +46,8 @@ build = [
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa276"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa286"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa287"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa365"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa366"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa456"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa457"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa536"]},
@@ -55,6 +59,7 @@ build = [
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "perf", "mcxa577"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "mcxa266", "time-driver-lptmr"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "mcxa287", "time-driver-lptmr"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "mcxa366", "time-driver-lptmr"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "mcxa577", "time-driver-lptmr"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxn235"]},
     {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxn236"]},
@@ -89,6 +94,8 @@ flavors = [
     { name = "mcx-a276", target = "thumbv8m.main-none-eabihf", features = ["mcxa276"] },
     { name = "mcx-a286", target = "thumbv8m.main-none-eabihf", features = ["mcxa286"] },
     { name = "mcx-a287", target = "thumbv8m.main-none-eabihf", features = ["mcxa287"] },
+    { name = "mcx-a365", target = "thumbv8m.main-none-eabihf", features = ["mcxa365"] },
+    { name = "mcx-a366", target = "thumbv8m.main-none-eabihf", features = ["mcxa366"] },
     { name = "mcx-a456", target = "thumbv8m.main-none-eabihf", features = ["mcxa456"] },
     { name = "mcx-a457", target = "thumbv8m.main-none-eabihf", features = ["mcxa457"] },
     { name = "mcx-a536", target = "thumbv8m.main-none-eabihf", features = ["mcxa536"] },
@@ -146,13 +153,13 @@ embassy-time-queue-utils = { version = "0.3.2", path = "../embassy-time-queue-ut
 grounded = { version = "0.2.1", features = ["cas", "critical-section"] }
 maitake-sync = { version = "0.3.0", default-features = false, features = ["critical-section", "no-cache-pad"] }
 nb = "1.1.0"
-nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "bc8d8f3ec87ca263986c7bfd05356109521375bc", features = ["rt"] }
+nxp-pac = { git = "https://github.com/kevswims/nxp-pac.git", rev = "c4222af47fcfbfa9015171643d9059afc26e7793", features = ["rt"] }
 paste = "1.0.15"
 
 rand-core-10 = { package = "rand_core", version = "0.10" }
 
 [build-dependencies]
-nxp-pac = { git = "https://github.com/embassy-rs/nxp-pac.git", rev = "bc8d8f3ec87ca263986c7bfd05356109521375bc", default-features = false, features = ["metadata"] }
+nxp-pac = { git = "https://github.com/kevswims/nxp-pac.git", rev = "c4222af47fcfbfa9015171643d9059afc26e7793", default-features = false, features = ["metadata"] }
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 convert_case = "0.12"
@@ -284,6 +291,8 @@ mcxa256 = ["_mcxa2xx", "nxp-pac/mcxa256"]
 mcxa265 = ["_mcxa2xx", "nxp-pac/mcxa265"]
 mcxa266 = ["_mcxa2xx", "nxp-pac/mcxa266"]
 mcxa276 = ["_mcxa2xx", "nxp-pac/mcxa276"]
+mcxa365 = ["_mcxa3xx", "nxp-pac/mcxa365"]
+mcxa366 = ["_mcxa3xx", "nxp-pac/mcxa366"]
 mcxa286 = ["_mcxa5xx", "nxp-pac/mcxa286"]
 mcxa287 = ["_mcxa5xx", "nxp-pac/mcxa287"]
 mcxa456 = ["_mcxa5xx", "nxp-pac/mcxa456"]
@@ -301,6 +310,7 @@ mcxa2xx = ["mcxa266"]
 mcxa5xx = ["mcxa577"]
 
 _mcxa2xx = []
+_mcxa3xx = []
 _mcxa5xx = []
 _mcxn = []
 _mcxn2xx = ["_mcxn"]

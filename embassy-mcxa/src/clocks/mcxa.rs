@@ -77,7 +77,7 @@ pub(crate) fn glikey_access_ready() -> bool {
         <crate::peripherals::GLIKEY0 as Gate>::is_clock_enabled()
             && <crate::peripherals::GLIKEY0 as Gate>::is_reset_released()
     }
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     {
         // No named GLIKEY MRCC gate/reset on A2. System/bus clocks must be live.
         true

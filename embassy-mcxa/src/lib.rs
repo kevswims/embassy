@@ -10,7 +10,7 @@
 ///
 /// NOTE: *for now*, some items are here because we haven't validated them on the MCXA5xx yet.
 /// This note will be removed when the two reach parity.
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 mod mcxa2xx_exclusive {
     pub use crate::chips::mcxa2xx::init;
 }
@@ -21,7 +21,7 @@ mod mcxa5xx_exclusive {
     pub use crate::chips::mcxa5xx::init;
 }
 
-#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa5xx"))]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx", feature = "_mcxa5xx"))]
 pub mod rom;
 pub mod trace;
 
@@ -68,7 +68,7 @@ pub mod gpio;
 pub mod i2c;
 #[cfg(mcxa_i3c)]
 pub mod i3c;
-#[cfg(mcxa_inputmux)]
+#[cfg(any(mcxa_inputmux, mcx_a_a3_inputmux))]
 pub mod inputmux;
 #[cfg(mcxa_lptmr)]
 pub mod lptmr;
@@ -98,7 +98,7 @@ pub mod wwdt;
 
 #[cfg(feature = "_mcxn")]
 pub use chips::mcxn::init;
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 pub use mcxa2xx_exclusive::*;
 #[cfg(feature = "_mcxa5xx")]
 pub use mcxa5xx_exclusive::*;
@@ -138,7 +138,9 @@ pub(crate) fn init_time_driver(priority: interrupt::Priority) {
 }
 
 const HALS_SELECTED: usize = const {
-    cfg!(feature = "_mcxa2xx") as usize + cfg!(feature = "_mcxa5xx") as usize + cfg!(feature = "_mcxn") as usize
+    cfg!(any(feature = "_mcxa2xx", feature = "_mcxa3xx")) as usize
+        + cfg!(feature = "_mcxa5xx") as usize
+        + cfg!(feature = "_mcxn") as usize
 };
 
 /// Ensure exactly one chip feature is set.

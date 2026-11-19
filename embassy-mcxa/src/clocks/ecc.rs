@@ -10,7 +10,7 @@ pub(crate) fn enable_ecc_ram_a_clock() -> Result<WakeGuard, ClockError> {
         let clocks = clocks.as_ref().ok_or(ClockError::NeverInitialized)?;
         clocks.ensure_cpu_system_clk_active(&PoweredClock::NormalEnabledDeepSleepDisabled)?;
         let guard = WakeGuard::new();
-        #[cfg(feature = "_mcxa2xx")]
+        #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
         let cc = pac::MRCC0.mrcc_glb_cc2();
         #[cfg(feature = "_mcxa5xx")]
         let cc = pac::MRCC0.mrcc_glb_cc3();

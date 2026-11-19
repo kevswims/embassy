@@ -42,7 +42,7 @@ pub struct StandardVersion {
 }
 
 pub fn get() -> &'static RomApi {
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     /// Base address of the ROM API bootloader tree for MCXA276.
     const ROM_API_BASE: u32 = 0x0300_5FE0;
     #[cfg(feature = "_mcxa5xx")]
@@ -61,7 +61,7 @@ pub struct RomApi {
     run_bootloader: unsafe extern "C" fn(arg: *const u32),
     // Flash driver interface table.
     flash: *const FlashVtable,
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     jump: unsafe extern "C" fn(image_base: u32),
     #[cfg(feature = "_mcxa5xx")]
     kb: *const KbVtable,

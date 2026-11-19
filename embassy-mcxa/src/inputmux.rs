@@ -157,7 +157,9 @@ impl_input_mux!(ctimer, 7, P1_6);
 impl_input_mux!(ctimer, 8, P1_7);
 impl_input_mux!(ctimer, 9, P1_8);
 impl_input_mux!(ctimer, 10, P1_9);
+#[cfg(not(feature = "_mcxa3xx"))]
 impl_input_mux!(ctimer, 11, P1_14);
+#[cfg(not(feature = "_mcxa3xx"))]
 impl_input_mux!(ctimer, 12, P1_15);
 
 #[cfg(feature = "sosc-as-gpio")]
@@ -183,12 +185,35 @@ impl_input_mux!(ctimer, 8, P3_15);
 impl_input_mux!(ctimer, 9, P3_16);
 impl_input_mux!(ctimer, 10, P3_17);
 impl_input_mux!(ctimer, 11, P3_22);
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 impl_input_mux!(ctimer, 14, P3_27);
-#[cfg(feature = "_mcxa2xx")]
+#[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
 impl_input_mux!(ctimer, 13, P3_28);
-#[cfg(all(feature = "dangerous-reset-as-gpio", feature = "_mcxa2xx"))]
+#[cfg(all(feature = "dangerous-reset-as-gpio", any(feature = "_mcxa2xx", feature = "_mcxa3xx")))]
 impl_input_mux!(ctimer, 4, P3_29);
 
 impl_input_mux!(ctimer, 7, P4_6);
 impl_input_mux!(ctimer, 8, P4_7);
+
+// CT_INP pins present only on MCXA3 (F60RM pin multiplexing table).
+#[cfg(all(feature = "swd-as-gpio", feature = "_mcxa3xx"))]
+impl_input_mux!(ctimer, 1, P0_0);
+#[cfg(feature = "_mcxa3xx")]
+mod mcxa3_ctimer_inputs {
+    use super::*;
+
+    impl_input_mux!(ctimer, 4, P0_7);
+    impl_input_mux!(ctimer, 3, P0_14);
+    impl_input_mux!(ctimer, 4, P0_15);
+    impl_input_mux!(ctimer, 13, P1_16);
+    impl_input_mux!(ctimer, 14, P1_17);
+    impl_input_mux!(ctimer, 9, P2_24);
+    impl_input_mux!(ctimer, 10, P2_25);
+    impl_input_mux!(ctimer, 11, P2_26);
+    impl_input_mux!(ctimer, 19, P3_4);
+    impl_input_mux!(ctimer, 20, P3_5);
+    impl_input_mux!(ctimer, 12, P3_23);
+    impl_input_mux!(ctimer, 17, P3_24);
+    impl_input_mux!(ctimer, 16, P3_25);
+    impl_input_mux!(ctimer, 15, P3_26);
+}

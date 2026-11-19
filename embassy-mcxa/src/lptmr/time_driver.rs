@@ -170,7 +170,7 @@ pub(crate) fn init(priority: interrupt::Priority) {
     interrupt::LPTMR0.disable();
     interrupt::WAKETIMER0.disable();
     let alarm_source = with_clocks(|clocks| {
-        #[cfg(feature = "_mcxa2xx")]
+        #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
         let frequency = clocks.ensure_clk_16k_vsys_active(&PoweredClock::AlwaysEnabled);
         #[cfg(feature = "_mcxa5xx")]
         let frequency = clocks.ensure_clk_16k_vbat_active(&PoweredClock::AlwaysEnabled);

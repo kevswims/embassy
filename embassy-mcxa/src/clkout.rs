@@ -34,7 +34,7 @@ pub enum ClockOutSel {
     #[cfg(not(feature = "sosc-as-gpio"))]
     ClkIn,
     /// 16KHz oscillator
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     Clk16K,
     /// RTC-selected low-power clock output.
     ///
@@ -43,7 +43,7 @@ pub enum ClockOutSel {
     #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
     LpOsc,
     /// Output of PLL1
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     Pll1Clk,
     /// Output of divided PLL1
     #[cfg(feature = "_mcxa5xx")]
@@ -140,7 +140,7 @@ impl Drop for ClockOut<'_> {
 /// Check whether the given clock selection is valid
 fn check_sel(sel: ClockOutSel, level: PoweredClock, divisor: u32) -> Result<(u32, Mux, Option<WakeGuard>), ClockError> {
     let res = with_clocks(|c| {
-        #[cfg(feature = "_mcxa2xx")]
+        #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
         let (freq, mux, fmax, expected) = {
             let (freq, mux) = match sel {
                 ClockOutSel::Fro12M => (c.ensure_fro_hf_active(&level)?, Mux::Clkroot12m),

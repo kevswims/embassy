@@ -88,7 +88,7 @@ impl ClockOperator<'_> {
         //   * Make FIRC changes
         //   * Switch main clock back to FIRC
         // * Firc is enabled and default -> nop
-        #[cfg(feature = "_mcxa2xx")]
+        #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
         let default_freq = FircFreqSel::Mhz45;
         #[cfg(feature = "_mcxa5xx")]
         let default_freq = FircFreqSel::Mhz48;
@@ -1180,7 +1180,7 @@ impl ClockOperator<'_> {
             MainClockSource::SoscClkIn => (Scs::Sosc, "clk_in", self.clocks.clk_in.as_ref()),
             MainClockSource::SircFro12M => (Scs::Sirc, "fro_12m", self.clocks.fro_12m.as_ref()),
             MainClockSource::FircHfRoot => (Scs::Firc, "fro_hf_root", self.clocks.fro_hf_root.as_ref()),
-            #[cfg(feature = "_mcxa2xx")]
+            #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
             MainClockSource::RoscFro16K => (Scs::Rosc, "fro16k", self.clocks.clk_16k_vdd_core.as_ref()),
             #[cfg(all(feature = "_mcxa5xx", not(feature = "rosc-32k-as-gpio")))]
             MainClockSource::RoscOsc32K => (Scs::Rosc, "osc32k", self.clocks.clk_32k_vdd_core.as_ref()),

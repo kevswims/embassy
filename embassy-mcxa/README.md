@@ -5,6 +5,21 @@ microcontrollers using the Embassy async framework. This HAL provides
 safe, idiomatic Rust interfaces for GPIO, UART, and OSTIMER
 peripherals.
 
+## MCXA3 support
+
+The `mcxa365` and `mcxa366` features select the MCXA36x devices. They share
+the MCXA2 clock tree (MRCC/SCG), clock limits, flash wait states, ROM API and
+the register layouts of the supported peripheral drivers, so they use the
+MCXA2 code paths. Supported drivers are GPIO (including async), LPUART
+(blocking, buffered, DMA, ring-buffer and packet modes), LPI2C, LPSPI, eDMA,
+CTIMER (PWM and capture), LPTMR, OSTIMER, WWDT, UTICK, CRC, FREQME and CLKOUT.
+The A3-specific ADC, CMP, OPAMP, CAN, SLCD and TRNG/MBC blocks have no driver
+yet. The A3 LPUART FIFOs hold 4 entries, half the MCXN depth.
+
+Only the FRDM-MCXA366 has been hardware validated. The MCXA345/346/355/356 and
+MCXA343/344 selections are not exposed: they use different SYSCON, MRCC and
+INPUTMUX layouts.
+
 ## Initial MCXN support
 
 Chip features cover the NXP MCXN23x, N24x, N52x, N53x, N54x, N55x and N94x

@@ -336,7 +336,7 @@ impl AsyncMode for Async {}
 
 pub(crate) enum Registers {
     Cmp0(pac::cmp::Cmp),
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     Cmp1(pac::cmp::Cmp1),
 }
 
@@ -346,7 +346,7 @@ macro_rules! with_regs {
     ($this:expr, $r:ident, $body:expr) => {
         match &$this {
             Registers::Cmp0($r) => $body,
-            #[cfg(feature = "_mcxa2xx")]
+            #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
             Registers::Cmp1($r) => $body,
         }
     };
@@ -356,7 +356,7 @@ impl Registers {
     fn disable_round_robin(&self) {
         match self {
             Self::Cmp0(r) => r.rrcr0().modify(|w| w.set_rr_en(false)),
-            #[cfg(feature = "_mcxa2xx")]
+            #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
             Self::Cmp1(r) => r.rrcr0().modify(|w| w.set_rr_en(false)),
         }
     }

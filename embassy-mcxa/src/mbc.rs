@@ -263,7 +263,7 @@ impl<'d> Mbc<'d> {
             pac::syscon::FlashSize::Size2mb => 2 * 1024 * 1024,
             _ => return Err(SetupError::UnsupportedGeometry),
         };
-        #[cfg(feature = "_mcxa2xx")]
+        #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
         let (log2, ifr_max) = (13, [16, 4]);
         #[cfg(feature = "_mcxa5xx")]
         let (log2, ifr_max) = (14, [32, 8]);
@@ -478,7 +478,7 @@ impl<'d> Mbc<'d> {
         let start = usize::from(self.ifr_blocks[0]);
         let count = usize::from(self.ifr_blocks[1]);
         if count != 0 {
-            #[cfg(feature = "_mcxa2xx")]
+            #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
             let blocks = decode_blocks!(regs.mbc0_dom0_mem2_blk_cfg_w0().read();
                 (mbacsel0, nse0), (mbacsel1, nse1), (mbacsel2, nse2), (mbacsel3, nse3));
             #[cfg(feature = "_mcxa5xx")]

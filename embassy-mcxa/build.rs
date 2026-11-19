@@ -40,15 +40,6 @@ fn main() {
         cfgs.enable("time_driver_ostimer");
     }
 
-    fn driver_to_cfg_name(name: &str) -> String {
-        match name.split_once("::") {
-            Some((path, _block)) => path,
-            None => name,
-        }
-        .replace("/", "_")
-        .to_lowercase()
-    }
-
     // Declare all drivers in nxp-pac (used or unused)
     for peripheral in nxp_pac::metadata::META_PERIPHERALS {
         cfgs.declare(driver_to_cfg_name(peripheral));
@@ -113,6 +104,22 @@ fn main() {
     rustfmt(&out_file);
 }
 
+/// The cfg name for a PAC driver identity: `mcxa/LPUART::Lpuart` -> `mcxa_lpuart`.
+fn driver_to_cfg_name(name: &str) -> String {
+    match name.split_once("::") {
+        Some((path, _block)) => path,
+        None => name,
+    }
+    .replace("/", "_")
+    .to_lowercase()
+}
+
+/// Whether an MCXA peripheral uses a register model the HAL's `mcxa/...` drivers support.
+/// Family-specific models (`mcx/a/a3/ADC`, ...) have no HAL driver yet.
+fn has_mcxa_driver(peripheral: &nxp_pac::metadata::Peripheral) -> bool {
+    peripheral.driver_name.starts_with("mcxa/")
+}
+
 fn is_mcxn() -> bool {
     env::var_os("CARGO_FEATURE__MCXN").is_some()
 }
@@ -164,7 +171,7 @@ fn generate_peripherals_call() -> TokenStream {
         .filter(|_| !is_mcxn())
         .filter_map(|p| prefix_num(p.name, "DMA").map(|dma_num| (dma_num, p)))
     {
-        let channels_num = find_num(dma_peripheral.driver_name, "DMA").unwrap();
+        let channels_num = dma_channel_count(dma_peripheral);
 
         for channel in 0..channels_num {
             singletons.push(Singleton::just_name(format!("DMA{dma_num}_CH{channel}")));
@@ -244,7 +251,7 @@ fn generate_cc_gates() -> TokenStream {
             // FREQME's PAC metadata predates its HAL clock helper.
             if is_numbered(peripheral.name, "CMP") {
                 format_ident!("CmpConfig")
-            } else if peripheral.driver_name == "mcxa/FREQME" {
+            } else if driver_to_cfg_name(peripheral.driver_name) == "mcxa_freqme" {
                 format_ident!("FreqmeConfig")
             } else {
                 format_ident!("NoConfig")
@@ -296,7 +303,7 @@ fn generate_instance_calls() -> TokenStream {
     ];
 
     for peripheral in METADATA.peripherals {
-        if peripheral.driver_name.is_empty() {
+        if peripheral.driver_name.is_empty() || !(is_mcxn() || has_mcxa_driver(peripheral)) {
             // Only use peripherals that have a driver
             continue;
         }
@@ -365,7 +372,7 @@ fn generate_gpio_pin_impls() -> TokenStream {
 fn generate_adc_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
-    for adc in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "ADC")) {
+    for adc in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "ADC") && has_mcxa_driver(p)) {
         let adc_name = format_ident!("{}", adc.name);
         for signal in adc.signals {
             let channel: u8 = prefix_num(signal.name, "A")
@@ -390,7 +397,7 @@ fn generate_adc_pin_impls() -> TokenStream {
 fn generate_cmp_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
     let a2 = env::var_os("CARGO_FEATURE__MCXA2XX").is_some();
-    for cmp in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "CMP")) {
+    for cmp in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "CMP") && has_mcxa_driver(p)) {
         let peripheral = format_ident!("{}", cmp.name);
         for signal in cmp.signals {
             let (number, positive, negative) = if let Some(n) = signal.name.strip_prefix("INP") {
@@ -480,7 +487,7 @@ fn generate_lpi2c_pin_impls() -> TokenStream {
 fn generate_i3c_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
-    for i3c in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "I3C")) {
+    for i3c in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "I3C") && has_mcxa_driver(p)) {
         let i3c_name = format_ident!("{}", i3c.name);
         for signal in i3c.signals {
             let signal_pin = format_ident!("{}Pin", ccase!(pascal, signal.name));
@@ -552,7 +559,7 @@ fn generate_flexspi_pin_impls() -> TokenStream {
 fn generate_dac_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
 
-    for dac in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "DAC")) {
+    for dac in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "DAC") && has_mcxa_driver(p)) {
         let dac_name = format_ident!("{}", dac.name);
 
         for signal in dac.signals {
@@ -652,7 +659,7 @@ fn generate_lpuart_pin_impls() -> TokenStream {
 
 fn generate_flexcan_pin_impls() -> TokenStream {
     let mut generated = TokenStream::new();
-    for can in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "CAN")) {
+    for can in METADATA.peripherals.iter().filter(|p| is_numbered(p.name, "CAN") && has_mcxa_driver(p)) {
         let can_name = format_ident!("{}", can.name);
         for signal in can.signals {
             // Signal names from the PAC metadata are `TXD` / `RXD`, which the
@@ -682,7 +689,7 @@ fn generate_dma_requests_enum() -> TokenStream {
         .iter()
         .filter_map(|p| prefix_num(p.name, "DMA").map(|num| (p, num)))
     {
-        let num_channels = find_num(dma.driver_name, "DMA").unwrap();
+        let num_channels = dma_channel_count(dma);
 
         for channel_num in 0..num_channels {
             let dma_num = proc_macro2::Literal::u32_unsuffixed(dma_num);
@@ -758,6 +765,14 @@ fn rustfmt(path: impl AsRef<Path>) {
             }
         }
     }
+}
+
+/// Number of channels of a DMA controller, from its driver name (`mcxa/DMA::DMA8`,
+/// `mcx/n/DMA::Dma16`).
+fn dma_channel_count(dma: &nxp_pac::metadata::Peripheral) -> u32 {
+    find_num(dma.driver_name, "::DMA")
+        .or_else(|| find_num(dma.driver_name, "::Dma"))
+        .unwrap_or_else(|| panic!("no channel count in DMA driver name {}", dma.driver_name))
 }
 
 /// Parse the number directly following `prefix` at the start of `s`, e.g. `prefix_num("DMA0", "DMA") == Some(0)`.

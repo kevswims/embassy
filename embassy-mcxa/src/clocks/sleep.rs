@@ -128,7 +128,7 @@ unsafe fn restart_active_only_clocks(_cs: &CriticalSection) {
     }
 
     // Ensure FRO45M is up and running
-    #[cfg(feature = "_mcxa2xx")]
+    #[cfg(any(feature = "_mcxa2xx", feature = "_mcxa3xx"))]
     if let Some(frohf) = clocks.fro_hf_root.as_ref()
         && !matches!(frohf.power, PoweredClock::AlwaysEnabled)
     {
